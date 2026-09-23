@@ -71,7 +71,7 @@ if [ "${TEST_MODE:-}" = "vitest" ]; then
   EXIT_CODE=0
   for config in $CONFIGS; do
     echo "[vitest-entrypoint] Running vitest: $config ${SHARD_ARG[*]-} ${EXTRA_ARGS[*]-}"
-    npx vitest run --config "$config" "${SHARD_ARG[@]}" "${EXTRA_ARGS[@]}" || EXIT_CODE=$?
+    pnpm exec vitest run --config "$config" "${SHARD_ARG[@]}" "${EXTRA_ARGS[@]}" || EXIT_CODE=$?
   done
   exit "$EXIT_CODE"
 fi
@@ -91,7 +91,7 @@ run_playwright_with_retry_receipt() {
 
   local status=0
   if FRESHELL_CLOUD_RETRY_REPORT_PATH="$RETRY_REPORT_PATH" \
-    npx playwright test --config "$CONFIG" "$@"; then
+    pnpm exec playwright test --config "$CONFIG" "$@"; then
     status=0
   else
     status=$?
@@ -179,7 +179,7 @@ echo "[e2e-entrypoint] Duration-aware shard ${SHARD}/${TASK_COUNT}"
 #    and positional spec-path filters). Discovery errors are fatal: silently
 #    broadening a selection would make a green job meaningless.
 echo "[e2e-entrypoint] Discovering spec files via --list..."
-if LIST_OUTPUT=$(npx playwright test --config "$CONFIG" --list \
+if LIST_OUTPUT=$(pnpm exec playwright test --config "$CONFIG" --list \
   "${FLAGS[@]}" "${SPEC_FILTERS[@]}" 2>&1); then
   LIST_STATUS=0
 else
@@ -298,6 +298,6 @@ for i in "${!MY_SPEC_PATHS[@]}"; do
 done
 
 echo "[e2e-entrypoint] Playwright flags: ${FLAGS[*]-}"
-echo "[e2e-entrypoint] Exec: npx playwright test --config ${CONFIG} ${FLAGS[*]-} ${MY_SPEC_PATHS[*]}"
+echo "[e2e-entrypoint] Exec: pnpm exec playwright test --config ${CONFIG} ${FLAGS[*]-} ${MY_SPEC_PATHS[*]}"
 
 run_playwright_with_retry_receipt "${FLAGS[@]}" "${MY_SPEC_PATHS[@]}"

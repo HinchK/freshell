@@ -143,7 +143,7 @@ impl SettingsStore {
     /// below), which needs a MUCH smaller window than 1 real second to stay
     /// immune to scheduling jitter under a parallel test-suite run.
     #[cfg(test)]
-    fn with_reload_throttle_window(mut self, window: std::time::Duration) -> Self {
+    pub(crate) fn with_reload_throttle_window(mut self, window: std::time::Duration) -> Self {
         self.reload_throttle_window = window;
         self
     }

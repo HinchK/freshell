@@ -30,6 +30,11 @@ on:
       - 'scripts/assert-native-windows-build.ts'
       - 'package.json'
       - 'package-lock.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - '.npmrc'
+      - 'packages/freshell-mcp-runtime/package.json'
+      - 'crates/freshell-claude-sidecar/package.json'
 
 permissions:
   contents: read
@@ -59,10 +64,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # pnpm must exist before setup-node resolves its pnpm cache. The action
+      # reads the exact version from the root packageManager pin.
+      # Pinned revision of the v4 major; reads the exact version from the root
+      # packageManager pin (no floating duplicate).
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
 
       - uses: actions/setup-python@v5
         with:
@@ -76,10 +88,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Run Electron unit tests
-        run: npm run test:electron
+        run: pnpm run test:electron
 
       # Build the host-native server before staging. The Windows job is always
       # native Windows, so its executable has the correct PE format.
@@ -88,19 +100,19 @@ jobs:
 
       - name: Build and verify Electron installer (Unix)
         if: matrix.os != 'windows-2022'
-        run: npm run electron:build
+        run: pnpm run electron:build
 
       - name: Build and verify Electron installer (Windows)
         if: matrix.os == 'windows-2022'
-        run: npm run electron:build:win
+        run: pnpm run electron:build:win
 
       # The package scripts verify as part of the build; repeat the explicit
       # verifier as the CI receipt immediately before checkout-free testing.
       - name: Verify unpacked native artifact
-        run: npm run verify:electron-artifact
+        run: pnpm run verify:electron-artifact
 
       - name: Checkout-free native runtime acceptance
-        run: npm run test:electron:runtime
+        run: pnpm run test:electron:runtime
         env:
           FRESHELL_ELECTRON_RUNTIME_DIR: ${{ matrix.runtime }}
 

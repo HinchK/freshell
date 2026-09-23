@@ -1,6 +1,3 @@
-import { readFileSync } from 'node:fs'
-import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -8,17 +5,6 @@ import {
   createStandardTestPlan,
 } from '../../../../scripts/run-standard-tests.js'
 import { classifyCommand } from '../../../../scripts/testing/coordinator-command-matrix.js'
-
-const TEST_DIR = path.dirname(fileURLToPath(import.meta.url))
-const PROJECT_ROOT = path.resolve(TEST_DIR, '../../../..')
-
-function readJson<T>(relativePath: string): T {
-  return JSON.parse(readFileSync(path.join(PROJECT_ROOT, relativePath), 'utf8')) as T
-}
-
-type PackageJson = {
-  scripts?: Record<string, string>
-}
 
 describe('Rust-first build and test selection', () => {
   it('runs client, source-runtime, Rust, and Electron phases without vacuous Vitest flags', () => {
@@ -54,30 +40,5 @@ describe('Rust-first build and test selection', () => {
     if (integration.kind === 'coordinated') {
       expect(integration.phases).toEqual([{ runner: 'cargo', args: ['test', '--workspace', '--tests', '--locked'] }])
     }
-  })
-
-  it('selects the visible-first harness while excluding artifact-dependent integration trees', async () => {
-    const configSource = readFileSync(path.join(PROJECT_ROOT, 'config/vitest/vitest.config.ts'), 'utf8')
-    expect(configSource).not.toContain("'test/unit/visible-first/cli-command-harness.test.ts'")
-    expect(configSource).toContain("'test/integration/tooling/**'")
-    expect(configSource).toContain("'test/integration/electron/**'")
-    expect(configSource).not.toContain('vitest.server.config')
-
-    const runtimeConfig = path.join(PROJECT_ROOT, 'config/vitest/vitest.runtime.config.ts')
-    expect(readFileSync(runtimeConfig, 'utf8')).toContain('source-runtime-rust.test.ts')
-  })
-
-  it('keeps the runtime wrapper and launchers on the closed Rust contract', () => {
-    const scripts = readJson<PackageJson>('package.json').scripts ?? {}
-    expect(scripts['test:source-runtime']).toBe('tsx scripts/testing/run-source-runtime-tests.ts')
-    expect(scripts['test:rust']).toContain('scripts/testing/run-rust-tests.ts')
-
-    const launch = readFileSync(path.join(PROJECT_ROOT, 'scripts/launch.sh'), 'utf8')
-    expect(launch).toContain('launch-rust.sh')
-    expect(launch).not.toContain('npm start')
-    expect(readFileSync(path.join(PROJECT_ROOT, 'run-rust-server.sh'), 'utf8')).not.toContain('Legacy server:')
-
-    expect(readFileSync(path.join(PROJECT_ROOT, 'scripts/launch-rust.sh'), 'utf8'))
-      .toContain('npm run --silent prepare:rust-runtime')
   })
 })

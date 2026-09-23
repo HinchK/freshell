@@ -91,6 +91,8 @@ import {
 } from '@/lib/terminal-restore'
 import { isTerminalPasteShortcut } from '@/lib/terminal-input-policy'
 import { terminalFollowsOscTitle } from '@/lib/terminal-title-policy'
+import { isUnifiedAgentMode } from '@shared/session-names'
+import { selectTabNameSourcePaneId } from '@/store/selectors/sessionNameSelectors'
 import { recordTerminalTitleForReplay } from '@/lib/terminal-inventory-titles'
 import {
   clearTerminalCursor,
@@ -3452,6 +3454,47 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       if (handledCreatedMessageRef.current?.requestId === requestId) {
         handledCreatedMessageRef.current = null
       }
+      // Unified agent names (T6-R3 sender repair): every NEW scoped logical
+      // conversation mints its pre-durable namingHandle BEFORE create, sends
+      // it on the frame, and persists it in the pane content. The pane's
+      // rename capture and display rungs then resolve the PENDING record
+      // while the durable identity doesn't exist yet (a fresh pane whose
+      // content carries only the prospective sessionRef would otherwise
+      // capture a target the server never matches — 409 NAME_TARGET_MOVED),
+      // and creation retries re-send the SAME persisted handle. A resume
+      // create (durable sessionRef) keeps the durable record as its target
+      // and deliberately sends no handle.
+      let namingHandle: string | undefined
+      if (
+        isUnifiedAgentMode(mode)
+        && !createSessionState.sessionRef
+        && !pendingReconcile
+        && !restore
+        && !recoveryIntent
+      ) {
+        namingHandle = contentRef.current?.namingHandle
+        if (!namingHandle) {
+          namingHandle = `nh-${nanoid()}`
+          updateContent({ namingHandle })
+        }
+      } else if (
+        isUnifiedAgentMode(mode)
+        && (restore || recoveryIntent || pendingReconcile === 'fresh')
+      ) {
+        // Unified agent names (zero-turn recovery): a restored terminal
+        // re-sends the pane content's PERSISTED pre-durable handle so the
+        // restored row rejoins the pending reconcile lane — after a
+        // restart the in-memory registry/stash are gone, and without the
+        // re-sent handle the restored row either binds a dead durable ref
+        // (a prospective prealloc) or mints a fresh empty record, in both
+        // cases orphaning the pre-durable rename. This covers every
+        // recovery lane: the restore flag, the fresh-recovery intent, and
+        // the pane-reconcile FRESH verdict (a zero-turn codex/opencode
+        // pane's recovery create). The server's admission ignores the
+        // handle when the durable record already exists, so a materialized
+        // pane's resume create is unaffected.
+        namingHandle = contentRef.current?.namingHandle
+      }
       if (debugRef.current) log.debug('[TRACE resumeSessionId] sendCreate', {
         paneId: paneIdRef.current,
         requestId,
@@ -3496,6 +3539,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         paneId: paneIdRef.current,
         ...(restore ? { restore: true } : {}),
         ...(recoveryIntent ? { recoveryIntent } : {}),
+        ...(namingHandle ? { namingHandle } : {}),
       })
     }
 
@@ -4961,11 +5005,27 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           // snapshot. The pane's own title update below stays tid-gated.
           recordTerminalTitleForReplay(msg.terminalId, msg.title)
           if (msg.terminalId === tid) {
+            // Unified agent names (Task 5): a scoped coding-agent terminal's
+            // presentation comes from the canonical sessionNames cache — an
+            // unrevisioned registry title never rewrites its pane, and it
+            // can never name a session-owned tab (only the tab's stable
+            // source pane's session owns that tab's display).
+            // Task 6 (T5-M7 gate): the tab-write gate is tab-ownership-scoped,
+            // not just pane-scoped — a non-agent sibling (a shell) in a
+            // session-OWNED tab cannot churn that tab's stored fallback
+            // title either. Legacy and mixed tabs (pointer legacy/undefined)
+            // keep the existing shell OSC/exit write behavior verbatim.
+            const scopedPane = isUnifiedAgentMode(contentRef.current?.mode, undefined)
             const titleTab = tabRef.current
-            if (titleTab && !titleTab.titleSetByUser) {
+            const sessionOwnedTab = titleTab
+              ? selectTabNameSourcePaneId(appStore.getState() as never, titleTab.id) != null
+              : false
+            if (!scopedPane && !sessionOwnedTab && titleTab && !titleTab.titleSetByUser) {
               dispatch(updateTab({ id: titleTab.id, updates: { title: msg.title } }))
             }
-            dispatch(updatePaneTitle({ tabId, paneId: paneIdRef.current, title: msg.title, setByUser: false }))
+            if (!scopedPane) {
+              dispatch(updatePaneTitle({ tabId, paneId: paneIdRef.current, title: msg.title, setByUser: false }))
+            }
           }
         }
 

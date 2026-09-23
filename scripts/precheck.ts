@@ -68,7 +68,7 @@ async function confirmServeBranchIfNeeded(branch: string | undefined): Promise<v
   }
 
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    console.error(`\n\x1b[31m✖ Refusing to run npm run serve from ${formatBranchForMessage(branch)} without confirmation.\x1b[0m`)
+    console.error(`\n\x1b[31m✖ Refusing to run pnpm run serve from ${formatBranchForMessage(branch)} without confirmation.\x1b[0m`)
     console.error('Check out main first, or set FRESHELL_ALLOW_NON_MAIN_SERVE=1 if this is intentional.\n')
     process.exit(1)
   }
@@ -150,7 +150,7 @@ function loadEnv(): Record<string, string> {
 
 const env = loadEnv()
 // process.env takes precedence over .env file so CLI overrides work:
-//   PORT=3002 VITE_PORT=5174 npm run dev
+//   PORT=3002 VITE_PORT=5174 pnpm run dev
 const VITE_PORT = parseInt(process.env.VITE_PORT || env.VITE_PORT || '5173', 10)
 const SERVER_PORT = parseInt(process.env.PORT || env.PORT || '3001', 10)
 
@@ -247,7 +247,7 @@ async function main(): Promise<void> {
       console.error(`  • ... and ${missingDeps.length - 10} more`)
     }
     console.error('\n\x1b[33mTo fix:\x1b[0m')
-    console.error('  npm install\n')
+    console.error('  pnpm install --frozen-lockfile\n')
     process.exit(1)
   }
 

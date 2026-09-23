@@ -162,6 +162,42 @@ export function isTransientRequestFailure(error: unknown): boolean {
   return false
 }
 
+/**
+ * Bounded retry for the shared rate-limit bucket's 429s. A fresh page's
+ * boot burst (settings, sessions, terminal directory, the naming bootstrap)
+ * or a reconnect storm can drain the ONE bucket every `/api` route shares:
+ * a 429 there is transient, and the callers below (the sidebar snapshot,
+ * the session-names bootstrap) have no later re-trigger — without the
+ * retry the surface stays stale/empty until the next invalidation.
+ * Retries at most 5 times, honoring the server's Retry-After hint.
+ */
+export const API_429_MAX_RETRIES = 5
+const API_429_DELAY_MS = 600
+
+export async function with429Retry<T>(
+  attempt: () => Promise<T>,
+  options: { signal?: AbortSignal } = {},
+): Promise<T> {
+  for (let tries = 0; ; tries += 1) {
+    try {
+      return await attempt()
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.status !== 429 || tries >= API_429_MAX_RETRIES) {
+        throw error
+      }
+      const hinted = (error as ApiError & { retryAfterMs?: number }).retryAfterMs
+      const delayMs = typeof hinted === 'number' && hinted > 0 ? hinted : API_429_DELAY_MS
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, delayMs)
+        options.signal?.addEventListener('abort', () => {
+          clearTimeout(timer)
+          reject(new DOMException('Aborted', 'AbortError'))
+        }, { once: true })
+      })
+    }
+  }
+}
+
 async function request<T = any>(path: string, options: RequestInit = {}): Promise<T> {
   const perfEnabled = isClientPerfLoggingEnabled() && typeof performance !== 'undefined'
   const perfConfig = getClientPerfConfig()
@@ -601,6 +637,11 @@ function groupDirectoryItemsAsProjects(
       ...(item.titleOverridden ? { titleOverridden: true } : {}),
       ...(item.providerTitle !== undefined ? { providerTitle: item.providerTitle } : {}),
       ...(item.titleOverrideSource ? { titleOverrideSource: item.titleOverrideSource } : {}),
+      // Unified agent names (Task 2 projection): the row's canonical ref +
+      // last-known name — a fresh second client's sessionNames cache
+      // bootstraps from these (its ready-time read races its hydration).
+      ...(item.nameRef ? { nameRef: item.nameRef } : {}),
+      ...(item.sessionName !== undefined ? { sessionName: item.sessionName } : {}),
     })),
   }))
 }
@@ -799,18 +840,21 @@ export async function fetchSidebarSessionsSnapshot(options: {
   } = options
   sanitizeSessionLocators(openSessions)
 
-  const page = SessionDirectoryPageSchema.parse(await getSessionDirectoryPage({
-    priority: 'visible',
-    tier: 'title' as const,
-    limit: Math.min(limit, 50),
-    cursor: encodeSessionCursor(before, beforeId),
-    includeSubagents,
-    includeNonInteractive,
-    includeEmpty,
-    ...(includeKeys && includeKeys.length > 0 ? { includeKeys } : {}),
-  }, {
-    signal,
-  })) as ReadModelSessionDirectoryPage
+  const page = SessionDirectoryPageSchema.parse(await with429Retry(
+    () => getSessionDirectoryPage({
+      priority: 'visible',
+      tier: 'title' as const,
+      limit: Math.min(limit, 50),
+      cursor: encodeSessionCursor(before, beforeId),
+      includeSubagents,
+      includeNonInteractive,
+      includeEmpty,
+      ...(includeKeys && includeKeys.length > 0 ? { includeKeys } : {}),
+    }, {
+      signal,
+    }),
+    { signal },
+  )) as ReadModelSessionDirectoryPage
 
   const projects = groupDirectoryItemsAsProjects(page.items, page.projectColors)
   const oldest = page.items.at(-1)

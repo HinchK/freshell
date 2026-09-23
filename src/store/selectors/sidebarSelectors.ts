@@ -12,6 +12,7 @@ import { deriveTabRecencyAt } from '@/lib/tab-recency'
 import type { CodexDurabilityRef, CodexDurabilityStateName } from '../../../shared/codex-durability.js'
 import { sessionStatusTierRank, type SessionStatusTier } from '@/store/selectors/sessionStatusTiers'
 import { makeSelectSessionStatusTiers } from '@/store/selectors/sessionStatusTiers'
+import { isScopedSessionRow, selectSessionRowRecord } from '@/store/selectors/sessionNameSelectors'
 
 /**
  * Module-scope instance of the status-tier selector, shared by every
@@ -81,6 +82,7 @@ const selectAppliedQuery = (state: RootState) => state.sessions.windows?.sidebar
 const selectAppliedSearchTier = (state: RootState) => state.sessions.windows?.sidebar?.appliedSearchTier
 const selectTerminals = (_state: RootState, terminals: BackgroundTerminal[]) => terminals
 const selectFilter = (_state: RootState, _terminals: BackgroundTerminal[], filter: string) => filter
+const selectSessionNames = (state: RootState) => state.sessionNames
 
 function getProjectName(projectPath: string): string {
   return getLeafDirectoryName(projectPath) ?? projectPath
@@ -175,6 +177,7 @@ export function buildSessionItems(
   sessionActivity: Record<string, number>,
   worktreeGrouping: WorktreeGrouping = 'repo',
   paneLastInputAt: Record<string, number | undefined> = EMPTY_PANE_LAST_INPUT_AT,
+  sessionNames?: RootState['sessionNames'],
 ): SidebarSessionItem[] {
   const itemsByKey = new Map<string, SidebarSessionItem>()
   const runningSessionMap = new Map<string, RunningSessionInfo>()
@@ -183,6 +186,19 @@ export function buildSessionItems(
   const terminalById = new Map(
     (terminals || []).map((terminal) => [terminal.terminalId, terminal]),
   )
+
+  /**
+   * Unified agent names (Task 5): a scoped session's canonical name from the
+   * revisioned cache — used by the provisional/fallback rows (a scoped row
+   * the directory window has not yet listed), where the canonical record
+   * outranks any pane/tab/terminal label.
+   */
+  const scopedCanonicalTitle = (provider: string, sessionId: string, sessionType?: string): string | undefined => {
+    if (!sessionNames || !isScopedSessionRow(provider, sessionType)) return undefined
+    // T5-N5: the shared durable-key row projection — never an inline
+    // `sessionNameRefKey` build.
+    return selectSessionRowRecord(sessionNames, provider, sessionId)?.name
+  }
 
   for (const terminal of terminals || []) {
     if (terminal.status === 'running') {
@@ -255,7 +271,16 @@ export function buildSessionItems(
       const runningTerminalIds = runningTerminal?.allTerminalIds
       const tabInfo = tabSessionMap.get(key)
       const ratchetedActivity = sessionActivity[key]
-      const hasTitle = !!session.title
+      // Unified agent names (Task 5): a scoped row displays its canonical
+      // session name — the LIVE canonical cache first (folded from
+      // `session.name.updated` in real time, so every surface converges the
+      // moment the server accepts a rename), then the row's additive
+      // `sessionName` projection (the directory fetch's last-known name) —
+      // over the provider-native title.
+      const scopedRowTitle = isScopedSessionRow(provider, session.sessionType)
+        ? scopedCanonicalTitle(provider, session.sessionId, session.sessionType) ?? session.sessionName
+        : undefined
+      const hasTitle = !!scopedRowTitle || !!session.title
       const effectivePath = worktreeGrouping === 'worktree'
         ? (session.checkoutPath || project.projectPath)
         : project.projectPath
@@ -264,20 +289,23 @@ export function buildSessionItems(
         sessionId: session.sessionId,
         provider,
         sessionType: session.sessionType || provider,
-        // A title-less RUNNING row (a real session whose transcript has not
-        // yet yielded a title — server placeholder rows carry the provider
-        // display name) keeps a meaningful label instead of an id prefix,
-        // composing the SAME name order the client-side fallback row uses
-        // below (:529): the pane title, then the terminal's registry title,
-        // then getProviderLabel — so the label is stable when the server
-        // row replaces the client's fallback row for the same terminal.
-        // getProviderLabel without extension data renders
-        // Opencode/Codex/Claude, and only as the LAST rung (no local
-        // pane/terminal info). hasTitle stays !!session.title — this is a
-        // display fallback, not a session title; later title-carrying
+        // Unified agent names (Task 5): a scoped row displays its canonical
+        // session name (scopedRowTitle above) over every native fallback.
+        // Below that, a title-less RUNNING row (a real session whose
+        // transcript has not yet yielded a title — server placeholder rows
+        // carry the provider display name) keeps a meaningful label instead
+        // of an id prefix, composing the SAME name order the client-side
+        // fallback row uses below (:529): the pane title, then the
+        // terminal's registry title, then getProviderLabel — so the label
+        // is stable when the server row replaces the client's fallback row
+        // for the same terminal. getProviderLabel without extension data
+        // renders Opencode/Codex/Claude, and only as the LAST rung (no
+        // local pane/terminal info). hasTitle stays !!session.title — this
+        // is a display fallback, not a session title; later title-carrying
         // fetches still override it.
-        title: session.title
-          || ((session.isRunning && session.runningTerminalId)
+        title: scopedRowTitle
+          ?? session.title
+          ?? ((session.isRunning && session.runningTerminalId)
             ? (terminalPaneTitles.get(session.runningTerminalId)?.title?.trim()
               || terminalById.get(session.runningTerminalId)?.title?.trim()
               || getProviderLabel(provider))
@@ -372,12 +400,16 @@ export function buildSessionItems(
     const runningTerminalId = runningTerminal?.terminalId
     const runningTerminalIds = runningTerminal?.allTerminalIds
     const hasTab = input.hasTab ?? true
+    // Unified agent names (Task 5): a scoped fallback row (a session the
+    // directory window has not listed yet) displays its canonical cached
+    // name over the pane/tab/terminal label it was synthesized from.
+    const canonicalTitle = scopedCanonicalTitle(input.provider, input.sessionId, input.metadata?.sessionType || input.sessionType)
     const item: SidebarSessionItem = {
       id: `session-${input.provider}-${input.sessionId}`,
       sessionId: input.sessionId,
       provider: input.provider,
       sessionType: input.metadata?.sessionType || input.sessionType,
-      title: fallbackTitle,
+      title: canonicalTitle ?? fallbackTitle,
       hasTitle: false,
       subtitle: input.cwd ? getProjectName(input.cwd) : undefined,
       projectPath: input.cwd,
@@ -841,6 +873,7 @@ export const makeSelectSortedSessionItems = () =>
       selectTerminals,
       selectFilter,
       selectSessionStatusTiers,
+      selectSessionNames,
     ],
     (
       projects,
@@ -861,8 +894,9 @@ export const makeSelectSortedSessionItems = () =>
       terminals,
       filter,
       sessionStatusTiers,
+      sessionNames,
     ) => {
-      const items = buildSessionItems(projects, tabs, panes, terminals, sessionActivity, worktreeGrouping, paneLastInputAt)
+      const items = buildSessionItems(projects, tabs, panes, terminals, sessionActivity, worktreeGrouping, paneLastInputAt, sessionNames)
       const visible = filterSessionItemsByVisibility(items, {
         showSubagents,
         ignoreCodexSubagents,

@@ -9,14 +9,50 @@
 # Usage:
 #   scripts/sandbox-test.sh "cargo test -p freshell-ws"
 #   scripts/sandbox-test.sh --corpus "cargo test -p freshell-sessions -- --ignored perf"
+#   scripts/sandbox-test.sh --native-tools <manifest-path> --receipt-dir <absolute-directory>
 #
 # --corpus mounts ~/.codex/sessions and ~/.claude/projects READ-ONLY at their
 # natural paths inside the container, for realistic-data perf tests. Without
 # it, no real user data is mounted at all.
+#
+# --native-tools is the EARLY native-only branch (unified-agent-names Task 8):
+# it never runs the repo-mount sandbox path. It delegates to the Node wrapper
+# (scripts/testing/native-session-names-sandbox.mjs), which validates the
+# closed input list (optionally relocated by the manifest), then runs the
+# native session-names contract runner read-only in an owned disposable
+# container — no corpus, no operator home, no package installation. The
+# wrapper's exit codes pass through unchanged (0 all providers passed,
+# 1 contract failure, 2 missing prerequisite before any Docker mutation).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE_TAG="freshell-sandbox:latest"
+
+if [ "${1:-}" = "--native-tools" ]; then
+  NATIVE_MANIFEST="${2:-}"
+  if [ -z "${NATIVE_MANIFEST}" ]; then
+    echo "usage: $0 --native-tools <manifest-path> [--receipt-dir <absolute-directory>]" >&2
+    exit 2
+  fi
+  shift 2
+  NATIVE_RECEIPT_DIR="/tmp"
+  if [ "${1:-}" = "--receipt-dir" ]; then
+    NATIVE_RECEIPT_DIR="${2:-}"
+    if [ -z "${NATIVE_RECEIPT_DIR}" ]; then
+      echo "usage: $0 --native-tools <manifest-path> --receipt-dir <absolute-directory>" >&2
+      exit 2
+    fi
+    shift 2
+  fi
+  if [ ! -d "${NATIVE_RECEIPT_DIR}" ]; then
+    echo "[sandbox] --receipt-dir is not an existing directory: ${NATIVE_RECEIPT_DIR}" >&2
+    exit 2
+  fi
+  exec node "${REPO_ROOT}/scripts/testing/native-session-names-sandbox.mjs" \
+    --require-all \
+    --manifest "${NATIVE_MANIFEST}" \
+    --output "${NATIVE_RECEIPT_DIR%/}/native-session-names.json"
+fi
 
 MOUNT_CORPUS=0
 if [ "${1:-}" = "--corpus" ]; then
@@ -54,6 +90,12 @@ DOCKER_ARGS=(
   -v freshell-sandbox-cargo-git:/usr/local/cargo/git
   -v freshell-sandbox-cargo-target:/workspace/target
   -v freshell-sandbox-node-modules:/workspace/node_modules
+  # pnpm workspace members with their own dependencies get their own
+  # sandbox-owned node_modules (the entrypoint chowns and, on fingerprint
+  # changes, purges these only as mounted volumes). On legacy npm-era
+  # branches these stay mounted-but-unused and harmless.
+  -v freshell-sandbox-sidecar-node-modules:/workspace/crates/freshell-claude-sidecar/node_modules
+  -v freshell-sandbox-mcp-node-modules:/workspace/packages/freshell-mcp-runtime/node_modules
   -v freshell-sandbox-playwright-cache:/home/sandbox/.cache/ms-playwright
 )
 
@@ -72,7 +114,7 @@ fi
 # bind-mounted repo (e.g. -v ...:/workspace/target) needs a mount point at
 # ${REPO_ROOT}/target on the host side; in a freshly cloned/worktree'd repo
 # that path doesn't exist yet, so dockerd creates it — root-owned. That stub
-# then breaks host-side `cargo`/`npm` in this worktree with EACCES the next
+# then breaks host-side `cargo`/`pnpm` in this worktree with EACCES the next
 # time a human (not root) tries to write there.
 #
 # Fix: pre-create every such mount point ourselves, as the invoking user,
@@ -100,7 +142,7 @@ docker "${DOCKER_ARGS[@]}" "${IMAGE_TAG}" bash -c "${CMD}" || DOCKER_STATUS=$?
 # than assuming it. If dockerd (or a future volume/mount this script doesn't
 # yet know to pre-create) still left a root-owned entry directly under the
 # repo root, fail loudly with a concrete remediation instead of leaving the
-# next `cargo build`/`npm install` on the host to fail with a bare EACCES.
+# next `cargo build`/`pnpm install` on the host to fail with a bare EACCES.
 ROOT_DROPPINGS="$(find "${REPO_ROOT}" -maxdepth 1 -user root 2>/dev/null || true)"
 if [ -n "${ROOT_DROPPINGS}" ]; then
   echo "[sandbox] ERROR: root-owned entries found directly under ${REPO_ROOT}:" >&2

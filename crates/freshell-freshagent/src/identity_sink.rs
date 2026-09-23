@@ -158,6 +158,34 @@ pub struct FreshAgentBindingUpsert {
     /// G3 supersession (V8/A14): OLD session id this binding replaces
     /// (codex crash-respawn passes the old thread id; everyone else None).
     pub supersedes: Option<String>,
+    /// Unified agent names (Task 2): the naming transition classification,
+    /// carried SEPARATELY from `supersedes` (which cannot distinguish a
+    /// rollback fork from a crash-recovery mint-new from a deliberate new
+    /// conversation). `None` = the write carries no naming fact (kilroy,
+    /// out-of-scope lanes, or a provider that drives naming at another
+    /// site).
+    ///
+    /// T2-M5 disposition (Task 4, truthful trim): the classification is
+    /// consumed at the RUNTIME LANES THAT DECLARE IT, through the shared
+    /// classification-driven fold (`crate::naming::fold_identity_transition`)
+    /// — claude's init lane (InitialMaterialization for a verified
+    /// materialization, InternalContinuation for a rollback fork;
+    /// prospective evidence retains the handle) and opencode's
+    /// materialization upsert. The SERVER's `record_binding`
+    /// (freshell-server's identity_sink) does NOT fold this field — it
+    /// builds the pane-ledger write without it; the field rides the wire
+    /// shape for the declaring lanes and any future server-side
+    /// composition. Codex's identity-event upserts declare `None`
+    /// deliberately: the durable-before-answer ledger write precedes the
+    /// rollout-driven bind, so the classification is not yet verified at
+    /// upsert time (codex's rollout bind classifies through the shared
+    /// fold directly, and its callers log the declared transition as
+    /// provenance). The remaining reasons (InitialRecovery, Resume,
+    /// Switch, NewConversation) currently have no production declarer —
+    /// those behaviors are implemented by the Task 2 lanes through
+    /// direct sink calls; the fold's arms carry the shared policy for
+    /// when a lane does declare them.
+    pub name_transition: Option<crate::naming::NameTransition>,
     /// D8 provenance write policy (see [`ProvenanceUpdate`]; the ledger's
     /// atomic apply/preserve/clear merge lives in `freshell-ws`'s pane
     /// ledger).
@@ -926,6 +954,7 @@ impl FakeIdentitySink {
                 .insert((provider.into(), session_id.into()), s.clone());
         }
         self.bindings.lock().unwrap().push(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: provider.into(),
             session_id: session_id.into(),
             mode: String::new(),
@@ -1902,6 +1931,7 @@ mod tests {
             .await
             .expect("pending write ok");
         fake.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_1".into(),
             mode: "freshopencode".into(),
@@ -1944,6 +1974,7 @@ mod tests {
     async fn fake_sink_blank_settings_binding_is_lineage_only() {
         let fake = Arc::new(FakeIdentitySink::default());
         fake.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_blank".into(),
             mode: "freshopencode".into(),
@@ -1990,6 +2021,7 @@ mod tests {
     async fn fake_sink_lookup_by_create_request_id_resolves_lineage() {
         let fake = Arc::new(FakeIdentitySink::default());
         fake.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_abc".into(),
             mode: "freshopencode".into(),
@@ -2128,6 +2160,7 @@ mod tests {
 
         // A stamped lineage-only row (blank settings) still answers.
         fake.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_prov".into(),
             mode: "freshopencode".into(),
@@ -2162,6 +2195,7 @@ mod tests {
         // A later conn-less write (all-None stamps) keeps them — and a partial
         // stamp touches NOTHING (the attribution fact is atomic).
         fake.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_prov".into(),
             mode: "freshopencode".into(),
@@ -2178,6 +2212,7 @@ mod tests {
         .await
         .expect("conn-less refresh ok");
         fake.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_prov".into(),
             mode: "freshopencode".into(),
@@ -2215,6 +2250,7 @@ mod tests {
         // mirrored): an OLDER full-triple assertion never drags the
         // attribution back; an equal-or-newer one replaces it.
         fake.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_prov".into(),
             mode: "freshopencode".into(),
@@ -2239,6 +2275,7 @@ mod tests {
         assert_eq!(p.client_instance_id.as_deref(), Some("client-1"));
         assert_eq!(p.asserted_at, 111, "the older assertion never applies");
         fake.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_prov".into(),
             mode: "freshopencode".into(),
@@ -2265,6 +2302,7 @@ mod tests {
 
         // A genuinely unattributed row answers None — never Some(default).
         fake.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_unstamped".into(),
             mode: "freshopencode".into(),
@@ -2292,6 +2330,7 @@ mod tests {
     async fn fake_sink_clear_provenance_erases_the_tracked_stamps() {
         let fake = Arc::new(FakeIdentitySink::default());
         fake.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_clr".into(),
             mode: "freshopencode".into(),
@@ -2315,6 +2354,7 @@ mod tests {
         assert!(fake.load_provenance("opencode", "ses_clr").is_some());
 
         fake.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_clr".into(),
             mode: "freshopencode".into(),
@@ -2337,6 +2377,7 @@ mod tests {
         );
         // Inherit afterwards has nothing to keep: the stamps stay gone.
         fake.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_clr".into(),
             mode: "freshopencode".into(),
@@ -2364,6 +2405,7 @@ mod tests {
     async fn fake_sink_mirrors_the_kill_tombstone_fence_and_the_claim_clear() {
         let fake = Arc::new(FakeIdentitySink::default());
         let upsert = || FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "claude".into(),
             session_id: "durable-m".into(),
             mode: "freshclaude".into(),
@@ -2476,6 +2518,7 @@ mod tests {
             "the refusal never revived"
         );
         fake.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "claude".into(),
             session_id: "durable-cc".into(),
             mode: "freshclaude".into(),
@@ -2511,6 +2554,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn fake_orphan_gate_applies_at_release_against_the_tombstone_state() {
         let upsert = || FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "claude".into(),
             session_id: "durable-g".into(),
             mode: "freshclaude".into(),
@@ -2553,6 +2597,7 @@ mod tests {
         // — the gate proves the write would have applied but for the tombstone.
         let gate = fake.arm_orphan_binding_gate("claude", "durable-h");
         fake.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "claude".into(),
             session_id: "durable-h".into(),
             observed_epoch: None,

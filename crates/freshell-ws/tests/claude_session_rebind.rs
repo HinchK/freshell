@@ -21,6 +21,18 @@
 //! Phase 7 (foreign provider, Discard): a signal naming a SHELL-mode pane is
 //!   explicitly ignored and CONSUMED (Discard, not Retain) -- no associated
 //!   frame, file deleted, so it cannot warn-log every sweep for 10 minutes.
+//! Phase 8 (unified agent names, first-bind transfer): a fresh claude pane's
+//!   pre-durable pending record -- carrying a pre-identity manual rename --
+//!   transfers onto the CLI-reported session once its transcript verifies
+//!   durability (the claude signal lane's bind).
+//! Phase 9 (unified agent names, conversation switch): a pane already bound
+//!   to one durable session switches to a NEW session with its OWN record --
+//!   the pane's naming ref follows the move, the new session's own name
+//!   surfaces (never a copy), and renames keep resolving post-transition.
+//! Phase 10 (unified agent names, zero-turn tick bind): a zero-turn fresh
+//!   claude create stays pending until its transcript appears; the naming
+//!   tick then transfers the record, advances the identity binding, and the
+//!   row leaves the pending reconcile list.
 //!
 //! Determinism: the test calls `drain_and_rebind_claude` directly on a state
 //! handle (the brief's preferred shape) instead of racing a spawned sweep
@@ -31,6 +43,18 @@
 #[cfg(unix)]
 mod common;
 
+#[cfg(unix)]
+use freshell_freshagent::naming::{
+    BindNameInput, PendingNameInput, RenameNameInput, SessionNaming as _,
+};
+#[cfg(unix)]
+use freshell_protocol::native_location::{
+    NativeAcquisition, NativeEvidenceKind, NativeLocation, NativePersistence,
+};
+#[cfg(unix)]
+use freshell_protocol::session_names::NameIntent;
+#[cfg(unix)]
+use freshell_protocol::session_names::{NamedProvider, SessionNameRef};
 #[cfg(unix)]
 use futures_util::{SinkExt, StreamExt};
 #[cfg(unix)]
@@ -122,8 +146,12 @@ fn registry_resume_id(
 
 /// [`common::spawn_server_with_specs`], but ALSO returning the `WsState`
 /// handle so the test can drive `drain_and_rebind_claude` directly
-/// (deterministic -- no sweep-timer race). `WsState` is Clone (every field
-/// is an Arc/primitive), so the clone shares the server's live stores.
+/// (deterministic -- no sweep-timer race) — and, like
+/// [`common::spawn_server_with_specs_and_naming`], wiring the ONE
+/// `NamingProbeSink` naming authority into the identity registry and the
+/// fresh states, returning it so the naming phases can pre-seed records and
+/// inspect transfers. `WsState` is Clone (every field is an Arc/primitive),
+/// so the clone shares the server's live stores.
 #[cfg(unix)]
 async fn spawn_server_returning_state(
     cli_commands: Vec<freshell_platform::CliCommandSpec>,
@@ -131,6 +159,7 @@ async fn spawn_server_returning_state(
     String,
     freshell_terminal::TerminalRegistry,
     freshell_ws::WsState,
+    std::sync::Arc<common::NamingProbeSink>,
 ) {
     use std::sync::Arc;
     let auth_token = Arc::new(common::AUTH_TOKEN.to_string());
@@ -139,12 +168,15 @@ async fn spawn_server_returning_state(
         serde_json::from_value(common::test_settings_value()).expect("valid settings fixture"),
     );
     let registry = freshell_terminal::TerminalRegistry::new();
+    let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+    let sink = Arc::new(common::NamingProbeSink::default());
+    identity.set_session_naming(sink.clone());
 
     let state = freshell_ws::WsState {
         layout: Default::default(),
         terminal_meta: Default::default(),
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
-        identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        identity,
         auth_token: Arc::clone(&auth_token),
         server_instance_id: Arc::new("srv-test".to_string()),
         boot_id: Arc::new("boot-test".to_string()),
@@ -153,18 +185,31 @@ async fn spawn_server_returning_state(
         broadcast_tx: Arc::clone(&broadcast_tx),
         auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
         auto_resume_cancels: Default::default(),
-        fresh_codex: freshell_freshagent::FreshCodexState::new(
-            Arc::clone(&auth_token),
-            Arc::clone(&broadcast_tx),
-            serde_json::json!({ "freshAgent": { "enabled": true } }),
-        ),
-        fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
-        fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
-            freshell_freshagent::FreshAgentState::new(
+        fresh_codex: {
+            let fresh_codex = freshell_freshagent::FreshCodexState::new(
                 Arc::clone(&auth_token),
                 Arc::clone(&broadcast_tx),
-            ),
-        ),
+                serde_json::json!({ "freshAgent": { "enabled": true } }),
+            );
+            fresh_codex.set_session_naming(sink.clone());
+            fresh_codex
+        },
+        fresh_claude: {
+            let fresh_claude =
+                freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+            fresh_claude.set_session_naming(sink.clone());
+            fresh_claude
+        },
+        fresh_opencode: {
+            let fresh_opencode = freshell_freshagent::FreshOpencodeState::new(
+                freshell_freshagent::FreshAgentState::new(
+                    Arc::clone(&auth_token),
+                    Arc::clone(&broadcast_tx),
+                ),
+            );
+            fresh_opencode.set_session_naming(sink.clone());
+            fresh_opencode
+        },
         registry: registry.clone(),
         tabs: freshell_ws::tabs::TabsRegistry::new(),
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
@@ -202,7 +247,7 @@ async fn spawn_server_returning_state(
         let _ = axum::serve(listener, router).await;
     });
 
-    (format!("ws://{addr}/ws", addr = addr), registry, state)
+    (format!("ws://{addr}/ws"), registry, state, sink)
 }
 
 /// Scan WS text frames until the next `terminal.session.associated` for
@@ -274,8 +319,7 @@ async fn send_create(ws: &mut common::TestWs, body: serde_json::Value) -> serde_
 
 /// Minimal fake claude sidecar speaking the newline-JSON protocol: answers
 /// `create` with `created` + `sdk.session.init` (echoing resumeSessionId as
-/// the durable cliSessionId), exits on `shutdown`.
-#[cfg(unix)]
+/// the durable cliSessionId), exits on `shutdown`.#[cfg(unix)]
 const FAKE_CLAUDE_SIDECAR_SOURCE: &str = r#"import readline from 'node:readline'
 
 let counter = 0
@@ -339,6 +383,30 @@ impl Drop for FakeClaudeEnv {
     }
 }
 
+/// Unified agent names (phases 8-10): plant
+/// `<store>/projects/<project>/<session_id>.jsonl` — the exact direct-layout
+/// file `locate_transcript_selected` accepts as VERIFIED durability evidence
+/// (a first `cwd`-bearing line so the selected-cwd read also answers).
+#[cfg(unix)]
+fn plant_claude_transcript(store: &std::path::Path, session_id: &str) {
+    let dir = store.join("projects").join("-freshell-naming-store");
+    std::fs::create_dir_all(&dir).expect("create transcript project dir");
+    std::fs::write(
+        dir.join(format!("{session_id}.jsonl")),
+        "{\"type\":\"user\",\"cwd\":\"/tmp/naming-proj\",\"message\":\"hi\"}\n",
+    )
+    .expect("plant transcript");
+}
+
+/// The naming phases' durable session ref.
+#[cfg(unix)]
+fn claude_session_ref(session_id: &str) -> SessionNameRef {
+    SessionNameRef::Session {
+        provider: NamedProvider::Claude,
+        session_id: session_id.to_string(),
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn session_start_signal_rebinds_and_restores_the_new_id() {
@@ -368,7 +436,8 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
     std::fs::create_dir_all(&signal_root).expect("signal root");
     let watcher = freshell_ws::claude_signal::ClaudeSignalWatcher::new(signal_root.clone());
 
-    let (url, registry, state) = spawn_server_returning_state(vec![claude_capture_spec()]).await;
+    let (url, registry, state, sink) =
+        spawn_server_returning_state(vec![claude_capture_spec()]).await;
     let (mut ws, _inventory) = common::connect_and_capture_inventory(&url).await;
 
     // ── Phase 1 -- mid-session rebind: fresh claude pane (identity A via the
@@ -755,12 +824,351 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
         "a foreign-provider pane must never be rebound by a claude signal"
     );
 
+    // ── Phase 8 — unified agent names: FIRST-BIND TRANSFER (claude signal).
+    // A fresh claude pane's pre-durable pending record — carrying the user's
+    // pre-identity manual rename — must transfer onto the CLI-reported
+    // session the moment its durability verifies (the transcript exists), so
+    // no pre-identity rename is ever orphaned behind a spent handle.
+    let capture_p8 = capture_for("pane8");
+    let _ = std::fs::remove_file(&capture_p8);
+    std::env::set_var("CLAUDE_ARGV_CAPTURE_PATH", &capture_p8);
+    let created8 = send_create(
+        &mut ws,
+        json!({
+            "type": "terminal.create",
+            "requestId": "req-claude-rebind-8",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+        }),
+    )
+    .await;
+    let tid8 = created8["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let handle8 = created8["nameRef"]["id"]
+        .as_str()
+        .expect("a fresh scoped create carries its pending namingHandle")
+        .to_string();
+    // The user renamed the pane BEFORE any durable identity existed — the
+    // rename targets the pending record (the only one that exists).
+    sink.rename(RenameNameInput {
+        target: SessionNameRef::Pending {
+            id: handle8.clone(),
+        },
+        name: "Pre Identity Name".into(),
+        intent: NameIntent::User,
+        if_revision: None,
+    })
+    .await
+    .expect("pre-identity rename lands on the pending record");
+
+    // The CLI reports a NEW session (B2) whose transcript already exists on
+    // disk — the signal lane's verified first-bind. The naming phases own
+    // CLAUDE_CONFIG_DIR from here (phase 4's fake sidecar is long done).
+    let naming_store = tempfile::tempdir().expect("naming transcript store");
+    std::env::set_var("CLAUDE_CONFIG_DIR", naming_store.path());
+    let b2 = "88888888-9999-4aaa-8bbb-cccccccc0001";
+    plant_claude_transcript(naming_store.path(), b2);
+    std::fs::write(
+        signal_root.join(format!("{tid8}__1770000000000000001-1.json")),
+        format!(r#"{{"session_id":"{b2}","source":"resume","hook_event_name":"SessionStart"}}"#),
+    )
+    .expect("write signal file");
+    freshell_ws::claude_signal::drain_and_rebind_claude(&state, &watcher).await;
+    tokio::task::yield_now().await;
+
+    let rebound8 = next_associated_frame(&mut ws, &tid8, "phase8/first-bind").await;
+    assert_eq!(
+        rebound8["sessionRef"],
+        json!({ "provider": "claude", "sessionId": b2 }),
+        "the first-bind signal must move the pane onto the reported session: {rebound8}"
+    );
+    // The pending record transferred onto the durable session, carrying the
+    // pre-identity manual name with it.
+    let bound8 = sink
+        .get(vec![claude_session_ref(b2)])
+        .await
+        .expect("get through the probe sink");
+    assert_eq!(
+        bound8.len(),
+        1,
+        "the first-bind must create the durable session's record (C1's dead lane left it absent)"
+    );
+    assert_eq!(
+        bound8[0].record.name, "Pre Identity Name",
+        "the pending record's manual name must carry through the bind"
+    );
+    assert_eq!(
+        state.identity.name_ref_for(&tid8),
+        Some(claude_session_ref(b2)),
+        "the pane's naming ref must follow the verified first-bind"
+    );
+    assert!(
+        !state
+            .identity
+            .pending_naming_binds()
+            .iter()
+            .any(|(t, ..)| *t == tid8),
+        "a bound row leaves the pending reconcile list"
+    );
+
+    // ── Phase 9 — unified agent names: CONVERSATION SWITCH ADOPTS THE NEW
+    // SESSION'S OWN NAME. C2 is a previously-named session with its OWN
+    // record; the pane (bound to B2) switches to it. The pane's naming ref
+    // must follow the move (the switch rule), the new session's own record
+    // must surface (never a copy of the old name), and renames must keep
+    // resolving through the pane's CURRENT binding after the transition.
+    let c2 = "88888888-9999-4aaa-8bbb-cccccccc0002";
+    sink.ensure_pending(PendingNameInput {
+        handle: "handle-c2".into(),
+        provider: NamedProvider::Claude,
+        cwd: None,
+    })
+    .await
+    .expect("seed C2's own record");
+    sink.bind_pending(BindNameInput {
+        pending: SessionNameRef::Pending {
+            id: "handle-c2".into(),
+        },
+        target: claude_session_ref(c2),
+        acquisition: NativeAcquisition {
+            location: NativeLocation::Claude {
+                config_root: naming_store.path().to_string_lossy().into_owned(),
+                transcript_path: None,
+                project_directory_key: None,
+                transcript_cwd: Some("/tmp/naming-proj".into()),
+                effective_project_key_override: None,
+            },
+            evidence: NativeEvidenceKind::SelectedTranscript,
+            persistence: NativePersistence::Verified,
+        },
+    })
+    .await
+    .expect("bind C2's seed record");
+    sink.rename(RenameNameInput {
+        target: claude_session_ref(c2),
+        name: "C Own Name".into(),
+        intent: NameIntent::User,
+        if_revision: None,
+    })
+    .await
+    .expect("name C2");
+
+    // C2 has no transcript in the naming store: the switch's own locate
+    // misses (prospective), but the IDENTITY MOVE itself must retarget the
+    // pane's naming ref onto the new session — the switch adopts the new
+    // session's name.
+    std::fs::write(
+        signal_root.join(format!("{tid8}__1770000000000000002-1.json")),
+        format!(r#"{{"session_id":"{c2}","source":"resume"}}"#),
+    )
+    .expect("write switch signal");
+    freshell_ws::claude_signal::drain_and_rebind_claude(&state, &watcher).await;
+    tokio::task::yield_now().await;
+
+    let rebound9 = next_associated_frame(&mut ws, &tid8, "phase9/switch").await;
+    assert_eq!(
+        rebound9["sessionRef"],
+        json!({ "provider": "claude", "sessionId": c2 }),
+        "the switch signal must move the pane: {rebound9}"
+    );
+    assert_eq!(
+        rebound9["previousSessionId"],
+        json!(b2),
+        "the switch must supersede the bound session: {rebound9}"
+    );
+    assert_eq!(
+        state.identity.name_ref_for(&tid8),
+        Some(claude_session_ref(c2)),
+        "the pane's naming ref must follow the conversation switch (an established \
+         binding never strands the pane on the superseded session)"
+    );
+    let got_c2 = sink
+        .get(vec![claude_session_ref(c2)])
+        .await
+        .expect("get C2");
+    assert_eq!(
+        got_c2[0].record.name, "C Own Name",
+        "the new session's OWN record must surface through the pane's binding"
+    );
+    // Renames keep resolving after the transition: a rename through the
+    // pane's CURRENT binding lands on C2's record.
+    sink.rename(RenameNameInput {
+        target: state.identity.name_ref_for(&tid8).expect("current binding"),
+        name: "Renamed After Switch".into(),
+        intent: NameIntent::User,
+        if_revision: None,
+    })
+    .await
+    .expect("rename through the pane's current binding");
+    let again_c2 = sink
+        .get(vec![claude_session_ref(c2)])
+        .await
+        .expect("get C2");
+    assert_eq!(again_c2[0].record.name, "Renamed After Switch");
+    // The OLD session keeps its own name — a switch never copies it over.
+    let kept_b2 = sink
+        .get(vec![claude_session_ref(b2)])
+        .await
+        .expect("get B2");
+    assert_eq!(
+        kept_b2[0].record.name, "Pre Identity Name",
+        "the superseded session's record must survive the switch untouched"
+    );
+
+    // ── Phase 10 — unified agent names: A ZERO-TURN CREATE BINDS VIA THE
+    // TICK. The pane's preallocated session has no transcript yet (zero
+    // turns): the naming tick's claude reconcile leaves the row pending; once
+    // the transcript lands, the SAME tick transfers the pending record,
+    // advances the identity binding, and the row leaves the pending list (no
+    // re-location on subsequent ticks).
+    let capture_p10 = capture_for("pane10");
+    let _ = std::fs::remove_file(&capture_p10);
+    std::env::set_var("CLAUDE_ARGV_CAPTURE_PATH", &capture_p10);
+    let created10 = send_create(
+        &mut ws,
+        json!({
+            "type": "terminal.create",
+            "requestId": "req-claude-rebind-10",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+        }),
+    )
+    .await;
+    let tid10 = created10["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let handle10 = created10["nameRef"]["id"]
+        .as_str()
+        .expect("pending namingHandle")
+        .to_string();
+    let pre10 = common::session_ref_of(&created10)
+        .expect("fresh claude carries a preallocated ref")["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+
+    // Zero-turn: no transcript yet — the row stays pending and the tick's
+    // reconcile is a no-op.
+    assert!(
+        state
+            .identity
+            .pending_naming_binds()
+            .iter()
+            .any(|(t, p, s, h)| *t == tid10 && p == "claude" && s == &pre10 && h == &handle10),
+        "a fresh scoped create must sit on the pending reconcile list"
+    );
+    let bound_missing = freshell_ws::identity::bind_pending_claude_transcript(
+        &state.identity,
+        &state.registry,
+        &tid10,
+        &pre10,
+    )
+    .await;
+    assert!(
+        !bound_missing,
+        "no transcript yet: the tick must leave the row pending"
+    );
+    assert!(
+        state
+            .identity
+            .pending_naming_binds()
+            .iter()
+            .any(|(t, ..)| *t == tid10),
+        "a miss keeps the row listed for the next tick's retry"
+    );
+
+    // The transcript appears (the CLI wrote its first turn) — the tick binds.
+    plant_claude_transcript(naming_store.path(), &pre10);
+    let bound_tick = freshell_ws::identity::bind_pending_claude_transcript(
+        &state.identity,
+        &state.registry,
+        &tid10,
+        &pre10,
+    )
+    .await;
+    assert!(
+        bound_tick,
+        "the tick must bind once the transcript verifies durability"
+    );
+    assert_eq!(
+        state.identity.name_ref_for(&tid10),
+        Some(claude_session_ref(&pre10)),
+        "a successful tick bind must advance the identity binding (I2)"
+    );
+    assert!(
+        !state
+            .identity
+            .pending_naming_binds()
+            .iter()
+            .any(|(t, ..)| *t == tid10),
+        "a successfully bound row leaves the pending list (no re-location on \
+         subsequent ticks)"
+    );
+    let ticked = sink
+        .get(vec![claude_session_ref(&pre10)])
+        .await
+        .expect("get the tick-bound record");
+    assert_eq!(
+        ticked.len(),
+        1,
+        "the tick's transfer creates the durable record"
+    );
+
+    // ── Phase 11 — unified agent names: A RECOVERY CREATE RE-STAMPS THE
+    // PERSISTED PRE-DURABLE HANDLE. A zero-turn pane's server restart
+    // recovers its terminal with BOTH the preallocated (prospective)
+    // sessionRef and the pane content's persisted namingHandle on the
+    // create frame. The durable branch's sessionRef targets a
+    // PROSPECTIVE id — no record exists — so the admission must fall
+    // back to the PENDING handle (the fresh branch): the restored
+    // terminal's registry row carries Pending{handle} and the sweep's
+    // verified bind can transfer the record. Without it the restored row
+    // has NO binding and the pre-durable rename is orphaned forever.
+    let capture_p11 = capture_for("pane11");
+    let _ = std::fs::remove_file(&capture_p11);
+    std::env::set_var("CLAUDE_ARGV_CAPTURE_PATH", &capture_p11);
+    let pre11 = "77777777-8888-4999-8aaa-cccccccc0011".to_string();
+    let created11 = send_create(
+        &mut ws,
+        json!({
+            "type": "terminal.create",
+            "requestId": "req-claude-rebind-11",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": pre11 },
+            "restore": true,
+            "namingHandle": "nh-persisted-restore",
+        }),
+    )
+    .await;
+    let tid11 = created11["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    assert_eq!(
+        registry.name_ref_of(&tid11),
+        Some(SessionNameRef::Pending {
+            id: "nh-persisted-restore".to_string()
+        }),
+        "a recovery create against a PROSPECTIVE (record-less) sessionRef \
+         must re-stamp the persisted pre-durable handle"
+    );
+
     state.fresh_claude.shutdown().await; // reap the fake node child
 
     registry.kill(&tid2);
     registry.kill(&tid3);
     registry.kill(&tid4);
     registry.kill(&tid6);
+    registry.kill(&tid8);
+    registry.kill(&tid10);
+    registry.kill(&tid11);
     let _ = std::fs::remove_dir_all(&signal_root);
     std::env::remove_var("CLAUDE_ARGV_CAPTURE_PATH");
     std::env::remove_var("CLAUDE_CMD");

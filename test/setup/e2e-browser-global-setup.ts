@@ -1,16 +1,16 @@
-import { execFileSync } from 'node:child_process'
+import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { GlobalSetupContext } from 'vitest/node'
-import { resolveNpmExecFileCommand } from './npm-command.js'
+import { resolveManagerExecFileCommand } from './manager-command.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const PROJECT_ROOT = path.resolve(__dirname, '../..')
 
 interface EnsureBuiltRuntimeDeps {
-  execFileSync: typeof execFileSync
+  spawnSync: typeof spawnSync
   rmSync: typeof fs.rmSync
   env: NodeJS.ProcessEnv
   platform: NodeJS.Platform
@@ -23,7 +23,7 @@ interface InstallBuiltRuntimeRefreshDeps {
 export function ensureBuiltRuntime(
   projectRoot: string,
   deps: EnsureBuiltRuntimeDeps = {
-    execFileSync,
+    spawnSync,
     rmSync: fs.rmSync,
     env: process.env,
     platform: process.platform,
@@ -33,20 +33,22 @@ export function ensureBuiltRuntime(
     ...deps.env,
     NODE_ENV: 'production',
   }
-  const prebuild = resolveNpmExecFileCommand(['run', 'prebuild'], deps.env, deps.platform)
-  deps.execFileSync(prebuild.command, prebuild.args, {
+  const prebuild = resolveManagerExecFileCommand(['run', 'prebuild'], deps.env, deps.platform, process.execPath, projectRoot)
+  deps.spawnSync(prebuild.command, prebuild.args, {
     cwd: projectRoot,
     env,
     stdio: 'inherit',
+    shell: prebuild.viaShell ?? false,
   })
   deps.rmSync(path.join(projectRoot, 'dist', '.env'), { force: true })
-  const npm = resolveNpmExecFileCommand(['run', 'build:client'], deps.env, deps.platform)
-  deps.execFileSync(npm.command, npm.args, {
+  const client = resolveManagerExecFileCommand(['run', 'build:client'], deps.env, deps.platform, process.execPath, projectRoot)
+  deps.spawnSync(client.command, client.args, {
     cwd: projectRoot,
     env,
     stdio: 'inherit',
+    shell: client.viaShell ?? false,
   })
-  deps.execFileSync('cargo', ['build', '--release', '-p', 'freshell-server', '--locked'], {
+  deps.spawnSync('cargo', ['build', '--release', '-p', 'freshell-server', '--locked'], {
     cwd: projectRoot,
     env,
     stdio: 'inherit',

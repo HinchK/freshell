@@ -5,8 +5,10 @@
  * a genuine missing pane, so it is deliberately never used as a poll signal.
  */
 
+import type { SessionNameRef } from '@shared/session-names'
+
 export type PaneRenameResponse =
-  | { data?: { paneId?: string; tabId?: string; tabRenamed?: boolean }; message?: string }
+  | { data?: { paneId?: string; tabId?: string; tabRenamed?: boolean; sessionName?: unknown }; message?: string }
   | null
   | undefined
 
@@ -114,6 +116,13 @@ function resultMessage(response: PaneRenameResponse): string {
  * Wait for Rust's exact `GET /api/panes?tabId` receipt, then make a single
  * rename PATCH. The caller owns the AbortSignal so a closed pane or unmounted
  * container cannot leave a delayed request updating stale UI.
+ *
+ * Unified agent names (Task 5): a scoped pane's rename carries the editor's
+ * captured naming target (`expectedNameRef`), the explicit user intent, and
+ * the captured revision (`ifRevision`) — the server routes a scoped target
+ * to the one canonical session name, and the capture guards refuse a rename
+ * that lands after the pane switched conversations. The deadline/membership
+ * probe and abort contract are unchanged.
  */
 export async function renamePaneAfterMirrorReady(
   tabId: string,
@@ -127,6 +136,9 @@ export async function renamePaneAfterMirrorReady(
     now?: () => number
     deadlineMs?: number
     pollIntervalMs?: number
+    expectedNameRef?: SessionNameRef
+    nameIntent?: 'user' | 'automatic'
+    ifRevision?: number
   },
 ): Promise<PaneRenameResult> {
   const { signal } = opts
@@ -176,7 +188,16 @@ export async function renamePaneAfterMirrorReady(
 
   throwIfAborted(signal)
   const response = await awaitWithAbort(
-    opts.patch(`/api/panes/${encodeURIComponent(paneId)}`, { name }, { signal }),
+    opts.patch(
+      `/api/panes/${encodeURIComponent(paneId)}`,
+      {
+        name,
+        ...(opts.nameIntent !== undefined ? { nameIntent: opts.nameIntent } : {}),
+        ...(opts.ifRevision !== undefined ? { ifRevision: opts.ifRevision } : {}),
+        ...(opts.expectedNameRef !== undefined ? { expectedNameRef: opts.expectedNameRef } : {}),
+      },
+      { signal },
+    ),
     signal,
   )
   throwIfAborted(signal)

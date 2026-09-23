@@ -555,9 +555,15 @@ fn terminal_created_notice_is_optional_and_additive() {
         restore_error: None,
         session_ref: None,
         notice: None,
+        session_name: None,
+        name_ref: None,
     };
     let json = serde_json::to_value(ServerMessage::TerminalCreated(created.clone())).unwrap();
     assert!(json.get("notice").is_none());
+    // Unified agent names (Task 2): absent naming fields stay omitted — the
+    // additive-optional wire contract holds for the frozen client.
+    assert!(json.get("sessionName").is_none());
+    assert!(json.get("nameRef").is_none());
 
     // Present => serialized verbatim.
     let mut with_notice = created;
@@ -612,5 +618,37 @@ fn terminal_created_roundtrips_with_and_without_notice() {
             );
         }
         other => panic!("expected TerminalCreated, got {other:?}"),
+    }
+}
+
+/// Unified agent names (Task 1): the canonical name broadcast round-trips its
+/// full payload — record, document generation, pending→durable redirects
+/// (colon-containing opaque IDs ride through verbatim) — and conforms to the
+/// regenerated frozen outbound schema.
+#[test]
+fn session_name_updated_broadcast_roundtrips_and_conforms() {
+    let wire = r#"{"type":"session.name.updated","record":{"ref":{"kind":"session","provider":"codex","sessionId":"ses_1:2:3"},"name":"Ship it","source":"manual","revision":4,"manualRevision":4,"renamedAt":1739491200000},"documentGeneration":5,"redirects":[{"from":{"kind":"pending","id":"freshcodex-req-1"},"to":{"kind":"session","provider":"codex","sessionId":"ses_1:2:3"},"revision":3}],"changed":true}"#;
+    match server_roundtrip(wire, "session.name.updated") {
+        ServerMessage::SessionNameUpdated(update) => {
+            assert_eq!(update.record.revision, 4);
+            assert_eq!(update.record.source, NameSource::Manual);
+            assert_eq!(
+                update.record.name_ref,
+                SessionNameRef::Session {
+                    provider: NamedProvider::Codex,
+                    session_id: "ses_1:2:3".to_string(),
+                }
+            );
+            assert_eq!(update.document_generation, 5);
+            assert!(update.changed);
+            assert_eq!(update.redirects.len(), 1);
+            assert_eq!(
+                update.redirects[0].from,
+                SessionNameRef::Pending {
+                    id: "freshcodex-req-1".to_string()
+                }
+            );
+        }
+        other => panic!("expected SessionNameUpdated, got {other:?}"),
     }
 }

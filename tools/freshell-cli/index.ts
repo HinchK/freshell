@@ -50,6 +50,7 @@ const flagAliases: Readonly<Record<string, readonly string[]>> = {
   'session-ref': ['sessionRef'],
   resume: ['resumeSessionId'],
   other: ['with'],
+  'name-intent': ['nameIntent'],
 }
 
 const getFlag = (flags: Flags, ...names: string[]) => {
@@ -59,6 +60,21 @@ const getFlag = (flags: Flags, ...names: string[]) => {
     }
   }
   return undefined
+}
+
+/**
+ * Unified agent names (Task 5): the naming intent a create/rename verb
+ * forwards. Omitted defaults to `automatic` — neither authentication nor a
+ * CLI invocation implies human intent; only an explicit `--name-intent user`
+ * (an operator-driven automation acting for a human) may claim it.
+ */
+function resolveNameIntent(flags: Flags): 'user' | 'automatic' {
+  const raw = getFlag(flags, 'name-intent')
+  if (raw === undefined) return 'automatic'
+  if (raw === 'user' || raw === 'automatic') return raw
+  writeError('--name-intent must be "user" or "automatic".')
+  process.exitCode = 1
+  throw new Error('--name-intent must be "user" or "automatic".')
 }
 
 function resolveRenameArgs(
@@ -431,6 +447,7 @@ async function main() {
   switch (command) {
     case 'new-tab': {
       const name = (getFlag(flags, 'n', 'name', 'title') as string | undefined) || undefined
+      const nameIntent = resolveNameIntent(flags)
       const agent = getFlag(flags, 'agent') as string | undefined
       const mode = isTruthy(getFlag(flags, 'claude')) ? 'claude'
         : isTruthy(getFlag(flags, 'codex')) ? 'codex'
@@ -452,6 +469,7 @@ async function main() {
 
       const res = await client.post('/api/tabs', {
         name,
+        nameIntent,
         mode,
         shell,
         cwd,
@@ -517,6 +535,7 @@ async function main() {
         process.exitCode = 1
         return
       }
+      const nameIntent = resolveNameIntent(flags)
       const { tab, message } = await resolveTabTarget(client, target)
       if (!tab) {
         writeError(message || 'tab not found')
@@ -524,7 +543,7 @@ async function main() {
         return
       }
       if (message) writeError(message)
-      const res = await client.patch(`/api/tabs/${encodeURIComponent(tab.id)}`, { name })
+      const res = await client.patch(`/api/tabs/${encodeURIComponent(tab.id)}`, { name, nameIntent })
       writeJson(res)
       return
     }
@@ -626,6 +645,7 @@ async function main() {
         process.exitCode = 1
         return
       }
+      const nameIntent = resolveNameIntent(flags)
 
       const resolved = await resolvePaneTarget(client, target)
       if (!resolved.pane?.id) {
@@ -635,7 +655,7 @@ async function main() {
       }
       if (resolved.message) writeError(resolved.message)
 
-      const res = await client.patch(`/api/panes/${encodeURIComponent(resolved.pane.id)}`, { name })
+      const res = await client.patch(`/api/panes/${encodeURIComponent(resolved.pane.id)}`, { name, nameIntent })
       writeJson(res)
       return
     }

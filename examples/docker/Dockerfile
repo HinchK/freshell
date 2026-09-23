@@ -24,10 +24,24 @@ RUN cargo build --release -p freshell-server --locked
 FROM node:24-slim AS client-builder
 
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci --ignore-scripts
+# Workspace member manifests must precede the frozen install: pnpm resolves
+# every importer listed in pnpm-workspace.yaml before touching the lock. Each
+# member manifest needs its destination directory spelled out — a multi-file
+# COPY into ./ flattens file sources by basename, which would overwrite the
+# root package.json with the member's manifest.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY crates/freshell-claude-sidecar/package.json crates/freshell-claude-sidecar/
+COPY packages/freshell-mcp-runtime/package.json packages/freshell-mcp-runtime/
+
+# npm appears only as the pinned pnpm bootstrap; dependency installation is
+# pnpm against the workspace lock. --ignore-scripts preserves this example
+# stage's intentional script-free install (the npm-era stage ran
+# `npm ci --ignore-scripts`).
+RUN npm install -g pnpm@10.34.5 \
+  && pnpm install --frozen-lockfile --ignore-scripts
+
 COPY . .
-RUN npm run build:client
+RUN pnpm run build:client
 
 # ---------------------------------------------------------------------------
 # Stage 3: only the Rust executable and static client are shipped.

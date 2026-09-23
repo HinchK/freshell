@@ -90,11 +90,23 @@ pub trait ConnectedOpencodeStream: Send {
     ) -> futures::future::BoxFuture<'static, Result<(), String>>;
 }
 
+/// The native-title observation fold seam: `(terminal_id, session_id,
+/// title)` from a `session.updated` `properties.info` payload.
+pub type NativeTitleObserver = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
+
 /// The lane's injected IO seams. Installed on the hub once at boot
 /// (`ActivityHub::set_opencode_lane_deps`); fakes in tests.
 pub struct OpencodeLaneDeps {
     pub http: Arc<dyn OpencodeLaneHttp>,
     pub events: Arc<dyn OpencodeEventStream>,
+    /// Unified agent names (Task 3): the native-title observation fold —
+    /// `(terminal_id, session_id, title)` from a `session.updated`
+    /// `properties.info` payload. `None` in tests/out-of-scope boots (the
+    /// observation is then dropped, exactly like the pre-Task-3 lane). The
+    /// observer is a sync callback because it only RESOLVES the target and
+    /// spawns the async fold; per-event handling order is preserved by the
+    /// lane's sequential pump either way.
+    pub native_title_observer: Option<NativeTitleObserver>,
 }
 
 /// Spawn the per-terminal lane task. `generation` is hub-issued at attach
@@ -239,6 +251,20 @@ impl Lane {
                     tokio::select! {
                         maybe_parsed = events_rx.recv() => {
                             let Some(parsed) = maybe_parsed else { break };
+                            // Unified agent names (Task 3): a `session.updated`
+                            // event carrying `properties.info.{id,title}` is a
+                            // NATIVE title observation (automatic — never an
+                            // intent claim). Folded BEFORE translation (the
+                            // lane vocabulary keeps `session.updated` as
+                            // activity-irrelevant); a failed fold never
+                            // disturbs the activity lane.
+                            if let Some(observer) = &self.deps.native_title_observer {
+                                if let Some((session_id, title)) =
+                                    freshell_opencode::session_title_observation(&parsed)
+                                {
+                                    observer(&self.terminal_id, &session_id, &title);
+                                }
+                            }
                             let Some(event) = translate_serve_event(&parsed) else {
                                 continue;
                             };
@@ -1478,6 +1504,7 @@ mod tests {
         let deps = Arc::new(OpencodeLaneDeps {
             http,
             events: stream,
+            native_title_observer: None,
         });
 
         let (hub, mut rx) = hub();
@@ -1591,6 +1618,7 @@ mod tests {
         let deps = Arc::new(OpencodeLaneDeps {
             http,
             events: stream,
+            native_title_observer: None,
         });
 
         let (hub, _rx) = hub();
@@ -1675,6 +1703,7 @@ mod tests {
         let deps = Arc::new(OpencodeLaneDeps {
             http,
             events: stream,
+            native_title_observer: None,
         });
 
         let (hub_ok, _rx) = hub();
@@ -1755,6 +1784,7 @@ mod tests {
         let deps_fail = Arc::new(OpencodeLaneDeps {
             http: http_fail,
             events: stream_fail,
+            native_title_observer: None,
         });
 
         let (hub_fail, _rx_fail) = hub();
@@ -1842,6 +1872,7 @@ mod tests {
         let deps = Arc::new(OpencodeLaneDeps {
             http: Arc::new(http),
             events: Arc::new(stream),
+            native_title_observer: None,
         });
         let (lane, verify_tx) = spawn_opencode_lane(
             deps,
@@ -1923,6 +1954,7 @@ mod tests {
         let deps = Arc::new(OpencodeLaneDeps {
             http: Arc::new(http),
             events: Arc::new(stream),
+            native_title_observer: None,
         });
         let (lane, verify_tx) = spawn_opencode_lane(
             deps,
@@ -2066,6 +2098,7 @@ mod tests {
         let deps = Arc::new(OpencodeLaneDeps {
             http: Arc::new(http),
             events: Arc::new(stream),
+            native_title_observer: None,
         });
         let (lane, _verify_tx) = spawn_opencode_lane(
             deps,
@@ -2176,6 +2209,7 @@ mod tests {
         let deps = Arc::new(OpencodeLaneDeps {
             http: Arc::new(http),
             events: Arc::new(stream),
+            native_title_observer: None,
         });
         let (lane, verify_tx) = spawn_opencode_lane(
             deps,
@@ -2254,6 +2288,7 @@ mod tests {
         let deps = Arc::new(OpencodeLaneDeps {
             http: Arc::new(http),
             events: Arc::new(stream),
+            native_title_observer: None,
         });
         let (lane, _verify_tx) = spawn_opencode_lane(
             deps,

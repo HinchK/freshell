@@ -20,6 +20,18 @@
 mod common;
 
 #[cfg(unix)]
+use freshell_freshagent::naming::{
+    BindNameInput, PendingNameInput, RenameNameInput, SessionNaming as _,
+};
+#[cfg(unix)]
+use freshell_protocol::native_location::{
+    NativeAcquisition, NativeEvidenceKind, NativeLocation, NativePersistence,
+};
+#[cfg(unix)]
+use freshell_protocol::session_names::NameIntent;
+#[cfg(unix)]
+use freshell_protocol::session_names::{NamedProvider, SessionNameRef};
+#[cfg(unix)]
 use futures_util::{SinkExt, StreamExt};
 #[cfg(unix)]
 use serde_json::json;
@@ -682,6 +694,301 @@ async fn after_rebind_a_recreate_resumes_the_new_session_id() {
 
     registry.kill(&terminal_id2);
     std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
+    std::env::remove_var("CODEX_HOME");
+}
+
+/// A raw `terminal.create` returning the FULL `terminal.created` frame (the
+/// naming lane tests read the frame's pre-durable `nameRef` handle) with an
+/// explicit requestId.
+#[cfg(unix)]
+async fn send_create_frame_at(
+    ws: &mut common::TestWs,
+    mode: &str,
+    request_id: &str,
+) -> serde_json::Value {
+    ws.send(WsMessage::Text(
+        json!({
+            "type": "terminal.create",
+            "requestId": request_id,
+            "mode": mode,
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send terminal.create");
+    common::next_frame_of_type(ws, "terminal.created").await
+}
+
+/// The naming lane tests' durable codex session ref.
+#[cfg(unix)]
+fn codex_session_ref(session_id: &str) -> SessionNameRef {
+    SessionNameRef::Session {
+        provider: NamedProvider::Codex,
+        session_id: session_id.to_string(),
+    }
+}
+
+/// Seed a durable record with its OWN name via a second pending handle (the
+/// "previously opened and named session" shape a fork/switch target has in
+/// production: its record exists before the pane ever points at it).
+#[cfg(unix)]
+async fn seed_named_durable_record(
+    sink: &std::sync::Arc<common::NamingProbeSink>,
+    handle: &str,
+    session_id: &str,
+    name: &str,
+) {
+    sink.ensure_pending(PendingNameInput {
+        handle: handle.to_string(),
+        provider: NamedProvider::Codex,
+        cwd: None,
+    })
+    .await
+    .unwrap();
+    sink.bind_pending(BindNameInput {
+        pending: SessionNameRef::Pending {
+            id: handle.to_string(),
+        },
+        target: codex_session_ref(session_id),
+        acquisition: NativeAcquisition {
+            location: NativeLocation::Codex {
+                codex_home: String::new(),
+                native_thread_id: Some(session_id.to_string()),
+                rollout_path: None,
+                persistence_evidence: None,
+            },
+            evidence: NativeEvidenceKind::PersistedMetadata,
+            persistence: NativePersistence::Verified,
+        },
+    })
+    .await
+    .unwrap();
+    sink.rename(RenameNameInput {
+        target: codex_session_ref(session_id),
+        name: name.to_string(),
+        intent: NameIntent::User,
+        if_revision: None,
+    })
+    .await
+    .unwrap();
+}
+
+/// Unified agent names (Task 2 review, C1/I1): the codex CLI lane's
+/// FIRST-BIND — a fresh codex pane's pre-durable pending record (carrying the
+/// user's pre-identity manual rename) transfers onto the adopted thread when
+/// the rollout locator verifies its persistence. The dead `bind_pending_naming`
+/// lane left these panes record-less forever (renames 404, pre-identity
+/// renames orphaned); this test drives the real locator adoption end to end.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_adoption_transfers_the_pending_naming_record() {
+    const OLD: &str = "019fa60f-aaaa-4bbb-8ccc-0000000000f1";
+
+    let _env = ENV_LOCK.lock().await;
+
+    // ---- env setup (serialized via ENV_LOCK: this binary owns process env) ----
+    let codex_home = tempfile::tempdir().expect("codex home");
+    let sessions_root = codex_home.path().join("sessions");
+    let sessions_day = sessions_root.join("2026").join("07").join("27");
+    std::fs::create_dir_all(&sessions_day).expect("sessions tree");
+    std::env::set_var("CODEX_HOME", codex_home.path());
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+
+    let (url, registry, sink, state) =
+        common::spawn_server_with_specs_activity_codex_locator_and_naming(
+            vec![codex_spec()],
+            &sessions_root,
+        )
+        .await;
+    let (mut ws, _inventory) = common::connect_and_capture_inventory(&url).await;
+
+    // A fresh codex pane admits its pre-durable naming handle at create.
+    let created = send_create_frame_at(&mut ws, "codex", "req-codex-name-adopt-1").await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let handle = created["nameRef"]["id"]
+        .as_str()
+        .expect("a fresh scoped create carries its pending namingHandle")
+        .to_string();
+
+    // The user renamed the pane BEFORE any durable identity existed.
+    sink.rename(RenameNameInput {
+        target: SessionNameRef::Pending { id: handle.clone() },
+        name: "Pre Identity Codex".into(),
+        intent: NameIntent::User,
+        if_revision: None,
+    })
+    .await
+    .unwrap();
+
+    // The adoption dance: first Enter (zero candidates), rollout appears,
+    // second Enter (sole new candidate) -> adoption.
+    common::send_input(&mut ws, &terminal_id, "\r").await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let cwd = std::env::temp_dir().to_string_lossy().to_string();
+    let rollout_a = sessions_day.join(format!("rollout-2026-07-27T12-00-00-{OLD}.jsonl"));
+    std::fs::write(
+        &rollout_a,
+        format!("{}\n", session_meta_line(OLD, &cwd, None)),
+    )
+    .unwrap();
+    common::send_input(&mut ws, &terminal_id, "\r").await;
+    let adopted = next_associated_frame(&mut ws, &terminal_id, "adopt/naming").await;
+    assert_eq!(
+        adopted["sessionRef"]["sessionId"], OLD,
+        "adoption must bind the thread first"
+    );
+
+    // The pending record transferred onto the adopted thread — carrying the
+    // pre-identity manual name (never orphaned behind the spent handle).
+    let bound = sink
+        .get(vec![codex_session_ref(OLD)])
+        .await
+        .expect("get through the probe sink");
+    assert_eq!(
+        bound.len(),
+        1,
+        "the codex CLI first-bind must create the durable thread's record (C1's \
+         dead lane left it absent, so every rename surface 404'd forever)"
+    );
+    assert_eq!(
+        bound[0].record.name, "Pre Identity Codex",
+        "the pending record's manual name must carry through the bind"
+    );
+    assert_eq!(
+        state.identity.name_ref_for(&terminal_id),
+        Some(codex_session_ref(OLD)),
+        "the pane's naming ref must follow the verified first-bind"
+    );
+    assert!(
+        !state
+            .identity
+            .pending_naming_binds()
+            .iter()
+            .any(|(t, ..)| *t == terminal_id),
+        "a bound row leaves the pending reconcile list"
+    );
+
+    registry.kill(&terminal_id);
+    std::env::remove_var("CODEX_HOME");
+}
+
+/// Unified agent names (Task 2 review, C1/I1): the codex CLI lane's
+/// CONVERSATION MOVE — after the first-bind, an in-TUI fork rebinds the pane
+/// onto a NEW thread that has its OWN pre-existing record; the pane's naming
+/// ref must follow the fork (an established binding never strands the pane on
+/// the superseded thread) and the new thread's own record must surface —
+/// never a copy of the old name.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_fork_retarget_surfaces_the_new_sessions_own_record() {
+    const OLD: &str = "019fa60f-aaaa-4bbb-8ccc-0000000000e1";
+    const NEW: &str = "019fa613-dddd-4eee-8fff-0000000000e2";
+
+    let _env = ENV_LOCK.lock().await;
+
+    // ---- env setup (serialized via ENV_LOCK: this binary owns process env) ----
+    let codex_home = tempfile::tempdir().expect("codex home");
+    let sessions_root = codex_home.path().join("sessions");
+    let sessions_day = sessions_root.join("2026").join("07").join("27");
+    std::fs::create_dir_all(&sessions_day).expect("sessions tree");
+    std::env::set_var("CODEX_HOME", codex_home.path());
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+
+    let (url, registry, sink, state) =
+        common::spawn_server_with_specs_activity_codex_locator_and_naming(
+            vec![codex_spec()],
+            &sessions_root,
+        )
+        .await;
+    let (mut ws, _inventory) = common::connect_and_capture_inventory(&url).await;
+
+    // First-bind onto OLD (with a manual name so OLD's record is distinct).
+    let created = send_create_frame_at(&mut ws, "codex", "req-codex-name-fork-1").await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let handle = created["nameRef"]["id"]
+        .as_str()
+        .expect("pending namingHandle")
+        .to_string();
+    sink.rename(RenameNameInput {
+        target: SessionNameRef::Pending { id: handle.clone() },
+        name: "Old Own Name".into(),
+        intent: NameIntent::User,
+        if_revision: None,
+    })
+    .await
+    .unwrap();
+
+    common::send_input(&mut ws, &terminal_id, "\r").await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let cwd = std::env::temp_dir().to_string_lossy().to_string();
+    let rollout_a = sessions_day.join(format!("rollout-2026-07-27T12-00-00-{OLD}.jsonl"));
+    std::fs::write(
+        &rollout_a,
+        format!("{}\n", session_meta_line(OLD, &cwd, None)),
+    )
+    .unwrap();
+    common::send_input(&mut ws, &terminal_id, "\r").await;
+    let adopted = next_associated_frame(&mut ws, &terminal_id, "fork/adopt").await;
+    assert_eq!(adopted["sessionRef"]["sessionId"], OLD);
+
+    // The fork child NEW has its OWN pre-existing record (a previously
+    // opened and named session).
+    seed_named_durable_record(&sink, "handle-fork-new", NEW, "New Own Name").await;
+
+    // The fork: Enter opens the fork-scan window, the child rollout appears
+    // (forked_from_id == OLD), the pane rebinds onto NEW.
+    common::send_input(&mut ws, &terminal_id, "\r").await;
+    let rollout_b = sessions_day.join(format!("rollout-2026-07-27T12-05-00-{NEW}.jsonl"));
+    std::fs::write(
+        &rollout_b,
+        format!("{}\n", session_meta_line(NEW, &cwd, Some(OLD))),
+    )
+    .unwrap();
+    let rebound = next_associated_frame(&mut ws, &terminal_id, "fork/rebind").await;
+    assert_eq!(
+        rebound["sessionRef"]["sessionId"], NEW,
+        "the fork must move the pane onto the child thread"
+    );
+    assert_eq!(rebound["previousSessionId"], OLD);
+
+    // The pane's naming ref followed the fork (an established binding never
+    // strands the pane on the superseded thread), and the NEW thread's own
+    // record surfaces through it — never a copy of the old name.
+    assert_eq!(
+        state.identity.name_ref_for(&terminal_id),
+        Some(codex_session_ref(NEW)),
+        "the pane's naming ref must follow the fork onto the new thread"
+    );
+    let pane_ref = sink
+        .get(vec![codex_session_ref(NEW), codex_session_ref(OLD)])
+        .await
+        .expect("get both records");
+    let new_record = pane_ref
+        .iter()
+        .find(|u| u.record.name_ref == codex_session_ref(NEW))
+        .expect("NEW must have a durable record");
+    assert_eq!(
+        new_record.record.name, "New Own Name",
+        "the new thread's OWN record must surface after the fork"
+    );
+    let old_record = pane_ref
+        .iter()
+        .find(|u| u.record.name_ref == codex_session_ref(OLD))
+        .expect("OLD must keep its durable record");
+    assert_eq!(
+        old_record.record.name, "Old Own Name",
+        "the superseded thread keeps its own name, never copied over"
+    );
+
+    registry.kill(&terminal_id);
     std::env::remove_var("CODEX_HOME");
 }
 

@@ -37,6 +37,7 @@ import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice
 import RepoIcon, { type RepoIconInfo } from '@/components/icons/RepoIcon'
 import { fetchRepoIconMeta } from '@/store/repoIconsSlice'
 import { pathBasename, buildRepoIconUrl } from '@/lib/repo-icon'
+import { isScopedSessionRow } from '@/store/selectors/sessionNameSelectors'
 
 const EMPTY_TERMINALS: BackgroundTerminal[] = []
 const EMPTY_LAYOUTS: Record<string, never> = {}
@@ -484,10 +485,15 @@ export default function Sidebar({
     )
     if (existing) {
       const existingTab = state.tabs.tabs.find((t) => t.id === existing.tabId)
-      if (existingTab && item.title && item.hasTitle && item.title !== existingTab.title && !existingTab.titleSetByUser) {
+      // Unified agent names (Task 5): a scoped session's pane/tab display
+      // comes from the canonical sessionNames cache — the legacy local
+      // title writes never fire for scoped rows (their stale flags can
+      // never override a canonical name).
+      const scoped = isScopedSessionRow(provider, item.sessionType)
+      if (!scoped && existingTab && item.title && item.hasTitle && item.title !== existingTab.title && !existingTab.titleSetByUser) {
         dispatch(updateTab({ id: existingTab.id, updates: { title: item.title } }))
       }
-      if (existing.paneId && item.hasTitle && item.title) {
+      if (!scoped && existing.paneId && item.hasTitle && item.title) {
         dispatch(updatePaneTitle({ tabId: existing.tabId, paneId: existing.paneId, title: item.title, setByUser: false }))
       }
       dispatch(setActiveTab(existing.tabId))

@@ -95,6 +95,7 @@ async fn create_tracked_session_with_resume(
 ) -> String {
     st.handle_create(
         FreshAgentCreate {
+            naming_handle: None,
             observed_epoch: None,
             observed_generation: None,
             request_id: request_id.to_string(),
@@ -225,6 +226,7 @@ async fn failed_spawn_leaves_no_record() {
 
     st.handle_create(
         FreshAgentCreate {
+            naming_handle: None,
             observed_epoch: None,
             observed_generation: None,
             request_id: "req-wfah-t2-fail".to_string(),
@@ -625,6 +627,7 @@ async fn create_bail_after_spawn_leaves_no_record() {
 
     st.handle_create(
         FreshAgentCreate {
+            naming_handle: None,
             observed_epoch: None,
             observed_generation: None,
             request_id: "req-wfah-t3-bail".to_string(),

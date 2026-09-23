@@ -266,4 +266,62 @@ describe('tabRegistrySlice', () => {
 
     expect(result.localOpen[0].updatedAt).toBe(1_740_000_060_000)
   })
+
+  it('summarizes a session-owned local tab by its canonical session name (Task 5)', () => {
+    const sessionKey = JSON.stringify(['session', 'claude', 'sess-reg-1'])
+    const result = selectTabsRegistryGroups({
+      tabs: {
+        tabs: [{
+          id: 'tab-1',
+          createRequestId: 'tab-1',
+          title: 'Active Tab',
+          status: 'running',
+          mode: 'claude',
+          createdAt: 1_740_000_000_000,
+          updatedAt: 1_740_000_999_999,
+        }],
+      },
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'claude',
+              createRequestId: 'req-1',
+              status: 'running',
+              sessionRef: { provider: 'claude', sessionId: 'sess-reg-1' },
+            },
+          },
+        },
+        paneTitles: { 'tab-1': { 'pane-1': 'freshell' } },
+      },
+      sessionNames: {
+        records: {
+          [sessionKey]: {
+            ref: { kind: 'session', provider: 'claude', sessionId: 'sess-reg-1' },
+            name: 'Canonical registry name',
+            source: 'manual',
+            revision: 2,
+          },
+        },
+        redirects: {},
+        nativeSync: {},
+        documentGeneration: 0,
+      },
+      tabRegistry: {
+        deviceId: 'device-1',
+        deviceLabel: 'Device',
+        remoteOpen: [],
+        closed: [],
+        localClosed: {},
+      },
+      connection: {
+        serverInstanceId: 'srv-test',
+      },
+    } as any)
+
+    expect(result.localOpen[0].tabName).toBe('Canonical registry name')
+  })
 })

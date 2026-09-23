@@ -223,6 +223,11 @@ pub struct ResolveState {
     /// that many permits; injectable so tests exercise saturation without
     /// spawning eight stalled fallbacks.
     pub resolve_permits: Arc<tokio::sync::Semaphore>,
+    /// Unified agent names (Task 2): the shared terminal identity registry,
+    /// consulted ONLY for its naming sink (the same authority every rename
+    /// route targets) when projecting matches. A registry without a wired
+    /// sink degrades to the un-projected response.
+    pub identity: freshell_ws::identity::TerminalIdentityRegistry,
 }
 
 /// `KNOWN_RESUME_PROVIDERS` = `DEFAULT_ENABLED_CLI_PROVIDERS`
@@ -826,15 +831,106 @@ async fn resolve_session(
             index.request_refresh();
         }
     }
-    Json(ResolveWireResponse {
+    let response = ResolveWireResponse {
         status,
         matches: outcome.matches,
         hint: outcome.hint,
         provider_errors,
         unsearched_providers,
         home_dir: state.home_dir.as_ref().map(|h| h.as_str().to_string()),
-    })
-    .into_response()
+    };
+    // Unified agent names (Task 2): the additive per-match naming projection
+    // — every scoped match resolves the SAME durable record the rename
+    // routes target. See [`merge_match_naming_projection`].
+    let mut page = serde_json::to_value(response).unwrap_or_else(|_| json!({}));
+    merge_match_naming_projection(&mut page, state.identity.naming().as_ref()).await;
+    Json(page).into_response()
+}
+
+/// Unified agent names (Task 2): resolve every scoped match's durable name
+/// through the naming authority (ONE batched `get`) and ride it onto the
+/// serialized matches: additive `sessionName`/`nameRef` per resolved match,
+/// and the record's name replaces the match's displayed `title` ONLY for
+/// manual or migration-protected records (the user's rename must surface on
+/// the resume list; lower-rank record names never shadow provider-generated
+/// titles — those fold into the record through the observation lanes). An
+/// unwired or failed resolution degrades to the un-projected response
+/// (loudly logged): naming is additive here, never a hard dependency of
+/// resolve.
+async fn merge_match_naming_projection(
+    response: &mut Value,
+    naming: Option<&std::sync::Arc<dyn freshell_freshagent::naming::SessionNaming>>,
+) {
+    use freshell_protocol::session_names::{NameSource, SessionNameRef};
+    let Some(sink) = naming else {
+        return;
+    };
+    let Some(matches) = response.get_mut("matches").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut refs: Vec<SessionNameRef> = Vec::new();
+    for m in matches.iter() {
+        let Some(provider) = m.get("provider").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(session_id) = m.get("sessionId").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(named) = freshell_freshagent::naming::named_provider_for(Some(provider), None) {
+            refs.push(SessionNameRef::Session {
+                provider: named,
+                session_id: session_id.to_string(),
+            });
+        }
+    }
+    if refs.is_empty() {
+        return;
+    }
+    let updates = match sink.get(refs).await {
+        Ok(updates) => updates,
+        Err(error) => {
+            tracing::warn!(
+                target: "freshell_server::session_names",
+                op = "get",
+                name_ref = "-",
+                revision = 0,
+                class = %error.code(),
+                "session_names.operation_failed: {}",
+                error
+            );
+            return;
+        }
+    };
+    let mut by_key: std::collections::HashMap<String, freshell_protocol::SessionNameUpdate> =
+        std::collections::HashMap::new();
+    for update in updates {
+        if let SessionNameRef::Session {
+            provider,
+            session_id,
+        } = &update.record.name_ref
+        {
+            by_key.insert(format!("{}:{}", provider.as_str(), session_id), update);
+        }
+    }
+    for m in matches {
+        let Some(provider) = m.get("provider").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(session_id) = m.get("sessionId").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(update) = by_key.get(&format!("{provider}:{session_id}")) else {
+            continue;
+        };
+        if matches!(
+            update.record.source,
+            NameSource::Manual | NameSource::LegacyProtected
+        ) {
+            m["title"] = json!(update.record.name);
+        }
+        m["sessionName"] = json!(update.record.name);
+        m["nameRef"] = serde_json::to_value(&update.record.name_ref).unwrap_or(Value::Null);
+    }
 }
 
 #[cfg(test)]
@@ -1008,6 +1104,9 @@ mod tests {
             home_dir: Some(Arc::new("/home/tester".to_string())),
             resolve_deadline: super::RESOLVE_FALLBACK_DEADLINE,
             resolve_permits: Arc::new(tokio::sync::Semaphore::new(super::RESOLVE_MAX_CONCURRENCY)),
+            // Unified agent names (Task 2): unwired by default in tests —
+            // the naming projection degrades to the un-projected response.
+            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         }
     }
 
@@ -1398,6 +1497,7 @@ mod tests {
                 cwd: Some("/repo/beta".to_string()),
                 title: Some("beta".to_string()),
                 last_activity_at: Some(1234),
+                database: None,
             }))
         }));
         let (status, body) = post(st, serde_json::json!({ "input": unknown }), true).await;
@@ -1913,6 +2013,7 @@ mod tests {
                 cwd: Some("/repo/delta".to_string()),
                 title: None,
                 last_activity_at: None,
+                database: None,
             }))
         }));
         let (status, body) = post(st, serde_json::json!({ "input": SES_ID }), true).await;

@@ -262,6 +262,9 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
   let tauriSha: string
   let fixtureSha: string
   let cargoConfigSha: string
+  let pnpmLockSha: string
+  let pnpmWorkspaceSha: string
+  let npmrcSha: string
 
   function git(args: string[], opts: { cwd: string; stdin?: string } = { cwd: '' }): string {
     const res = spawnSync('git', args, { cwd: opts.cwd, encoding: 'utf8', timeout: 30_000 })
@@ -349,6 +352,15 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
 
     writeFixture(path.join(fixtureRoot, '.cargo/config.toml'), '[build]\n')
     cargoConfigSha = commit('cargo config change')
+
+    writeFixture(path.join(fixtureRoot, 'pnpm-lock.yaml'), "lockfileVersion: '9.0'\n")
+    pnpmLockSha = commit('pnpm lock change')
+
+    writeFixture(path.join(fixtureRoot, 'pnpm-workspace.yaml'), 'packages: []\n')
+    pnpmWorkspaceSha = commit('pnpm workspace change')
+
+    writeFixture(path.join(fixtureRoot, '.npmrc'), 'verify-deps-before-run=false\n')
+    npmrcSha = commit('npmrc change')
   })
 
   afterAll(() => {
@@ -416,6 +428,27 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
     expect(out.status).toBe(0)
     expect(out.stderr).toContain('run_rust=1')
     expect(out.stderr).toContain('test_mode=workspace')
+  })
+
+  it('runs the ts gate for pnpm lock changes', () => {
+    const out = runHook(pnpmLockSha, cargoConfigSha)
+    expect(out.status).toBe(0)
+    expect(out.stderr).toContain('run_rust=0 run_ts=1')
+    expect(out.stderr).toContain('test_mode=skip')
+  })
+
+  it('runs the ts gate for pnpm workspace changes', () => {
+    const out = runHook(pnpmWorkspaceSha, pnpmLockSha)
+    expect(out.status).toBe(0)
+    expect(out.stderr).toContain('run_rust=0 run_ts=1')
+    expect(out.stderr).toContain('test_mode=skip')
+  })
+
+  it('runs the ts gate for .npmrc changes', () => {
+    const out = runHook(npmrcSha, pnpmWorkspaceSha)
+    expect(out.status).toBe(0)
+    expect(out.stderr).toContain('run_rust=0 run_ts=1')
+    expect(out.stderr).toContain('test_mode=skip')
   })
 
   it('runs the full gate when the merge base is unknown', () => {

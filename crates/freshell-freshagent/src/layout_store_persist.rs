@@ -328,7 +328,17 @@ fn snapshot_from_value(value: &Value) -> Option<UiSnapshot> {
         timestamp: obj.get("timestamp").and_then(Value::as_i64),
     };
     for tab in obj.get("tabs")?.as_array()? {
+        // Unified agent names (Task 6): the stable naming-source
+        // relationship round-trips the persisted registry the same way
+        // `tab_row_value` wrote it — a restart must never drop a tab's
+        // name source (the rename-tab route resolves it, never the
+        // active pane). Absent on pre-Task-6 files → `None`.
+        let name_source = tab.get("nameSource").and_then(|value| {
+            serde_json::from_value::<freshell_protocol::session_names::TabNameSource>(value.clone())
+                .ok()
+        });
         snapshot.tabs.push(TabRow {
+            name_source,
             id: tab.get("id")?.as_str()?.to_string(),
             title: tab.get("title").and_then(Value::as_str).map(str::to_string),
             fallback_session_ref: tab.get("fallbackSessionRef").cloned(),

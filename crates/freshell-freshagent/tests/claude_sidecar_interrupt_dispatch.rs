@@ -9,7 +9,7 @@
 //!
 //! This test spawns the REAL `index.mjs` source with `node` and drives its stdin
 //! directly. The `@anthropic-ai/claude-agent-sdk` dependency is vendored via
-//! `npm install` into the sidecar package's own node_modules and is NOT present
+//! `pnpm install` into the sidecar package's own node_modules and is NOT present
 //! in a plain checkout/CI, so the test copies the real sidecar entrypoint and its
 //! local helper modules VERBATIM into a temp dir with a
 //! stub `node_modules/@anthropic-ai/claude-agent-sdk` that satisfies only the
