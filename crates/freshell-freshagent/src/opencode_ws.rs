@@ -6911,9 +6911,15 @@ impl FreshOpencodeState {
                 .get_session_status_map(&route)
                 .await
             {
-                Ok(map) => !map
-                    .get(real_id)
-                    .is_some_and(|status| status["type"] == "busy"),
+                // Focused episode 3 round 2, Major 1: the CANONICAL
+                // classifier — "busy" AND "retry" both mean running
+                // (`is_running_status_type`, events.rs:149-150, the same
+                // classifier the status-poll path uses). A retrying
+                // compact is NOT settled; only a status that is neither
+                // (or absent) authorizes the release.
+                Ok(map) => !freshell_opencode::is_running_status_type(
+                    map.get(real_id).and_then(|status| status.get("type")),
+                ),
                 // Conservative: a failed poll proves nothing — do not
                 // release or record on transport failure (the next idle
                 // observation re-tries).
@@ -6926,7 +6932,7 @@ impl FreshOpencodeState {
         // stays inside this critical section (the round-ep1 atomicity:
         // a send registering either preceded the decision or follows the
         // idle).
-        let (released, emit_idle) = {
+        let released = {
             let session = session_arc.lock().await;
             let abort_in_flight_now = session.abort_in_flight.load(Ordering::SeqCst) > 0;
             let busy_now = session.daemon_busy_after_idle.load(Ordering::SeqCst);
@@ -6999,12 +7005,18 @@ impl FreshOpencodeState {
                     (false, false)
                 }
             };
-            (released, emit_idle)
+            // Focused episode 3 round 2, Major 2: the emission stays
+            // INSIDE the critical section — outside it, a waiting
+            // handle_send could register + emit its running between the
+            // quiescence decision and this frame (the check-then-broadcast
+            // race the parent kept closed; the broadcast is a synchronous
+            // channel send, safe under the lock).
+            if emit_idle {
+                this.fresh_agent
+                    .broadcast(&event_frame(real_id, snapshot_event(session_id, "idle")));
+            }
+            released
         };
-        if emit_idle {
-            this.fresh_agent
-                .broadcast(&event_frame(real_id, snapshot_event(session_id, "idle")));
-        }
         if released {
             Self::drain_detached(this, real_id);
         }
@@ -13754,6 +13766,9 @@ mod tests {
         /// daemon may still apply the abort after the client saw the
         /// failure.
         abort_ambiguates: StdMutex<bool>,
+        /// Focused episode 3 round 2: sessions whose status-map entry
+        /// reports "retry" instead of "busy" (both are running).
+        status_retry: StdMutex<std::collections::HashSet<String>>,
     }
 
     impl CompactFakeHttp {
@@ -13781,6 +13796,7 @@ mod tests {
                 abort_hangs: StdMutex::new(false),
                 abort_refused: StdMutex::new(false),
                 abort_ambiguates: StdMutex::new(false),
+                status_retry: StdMutex::new(std::collections::HashSet::new()),
             }
         }
 
@@ -13848,6 +13864,17 @@ mod tests {
                 .lock()
                 .expect("busy budget mutex")
                 .insert(id.to_string(), budget);
+        }
+
+        /// Focused episode 3 round 2: seed the session's status-map
+        /// entry as RETRY (a retrying compact is RUNNING by the
+        /// canonical classifier — busy AND retry).
+        fn arm_status_retry(&self, id: &str) {
+            self.arm_status_busy(id, 1000);
+            self.status_retry
+                .lock()
+                .expect("status retry mutex")
+                .insert(id.to_string());
         }
 
         fn summarize_requests(&self) -> Vec<RecordedRequest> {
@@ -14096,11 +14123,19 @@ mod tests {
             }
             if method == "GET" && req.url.contains("/session/status") {
                 let mut budgets = self.busy_budget.lock().expect("busy budget mutex");
+                let retry: Vec<String> = self
+                    .status_retry
+                    .lock()
+                    .expect("status retry mutex")
+                    .iter()
+                    .cloned()
+                    .collect();
                 let mut map = serde_json::Map::new();
                 for (id, budget) in budgets.iter_mut() {
                     if *budget > 0 {
                         *budget -= 1;
-                        map.insert(id.clone(), json!({ "type": "busy" }));
+                        let ty = if retry.contains(id) { "retry" } else { "busy" };
+                        map.insert(id.clone(), json!({ "type": ty }));
                     }
                 }
                 let body = serde_json::to_vec(&Value::Object(map)).unwrap();
@@ -19351,6 +19386,89 @@ mod tests {
             !session.orphaned_daemon_turn.load(Ordering::SeqCst),
             "the missed-running terminal idle releases — no strand"
         );
+        assert!(session.pending_sends.is_empty());
+    }
+
+    /// Focused episode 3 round 2, Major 1: a RETRYING compact is RUNNING
+    /// by the canonical classifier ("busy" AND "retry") — the missed-
+    /// running fallback must NOT treat it as settled and drain into it.
+    /// Only when the daemon's live status is neither busy nor retry (the
+    /// turn actually ended) does the release proceed.
+    #[tokio::test]
+    async fn a_retrying_compact_is_running_and_does_not_release_the_queue() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q30", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q30")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q30", "waits out the retry")),
+        )
+        .await;
+
+        // The abort FAILS (answered 500) and settles — counter zero,
+        // latch armed.
+        http.arm_abort_fail();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q30".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers (abort 500)");
+
+        // The compact is RETRYING (no running was ever delivered — the
+        // missed-running path), and the daemon's live status map says
+        // "retry": a RUNNING state. The terminal-looking idle must NOT
+        // release — draining into a retrying compact is the loss the
+        // queue exists to prevent.
+        http.arm_status_retry("ses_q30");
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q30", "ses_q30").await;
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "a retrying compact is running — the canonical classifier must not mistake it for settled"
+        );
+        let session_arc = st.sessions.lock().await.get("ses_q30").cloned().unwrap();
+        assert!(
+            session_arc
+                .lock()
+                .await
+                .orphaned_daemon_turn
+                .load(Ordering::SeqCst),
+            "the deferral holds while the compact retries"
+        );
+
+        // The compact finally settles — the live status map reports
+        // neither busy nor retry — and the release delivers.
+        http.clear_status_busy("ses_q30");
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q30", "ses_q30").await;
+        await_prompt_posted(&http, "waits out the retry").await;
+        let session_arc = st.sessions.lock().await.get("ses_q30").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
         assert!(session.pending_sends.is_empty());
     }
 
