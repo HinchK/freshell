@@ -376,6 +376,22 @@ struct OpencodeSession {
     /// daemon-side turn whenever this is set, NOT whenever the local task
     /// is unfinished — a finished local task can mean IdleTimeout.
     daemon_turn_accepted: Arc<AtomicBool>,
+    /// send-during-compact queue (delta review round 3): armed at
+    /// `handle_interrupt`'s TEARDOWN START (under the session lock, before
+    /// the drive task is taken) — from that moment the local task is being
+    /// torn down without a proven daemon-side quiesce, and the daemon-side
+    /// turn may still be executing ("the turn may still complete
+    /// normally"). While armed, the send-during-compact drain REFUSES to
+    /// dispatch parked messages (firing a prompt into a possibly-live
+    /// daemon-side turn — including via a push-armed drain scheduled into
+    /// the interrupt's own abort window — is exactly the interleaving the
+    /// queue exists to prevent; a deferred message is WARN-observable and
+    /// recoverable, a lost one is not). Disarmed ONLY by a later
+    /// interrupt's SUCCESSFUL daemon-side abort (the proven quiesce —
+    /// the retry then drains the queue in FIFO order); kill/handoff drop
+    /// the queue outright. Consulted ONLY by the drain gate — the direct
+    /// send path's tolerance is unchanged (pre-existing semantics).
+    orphaned_daemon_turn: Arc<AtomicBool>,
     /// PR-3: flipped `true` by the serve-stream bridge when it observes a `session.error`
     /// SSE event during the in-flight turn (`state.turnErrored`, adapter.ts:278-282,334-335).
     /// Reset to `false` at the top of every `handle_send`.
@@ -461,6 +477,7 @@ impl OpencodeSession {
             pending_sends: std::collections::VecDeque::new(),
             turn_aborted: Arc::new(AtomicBool::new(false)),
             daemon_turn_accepted: Arc::new(AtomicBool::new(false)),
+            orphaned_daemon_turn: Arc::new(AtomicBool::new(false)),
             turn_errored: Arc::new(AtomicBool::new(false)),
             last_turn_complete_at: Arc::new(StdMutex::new(None)),
             serve_bridge: None,
@@ -2221,6 +2238,16 @@ impl FreshOpencodeState {
             if session.killed.load(Ordering::SeqCst) || session.close_pending > 0 {
                 return;
             }
+            // Delta-review round 3: a FAILED daemon-side interrupt abort
+            // left the daemon turn possibly still executing — dispatching
+            // a parked prompt into that window is exactly the
+            // interleaving the queue exists to prevent. The orphan marker
+            // holds every drain trigger off until a later interrupt
+            // PROVES the daemon quiesced (its abort succeeded); the
+            // deferral is WARN-observable, the message is never lost.
+            if session.orphaned_daemon_turn.load(Ordering::SeqCst) {
+                return;
+            }
             if session
                 .turn_task
                 .as_ref()
@@ -3849,9 +3876,18 @@ impl FreshOpencodeState {
             return;
         };
 
-        let (real_id, route, turn_aborted, daemon_turn_accepted) = {
+        let (real_id, route, turn_aborted, daemon_turn_accepted, orphaned_daemon_turn) = {
             let mut session = session_arc.lock().await;
             session.turn_aborted.store(true, Ordering::SeqCst);
+            // send-during-compact queue (delta-review round 3): arm the
+            // orphan marker at the TEARDOWN START — the moment the local
+            // drive task is being taken, no drain may dispatch a parked
+            // prompt (the push-armed drains from queue time can be
+            // scheduled into exactly this window: turn_task is already
+            // taken and the daemon-side abort has not answered yet).
+            // Disarmed ONLY by the proven daemon quiesce (the abort
+            // SUCCEEDS below); the Err arm keeps it armed + WARNs.
+            session.orphaned_daemon_turn.store(true, Ordering::SeqCst);
             if let Some(task) = session.turn_task.take() {
                 // ep4-r6 F2: join + await the compact's pre-drive-redo settle
                 // — the interrupt's answer must never precede the restore.
@@ -3862,6 +3898,7 @@ impl FreshOpencodeState {
                 session.cwd.clone(),
                 session.turn_aborted.clone(),
                 session.daemon_turn_accepted.clone(),
+                session.orphaned_daemon_turn.clone(),
             )
         };
 
@@ -3882,21 +3919,47 @@ impl FreshOpencodeState {
                 // daemon-side turn is settled; disarm the acceptance so a
                 // later handoff stop does not issue a redundant abort.
                 daemon_turn_accepted.store(false, Ordering::SeqCst);
+                // send-during-compact queue (delta-review round 3): a
+                // successful abort is the PROVEN daemon quiesce — clear
+                // any orphan marker a previously failed interrupt armed.
+                orphaned_daemon_turn.store(false, Ordering::SeqCst);
                 self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
+                // send-during-compact queue: an interrupted compact never
+                // runs its own settle tail (the TurnTask doc — an aborted
+                // drive drops mid-await and never reaches its tail), so
+                // THIS handler is the drain trigger — and only on the
+                // SUCCESS arm: the daemon-side abort answered, so the
+                // window is provably closed. Only kill drops the queue;
+                // a successful interrupt delivers.
+                Self::drain_detached(self, &real_id);
             }
             Err(_) => {
                 // adapter.ts:525-528 -- the abort never landed, so the turn may still
                 // complete normally; clear the flag so a genuine completion isn't
                 // silently swallowed.
                 turn_aborted.store(false, Ordering::SeqCst);
+                // send-during-compact queue (delta-review round 3): the
+                // daemon-side turn may STILL be executing — the orphan
+                // marker (armed at the teardown start, above) STAYS
+                // armed, so no drain trigger (this one, the queue arm's
+                // push-armed drains, the kill-enumeration decrements)
+                // dispatches a parked prompt into the possibly-live
+                // daemon-side turn. A deferred message is WARN-observable
+                // and recoverable (a later interrupt whose abort succeeds
+                // disarms and delivers); a prompt fired into the
+                // interleaving window could be lost or reordered — the
+                // exact loss the queue exists to prevent.
+                let queued_depth = {
+                    let session = session_arc.lock().await;
+                    debug_assert!(session.orphaned_daemon_turn.load(Ordering::SeqCst));
+                    session.pending_sends.len()
+                };
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %real_id,
+                    queued_depth = queued_depth,
+                    "fresh_agent_interrupt_abort_failed_queue_deferred");
             }
         }
-        // send-during-compact queue: an interrupted compact never runs its
-        // own settle tail (the TurnTask doc — an aborted drive drops
-        // mid-await and never reaches its tail), so THIS handler is the
-        // drain trigger — after the abort settled and the daemon-side
-        // abort resolved. Only kill drops the queue; interrupt does not.
-        Self::drain_detached(self, &real_id);
     }
 
     // ── freshAgent.compact (WS, AGENT-04) ────────────────────────────────────
@@ -13173,6 +13236,12 @@ mod tests {
         /// `await_prompt_posted` sees the parked POST — the same
         /// record-then-park split the summarize arm uses.
         prompt_gate: StdMutex<Option<Arc<tokio::sync::Notify>>>,
+        /// send-during-compact queue (delta-review round 3): when set, the
+        /// `POST /session/:id/abort` arm answers 500 — the deterministic
+        /// daemon-side abort FAILURE for the interrupt-deferral test
+        /// (handle_interrupt's Err arm). Unset (every sibling test's
+        /// path): the arm answers 200 exactly like the catch-all default.
+        abort_fails: StdMutex<bool>,
     }
 
     impl CompactFakeHttp {
@@ -13195,6 +13264,7 @@ mod tests {
                 health_gate,
                 config_gate,
                 prompt_gate: StdMutex::new(None),
+                abort_fails: StdMutex::new(false),
             }
         }
 
@@ -13208,6 +13278,17 @@ mod tests {
             let gate = Arc::new(tokio::sync::Notify::new());
             *self.prompt_gate.lock().expect("prompt gate mutex") = Some(gate.clone());
             gate
+        }
+
+        /// send-during-compact queue (delta-review round 3): script the
+        /// daemon-side abort FAILURE — the next and every `POST /abort`
+        /// answers 500 until cleared.
+        fn arm_abort_fail(&self) {
+            *self.abort_fails.lock().expect("abort fails mutex") = true;
+        }
+
+        fn clear_abort_fail(&self) {
+            *self.abort_fails.lock().expect("abort fails mutex") = false;
         }
 
         fn summarize_requests(&self) -> Vec<RecordedRequest> {
@@ -13357,6 +13438,19 @@ mod tests {
                         gate.notified().await;
                     }
                     Ok(ServeHttpResponse::new(200, b"true".to_vec()))
+                });
+            }
+            if method == "POST" && req.url.contains("/abort") {
+                // send-during-compact queue (delta-review round 3): the
+                // deterministic daemon-side abort failure knob; unset, the
+                // arm answers 200 exactly like the catch-all default.
+                let fail = *self.abort_fails.lock().expect("abort fails mutex");
+                return Box::pin(async move {
+                    if fail {
+                        Ok(ServeHttpResponse::new(500, b"abort exploded".to_vec()))
+                    } else {
+                        Ok(ServeHttpResponse::new(200, b"{}".to_vec()))
+                    }
                 });
             }
             if method == "POST" && req.url.contains("/prompt_async") {
@@ -16622,6 +16716,119 @@ mod tests {
         .await
         .expect("interrupt answers");
         await_prompt_posted(&http, "survives the interrupt").await;
+    }
+
+    /// Delta-review round 3: the FAILED daemon-side abort path. The
+    /// interrupt's Err arm must NOT dispatch parked sends — the daemon
+    /// may still be executing the interrupted turn, and firing a prompt
+    /// into that window could lose or reorder the message. The deferral
+    /// holds EVERY drain trigger off (the interrupt's own, the queue
+    /// arm's push-armed drain) and is WARN-observable; a LATER
+    /// interrupt whose daemon-side abort SUCCEEDS proves the quiesce,
+    /// disarms the deferral, and delivers the queue in FIFO order.
+    #[tokio::test]
+    async fn a_failed_daemon_abort_defers_the_drain_until_a_successful_interrupt() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q8", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q8")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        // TWO queued sends: the second's push-armed drain is the extra
+        // trigger that must ALSO be held off during the orphan window.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q8", "first deferred")),
+        )
+        .await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q8", "second deferred")),
+        )
+        .await;
+
+        let (events, _guard) = info_capture::capture();
+
+        // The daemon-side abort FAILS — the Err arm arms the deferral.
+        http.arm_abort_fail();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q8".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers (abort fails)");
+
+        // The daemon-side compact completes in the fake; NOTHING local
+        // observes it — the parked prompts must STILL not have POSTed
+        // (the deferral holds every trigger). Let any spawned drain
+        // reach its gate check before asserting absence.
+        summarize_gate.notify_waiters();
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        {
+            let captured = events.lock().unwrap();
+            assert!(
+                captured.iter().any(|e| e
+                    .message
+                    .contains("fresh_agent_interrupt_abort_failed_queue_deferred")),
+                "the deferral is WARN-observable"
+            );
+        }
+        assert!(
+            !http.recorded().iter().any(|r| {
+                r.url.contains("prompt_async")
+                    && (r_body_contains(r, "first deferred") || r_body_contains(r, "second deferred"))
+            }),
+            "a failed daemon-side abort must defer the drain — no parked prompt POSTs into the orphan window"
+        );
+        // A LATER interrupt whose daemon-side abort SUCCEEDS proves the
+        // quiesce: disarm + drain → the queue delivers in FIFO order.
+        http.clear_abort_fail();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q8".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers (abort succeeds)");
+        await_prompt_posted(&http, "first deferred").await;
+        await_prompt_posted(&http, "second deferred").await;
+        let recorded = http.recorded();
+        let first_ix = recorded
+            .iter()
+            .position(|r| r.url.contains("prompt_async") && r_body_contains(r, "first deferred"))
+            .expect("first deferred drained");
+        let second_ix = recorded
+            .iter()
+            .position(|r| r.url.contains("prompt_async") && r_body_contains(r, "second deferred"))
+            .expect("second deferred drained");
+        assert!(first_ix < second_ix, "the recovered queue delivers FIFO");
+        let session_arc = st.sessions.lock().await.get("ses_q8").cloned().unwrap();
+        assert!(
+            session_arc.lock().await.pending_sends.is_empty(),
+            "the recovered queue drains completely"
+        );
     }
 
     /// Same rig with SummarizeOutcome::Answered500 + the gate (fixture

@@ -957,6 +957,16 @@ struct TurnTask {
         // own settle tail (TurnTask doc :199-201), so THIS handler is the
         // drain trigger — after the abort settled and the daemon-side
         // abort resolved. Only kill drops the queue; interrupt does not.
+        // (Delta-review round 3 amendment: the trigger is the daemon-side
+        // abort's SUCCESS arm ONLY. The interrupt arms an
+        // `orphaned_daemon_turn` marker at its teardown start; a FAILED
+        // daemon-side abort keeps the marker armed and WARNs — no drain
+        // trigger (the interrupt's, a push-armed drain, the
+        // kill-enumeration decrements) may dispatch a parked prompt into
+        // a possibly-live daemon-side turn. A later interrupt whose abort
+        // succeeds proves the quiesce, disarms, and delivers in FIFO
+        // order. Test:
+        // a_failed_daemon_abort_defers_the_drain_until_a_successful_interrupt.)
         Self::drain_detached(self, &real_id);
 ```
 
