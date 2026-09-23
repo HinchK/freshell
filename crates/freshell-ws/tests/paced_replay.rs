@@ -1557,7 +1557,7 @@ async fn input_on_the_same_connection_is_serviced_while_a_producing_drain_is_sti
     credit(&mut paced, &terminal_id, "attach-drain-input", credited).await;
     let mut drain_started = false;
     let mut frames_after_input_probe = 0u64;
-    let mut input_probe_answered_before_completion = false;
+    let mut input_probe_answered = false;
     let mut input_probe_sent = false;
     // Generous wall-clock windows: the suite runs these PTY+socket tests
     // in parallel, and the assertions are behavioral — the deadlines only
@@ -1595,19 +1595,22 @@ async fn input_on_the_same_connection_is_serviced_while_a_producing_drain_is_sti
                 }
             }
             Some("terminal.input.blocked") => {
-                // The probe's answer arrived on THIS socket. The drain is
-                // still running (paced_complete has NOT fired): the
-                // dispatcher serviced same-connection input mid-drain.
+                // The probe's answer arrived on THIS socket: the dispatcher
+                // serviced same-connection input mid-drain. Deliberately NOT
+                // compared against the server-side ws.restore.paced_complete
+                // event: completion is emitted server-side when the drain's
+                // production ends, while this frame's ARRIVAL is serialized
+                // behind whatever drain pages already hold the queue (this
+                // client reads them slowly on purpose), so a correctly
+                // serviced probe can still land after the completion event.
+                // The mid-drain proof rides on the frames-after observable
+                // below — the pre-fix synchronous-drain stall delivered the
+                // answer only AFTER the drain's last page.
                 assert_eq!(
                     value["reason"], "unknown_terminal",
                     "the probe is answered by the input-blocked frame: {value}"
                 );
-                let completed_already = events.lock().unwrap().iter().any(|e| {
-                    e.message == "ws.restore.paced_complete"
-                        && e.fields.get("terminal_id").map(String::as_str)
-                            == Some(terminal_id.as_str())
-                });
-                input_probe_answered_before_completion = !completed_already;
+                input_probe_answered = true;
                 if !input_probe_sent {
                     panic!("probe answer observed before the probe was sent");
                 }
@@ -1618,7 +1621,7 @@ async fn input_on_the_same_connection_is_serviced_while_a_producing_drain_is_sti
             input_probe_sent = true;
             send_input(&mut paced, "no-such-terminal-drain-input", "x").await;
         }
-        if input_probe_answered_before_completion && frames_after_input_probe > 0 {
+        if input_probe_answered && frames_after_input_probe > 0 {
             break 'drain_watch;
         }
     }
@@ -1628,8 +1631,9 @@ async fn input_on_the_same_connection_is_serviced_while_a_producing_drain_is_sti
         "the drain must have demonstrably started for the probe window to open"
     );
     assert!(
-        input_probe_answered_before_completion,
-        "the same-connection input probe must be answered while the producing drain is still running"
+        input_probe_answered,
+        "the dispatcher must service same-connection input even while a \
+         producing drain is running (the probe answer never arrived)"
     );
     assert!(
         frames_after_input_probe > 0,
