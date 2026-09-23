@@ -528,7 +528,7 @@ export class WsClient {
           type: 'hello',
           token,
           protocolVersion: WS_PROTOCOL_VERSION,
-          capabilities: { uiScreenshotV1: true, terminalOutputBatchV1: true, terminalInterestV1: true, paneReconcileV1: true, paneReconcileFreshAgentV1: true },
+          capabilities: { uiScreenshotV1: true, terminalOutputBatchV1: true, terminalInterestV1: true, paneReconcileV1: true, paneReconcileFreshAgentV1: true, pacedTerminalReplayV1: true, terminalLifetimeClaimV1: true },
           ...helloExtensions,
         })
       }
@@ -908,7 +908,9 @@ export class WsClient {
   }
 
   /** Presentation updates are sent only on the current negotiated socket.
-   * Never put stale interest in the reconnect/reliable-command queue. */
+   * Never put stale interest in the reconnect/reliable-command queue.
+   * `claimedTerminalIds` (hidden-pane lifetime claims) rides the wire only
+   * when the ready echo advertised `terminalLifetimeClaimV1`. */
   sendTerminalInterest(snapshot: TerminalInterestSnapshot): boolean {
     if (this.intentionalClose || this._state !== 'ready'
       || this.ws?.readyState !== WebSocket.OPEN
@@ -916,8 +918,15 @@ export class WsClient {
       || this.terminalInterestRevision >= Number.MAX_SAFE_INTEGER) return false
     const revision = ++this.terminalInterestRevision
     try {
-      this.sendNow({ type: 'terminal.interest', revision,
-        focusedTerminalId: snapshot.focusedTerminalId, visibleTerminalIds: snapshot.visibleTerminalIds })
+      this.sendNow({
+        type: 'terminal.interest',
+        revision,
+        focusedTerminalId: snapshot.focusedTerminalId,
+        visibleTerminalIds: snapshot.visibleTerminalIds,
+        ...(this.serverCapabilities.terminalLifetimeClaimV1 === true
+          ? { claimedTerminalIds: snapshot.claimedTerminalIds ?? [] }
+          : {}),
+      })
       return true
     } catch {
       return false

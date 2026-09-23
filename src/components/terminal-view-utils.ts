@@ -96,6 +96,10 @@ export function buildTerminalAttachMessage(input: {
   attachRequestId: string
   priority: 'foreground' | 'background'
   maxReplayBytes?: number
+  /** Paced terminal restore (Workstream 1): negotiated attaches request
+   *  page-sized replay delivery instead of a byte-budget-truncated inline
+   *  burst. Additive optional — servers that predate pacing strip it. */
+  replayPageBytes?: number
   surfaceReset?: boolean
   /** b8ke ext r8 F2: the pane's observed ownership fence — terminal.attach
    *  participates in the coordinator (a queued cross-device attach is
@@ -111,6 +115,7 @@ export function buildTerminalAttachMessage(input: {
   attachRequestId: string
   priority: 'foreground' | 'background'
   maxReplayBytes?: number
+  replayPageBytes?: number
   expectedSessionRef?: SessionLocator
   surfaceReset?: boolean
   createRequestId?: string
@@ -138,6 +143,7 @@ export function buildTerminalAttachMessage(input: {
     priority: input.priority,
     ...(input.ownerFence ? { observedEpoch: input.ownerFence.epoch, observedGeneration: input.ownerFence.generation } : {}),
     ...(input.maxReplayBytes ? { maxReplayBytes: input.maxReplayBytes } : {}),
+    ...(input.replayPageBytes ? { replayPageBytes: input.replayPageBytes } : {}),
     ...(input.surfaceReset ? { surfaceReset: true } : {}),
     ...(expectedSessionRef ? { expectedSessionRef } : {}),
     ...(createRequestId ? { createRequestId } : {}),

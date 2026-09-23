@@ -3,6 +3,7 @@ import {
   normalizeTranscript,
   canonicalizeTranscript,
   diffNormalized,
+  maskEnvelopeShape,
   FIELD_FAMILIES,
   type TranscriptMessage,
 } from '../../../port/oracle/harness/normalize.js'
@@ -384,5 +385,130 @@ describe('FIELD_FAMILIES registry', () => {
     expect(FIELD_FAMILIES.code).toBeUndefined()
     expect(FIELD_FAMILIES.mimeType).toBeUndefined()
     expect(FIELD_FAMILIES.ok).toBeUndefined()
+  })
+})
+
+// ── the T1 attach-envelope banner race (task-010) ───────────────────────────
+//
+// ROOT CAUSE of the pty-determinism-t1 "fixed-width-fill" flake: the raw seq
+// values in `terminal.attach.ready` depend on whether the spawned shell's
+// banner bytes landed in the retained ring BEFORE the attach snapshotted it.
+// Both orders are contract-valid (the client gets the banner either as replay
+// or as live frames; the golden bytes are unaffected — reassembly is by seq
+// and the sentinels bound the golden window). But the transcript normalizer's
+// seq family is VALUE-DEDUPED with first-seen ordinals, so the single-message
+// envelope comparison is sensitive to the VALUE-COINCIDENCE PARTITION: which
+// fields happen to share a raw value differs boot to boot with the race.
+
+/** A `terminal.attach.ready` envelope as the T1 harness captures it (wire camelCase). */
+function attachReadyLike(v: {
+  terminalId: string
+  streamId: string
+  headSeq: number
+  replayFromSeq: number
+  replayToSeq: number
+  effectiveSinceSeq: number
+  geometryEpoch: number
+  requestedSinceSeq: number
+}): Record<string, unknown> {
+  return {
+    type: 'terminal.attach.ready',
+    terminalId: v.terminalId,
+    streamId: v.streamId,
+    headSeq: v.headSeq,
+    replayFromSeq: v.replayFromSeq,
+    replayToSeq: v.replayToSeq,
+    attachRequestId: 'arid-attach-000001',
+    effectiveSinceSeq: v.effectiveSinceSeq,
+    geometryAuthority: 'server',
+    geometryEpoch: v.geometryEpoch,
+    requestedSinceSeq: v.requestedSinceSeq,
+  }
+}
+
+/** The two contract-valid faces of the banner/attach startup race. */
+function bannerRacePair(): [Record<string, unknown>, Record<string, unknown>] {
+  return [
+    // Banner had NOT landed when the attach snapshotted: empty replay window
+    // (replayFromSeq = headSeq+1 > replayToSeq = headSeq).
+    attachReadyLike({
+      terminalId: 't_race_a0000001', streamId: 's_race_a0000001',
+      headSeq: 0, replayFromSeq: 1, replayToSeq: 0,
+      effectiveSinceSeq: 0, geometryEpoch: 0, requestedSinceSeq: 0,
+    }),
+    // Banner landed first: the replay window covers it (headSeq = last banner
+    // seq end). Same field SET, different raw values/coincidences.
+    attachReadyLike({
+      terminalId: 't_race_b0000001', streamId: 's_race_b0000001',
+      headSeq: 9, replayFromSeq: 1, replayToSeq: 9,
+      effectiveSinceSeq: 0, geometryEpoch: 0, requestedSinceSeq: 0,
+    }),
+  ]
+}
+
+describe('normalize — value-dedup seq masking is banner-race sensitive (root-cause characterization)', () => {
+  it('two contract-valid attach.ready envelopes that COINCIDE differently are NOT equal after value-dedup masking', () => {
+    const [bootA, bootB] = bannerRacePair()
+    const a = normalizeTranscript([inbound(bootA)]).normalized[0].serialized
+    const b = normalizeTranscript([inbound(bootB)]).normalized[0].serialized
+    // This is precisely why the pre-task-010 T1 envelope assertion flaked:
+    // boot A maps headSeq/replayToSeq/effectiveSinceSeq/… onto ONE
+    // <SEQ:1> while boot B splits them across two ordinals — the comparison
+    // pinned the timing-dependent coincidence partition, not the shape.
+    expect(a).not.toBe(b)
+  })
+})
+
+describe('maskEnvelopeShape — field-scoped shape masking for cross-boot envelope comparison', () => {
+  it('is invariant to the banner race: same field set, different raw values, ONE canonical form', () => {
+    const [bootA, bootB] = bannerRacePair()
+    expect(maskEnvelopeShape(bootA)).toBe(maskEnvelopeShape(bootB))
+  })
+
+  it('masks each nondeterministic leaf to a stable per-field placeholder (value erased, field identity kept)', () => {
+    const [bootA] = bannerRacePair()
+    const masked = JSON.parse(maskEnvelopeShape(bootA)) as Record<string, unknown>
+    expect(masked.terminalId).toBe('<ID:terminalId>')
+    expect(masked.streamId).toBe('<ID:streamId>')
+    expect(masked.headSeq).toBe('<SEQ:headSeq>')
+    expect(masked.replayFromSeq).toBe('<SEQ:replayFromSeq>')
+    expect(masked.replayToSeq).toBe('<SEQ:replayToSeq>')
+    expect(masked.effectiveSinceSeq).toBe('<SEQ:effectiveSinceSeq>')
+    // Deterministic contract values pass through verbatim.
+    expect(masked.type).toBe('terminal.attach.ready')
+    expect(masked.geometryAuthority).toBe('server')
+  })
+
+  it('still detects STRUCTURAL divergence: a missing field, an extra field, a changed deterministic value', () => {
+    const [bootA] = bannerRacePair()
+    const { replayToSeq: _dropped, ...missingField } = bootA
+    expect(maskEnvelopeShape(missingField)).not.toBe(maskEnvelopeShape(bootA))
+    const withExtra = { ...bootA, oldestRetainedSeq: 1 }
+    expect(maskEnvelopeShape(withExtra)).not.toBe(maskEnvelopeShape(bootA))
+    const changedEnum = { ...bootA, geometryAuthority: 'client' }
+    expect(maskEnvelopeShape(changedEnum)).not.toBe(maskEnvelopeShape(bootA))
+  })
+
+  it('is idempotent: masking an already-masked tree changes nothing', () => {
+    const [bootA] = bannerRacePair()
+    const once = maskEnvelopeShape(bootA)
+    expect(maskEnvelopeShape(JSON.parse(once))).toBe(once)
+  })
+
+  it('masks opaque payloads to their field tag and preserves array shape (count survives)', () => {
+    const envelope = {
+      type: 'terminal.exit',
+      terminalId: 't_opaque_a000001',
+      recoverableTerminalIds: ['t_x_a000001', 't_y_a000001'],
+      data: 'some opaque byte payload',
+      cwd: '/tmp/host-specific-path',
+    }
+    const masked = JSON.parse(maskEnvelopeShape(envelope)) as Record<string, unknown>
+    expect(masked.data).toBe('<OPAQUE:data>')
+    expect(masked.cwd).toBe('<PATH:cwd>')
+    expect(masked.recoverableTerminalIds).toEqual([
+      '<ID:recoverableTerminalIds>',
+      '<ID:recoverableTerminalIds>',
+    ])
   })
 })

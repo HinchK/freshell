@@ -279,12 +279,14 @@ pub async fn run(
     state: &WsState,
     bcast_rx: tokio::sync::broadcast::Receiver<String>,
     terminal_output_batch_v1: bool,
+    paced_terminal_replay_v1: bool,
     ui_screenshot_v1: bool,
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
     origin_kind: &'static str,
     conn_identity: ConnectionIdentity,
     terminal_interest_v1: bool,
+    terminal_lifetime_claim_v1: bool,
 ) {
     let (ws_tx, ws_rx) = socket.split();
 
@@ -319,6 +321,7 @@ pub async fn run(
         state,
         bcast_rx,
         terminal_output_batch_v1,
+        paced_terminal_replay_v1,
         ui_screenshot_v1,
         pane_reconcile_v1,
         pane_reconcile_fresh_agent_v1,
@@ -326,6 +329,7 @@ pub async fn run(
         origin_kind,
         conn_identity,
         terminal_interest_v1,
+        terminal_lifetime_claim_v1,
     )
     .instrument(span)
     .await;
@@ -341,6 +345,7 @@ async fn run_loop(
     state: &WsState,
     mut bcast_rx: tokio::sync::broadcast::Receiver<String>,
     terminal_output_batch_v1: bool,
+    paced_terminal_replay_v1: bool,
     ui_screenshot_v1: bool,
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
@@ -348,6 +353,7 @@ async fn run_loop(
     origin_kind: &'static str,
     mut conn_identity: ConnectionIdentity,
     terminal_interest_v1: bool,
+    terminal_lifetime_claim_v1: bool,
 ) {
     // One independently supervised socket writer. The read/dispatch path
     // never awaits socket capacity; output is reconsidered one frame at a time.
@@ -367,9 +373,59 @@ async fn run_loop(
     if terminal_interest_v1 {
         ws_tx.enable_terminal_interest();
     }
+    if terminal_lifetime_claim_v1 {
+        // Hidden-pane lifetime claims (responsive-terminal-restore WS1): this
+        // connection's terminal.interest snapshots may carry
+        // claimedTerminalIds. A connection that never negotiated keeps its
+        // claim fields ignored server-side.
+        ws_tx.enable_terminal_lifetime_claims();
+    }
+    if paced_terminal_replay_v1 {
+        // Restore contract (responsive-terminal-restore): a negotiated
+        // connection's queue-overflow gaps carry the terminal's CURRENT
+        // replay-retention bounds, resolved from the registry at
+        // gap-emission time. Installed BEFORE the pump is spawned (the same
+        // pre-spawn setup rule as `enable_terminal_interest`), so a gap can
+        // never be leased before the source exists. Non-negotiated
+        // connections leave the source unset and their gaps stay
+        // byte-identical to the pre-capability wire shape.
+        let registry = state.registry.clone();
+        ws_tx.set_paced_replay_gap_bounds(Arc::new(move |terminal_id: &str| {
+            registry.replay_bounds(terminal_id)
+        }));
+    }
     let mut writer_task = tokio::spawn(writer.run(socket_tx).instrument(tracing::Span::current()));
     let _writer_lifetime = connection_writer::AbortWriterOnDrop(writer_task.abort_handle());
     let mut writer_finished = false;
+    // Responsive-terminal-restore W1: this connection's paced replay
+    // sessions. Owned by the loop — a socket drop discards them (the
+    // registry-side deferrals die with the subscribers remove_connection
+    // sweeps), a detach cancels one, a re-attach replaces it.
+    let mut paced_sessions = crate::paced_replay::PacedSessions::default();
+    // Round-2 finding F1 + E2R1 finding 1 + E2R2 finding: the
+    // connection's staged-exit routing. A natural exit while a paced
+    // session's deferral is armed STAGES the exit registry-side (final
+    // output first) and fires the per-subscriber notify hook; this
+    // channel carries the event back to THIS loop, whose select arm
+    // ARMS the still-CREDITED session's phase extension through the
+    // terminal's frozen final head (the dispatch-side mirror of the
+    // credit path's arm-first query — the registry is the authority
+    // either way, and the arm is monotone + idempotent). The deferred
+    // final output pages ONLY on continuation credits, and terminal.exit
+    // rides the credit that acknowledges the page reaching the armed
+    // exit head (no uncredited dump, no wedge). Unbounded mpsc: the
+    // sender lives on registry subscribers and fires at most once per
+    // subscriber; the credited session bounds the staged window itself.
+    let (paced_exit_tx, mut paced_exit_rx) = mpsc::unbounded_channel::<(String, i64)>();
+    let paced_exit_notify: Option<freshell_terminal::PacedExitNotify> = paced_terminal_replay_v1
+        .then(|| {
+            let tx = paced_exit_tx.clone();
+            let notify: freshell_terminal::PacedExitNotify =
+                Arc::new(move |terminal_id: &str, exit_code: i64| {
+                    let _ = tx.send((terminal_id.to_string(), exit_code));
+                });
+            notify
+        });
     let conn_sink: FrameSink = {
         let sender = ws_tx.clone();
         Arc::new(move |msg| {
@@ -409,6 +465,11 @@ async fn run_loop(
     let mut catastrophic_ticker = tokio::time::interval(std::time::Duration::from_millis(
         (state.term09.catastrophic_stall_ms / 4).max(10),
     ));
+    // Drain-progress liveness (responsive-terminal-restore W3): the last
+    // snapshot of the writer's completed-send counter, so each monitor tick
+    // feeds the DELTA — successful sends since the previous tick — into the
+    // window decision. Slow consumption alone is not a dead socket.
+    let mut last_completed_sends: u64 = 0;
 
     // Task 9 (host-pressure pane): THIS connection's last `hoststats.refresh`
     // stamp — the per-connection 1s floor (legacy parity:
@@ -506,12 +567,15 @@ async fn run_loop(
                             conn_id,
                             &conn_sink,
                             terminal_output_batch_v1,
+                            paced_terminal_replay_v1,
                             pane_reconcile_v1,
                             pane_reconcile_fresh_agent_v1,
                             &interactive_create_tx,
                             &create_cancel_rx,
                             &mut host_stats_last_refresh_at,
                             &mut conn_identity,
+                            &mut paced_sessions,
+                            &paced_exit_notify,
                         )
                         .await
                         {
@@ -542,16 +606,65 @@ async fn run_loop(
                     _ => {}
                 }
             }
-            // TERM-09 catastrophic backpressure: this connection's queued
-            // output has stayed above the threshold continuously for the
-            // full stall duration -- close now (mirrors `broker.ts`'s
-            // `catastrophicBlocked` closing with 4008 "Catastrophic backpressure").
+            // E2R3 (the atomic exit-transition decision): the notify arm
+            // is the DISPATCH-side PRE-ARM — an extension hint, never a
+            // transition commitment. A session still in its credited
+            // phase — which always has exactly ONE uncredited page
+            // outstanding — gets its phase extended through the
+            // terminal's frozen final head HERE when the notify wins the
+            // dispatch race, so the next credit's drive pages toward it
+            // immediately; the arm reads the transition decision under
+            // ONE registry lock hold (monotone, idempotent — whichever
+            // arm lands first wins and the others are inert). NOTHING
+            // is ever delivered here and the session never leaves the
+            // table here: the disposition that commits extend-vs-transfer
+            // is the drive sites' `settle_exit_transition`, whose own
+            // atomic read absorbs any staging this arm missed — so a
+            // lost, delayed, or out-raced notify is a paging hint
+            // difference only, never a correctness difference.
+            Some((terminal_id, exit_code)) = paced_exit_rx.recv() => {
+                let _ = exit_code; // the armed log names the frozen head; the drain logs the code
+                if let Some(session) = paced_sessions.get_mut(&terminal_id) {
+                    crate::paced_replay::arm_staged_exit_from_registry(
+                        &state.registry,
+                        conn_id,
+                        session,
+                    );
+                }
+                // A session NOT in the credited table is owned by its
+                // drain task (its completing verdict delivers the staged
+                // exit) or already completed (the exit was delivered at
+                // staging, the non-paced shape) — nothing to do.
+            }
             _ = catastrophic_ticker.tick() => {
-                if catastrophic.tick(ws_tx.pending_output_bytes()) {
+                // TERM-09 catastrophic backpressure: this connection's queued
+                // output has stayed above the threshold continuously for the
+                // full stall duration WITH ZERO successful socket sends — close
+                // now (mirrors `broker.ts`'s `catastrophicBlocked` closing with
+                // 4008 "Catastrophic backpressure"). A slow-but-progressing
+                // client resets the window every tick it completes a send.
+                let completed_sends = ws_tx.completed_sends();
+                let sends_since_last_tick = completed_sends.saturating_sub(last_completed_sends);
+                last_completed_sends = completed_sends;
+                if let Some(fire) =
+                    catastrophic.tick(ws_tx.pending_output_bytes(), sends_since_last_tick)
+                {
+                    // Task-007 review M3 (landed by task-010): the event
+                    // must be diagnosable from the log line alone.
+                    // `sends_in_window` is the per-occurrence evidence —
+                    // completed sends DURING the deciding window for THIS
+                    // close, structurally zero (any send resets the window)
+                    // — while `total_sends` carries the connection's
+                    // lifetime history; the pair distinguishes a
+                    // wedge-after-progress episode (large total, silent
+                    // window) from a never-sent socket (both zero).
                     tracing::warn!(
                         connection_id = conn_id,
                         pending_bytes = ws_tx.pending_output_bytes(),
                         threshold = state.term09.catastrophic_buffered_bytes,
+                        total_sends = completed_sends,
+                        sends_in_window = fire.sends_in_window,
+                        window_ms = state.term09.catastrophic_stall_ms,
                         "ws.terminal_stream.catastrophic_close"
                     );
                     use axum::extract::ws::CloseFrame;
@@ -750,6 +863,7 @@ async fn handle_client_text(
     conn_id: u64,
     conn_sink: &FrameSink,
     terminal_output_batch_v1: bool,
+    paced_terminal_replay_v1: bool,
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
     interactive_create_tx: &mpsc::Sender<interactive_creates::Job>,
@@ -759,6 +873,14 @@ async fn handle_client_text(
     // D8: the connection's hello-stamped client identity (refreshed by
     // `tabs.sync.push` below) — the provenance source for ledger stamps.
     conn_identity: &mut ConnectionIdentity,
+    // Responsive-terminal-restore W1: this connection's paced replay
+    // sessions (one per attached terminal; the pacing coordinator's state).
+    paced_sessions: &mut crate::paced_replay::PacedSessions,
+    // Round-2 finding F1: the connection's staged-exit notification hook.
+    // A natural exit while a paced session's deferral is armed STAGES the
+    // exit registry-side and fires this hook; the run_loop's
+    // paced_exit_rx arm routes it into the exit-drain.
+    paced_exit_notify: &Option<freshell_terminal::PacedExitNotify>,
 ) -> bool {
     // Accept-and-strip: unknown/unparseable frames are ignored (matches the
     // runtime's tolerance; the handshake already gated auth).
@@ -905,7 +1027,25 @@ async fn handle_client_text(
     }
     match message {
         ClientMessage::TerminalInterest(interest) => match ws_tx.set_terminal_interest(&interest) {
-            Ok(()) => true,
+            // Hidden-pane lifetime claims (responsive-terminal-restore WS1):
+            // the accepted snapshot's claim diff is applied to the registry —
+            // claims never attach, never grant replay, and never change
+            // delivery priority (the priority recompute happened inside
+            // set_terminal_interest). A connection that did not negotiate
+            // `terminalLifetimeClaimV1` produces an empty diff here, so its
+            // claimedTerminalIds (if any) are ignored server-side.
+            Ok(Some(claims)) => {
+                if !claims.is_empty() {
+                    for terminal_id in &claims.added {
+                        state.registry.claim_terminal(terminal_id, conn_id);
+                    }
+                    for terminal_id in &claims.removed {
+                        state.registry.withdraw_claim(terminal_id, conn_id);
+                    }
+                }
+                true
+            }
+            Ok(None) => true,
             Err(message) => {
                 send(
                     ws_tx,
@@ -1458,15 +1598,61 @@ async fn handle_client_text(
                 // session lost before its first snapshot.
                 let asserted_at = now_ms();
                 maybe_restamp_on_attach(&attach, state, conn_identity, asserted_at).await;
+                // Observability inputs captured before the attach moves.
+                let requested_since_seq = attach.since_seq.unwrap_or(0);
+                let attach_max_replay_bytes = attach.max_replay_bytes;
+                // Responsive-terminal-restore binding point 6 (supersede):
+                // EVERY successful re-attach for the same (connection,
+                // terminal) cancels the connection's previous paced session
+                // for that terminal — a cancelled session's late credits are
+                // ignored as a stale generation. This must cover the LEGACY
+                // reply too (an arid-less re-attach from a negotiated
+                // connection, or an attach to an exited terminal): the
+                // registry already replaced the subscriber, so a surviving
+                // ws-layer session would be fed by a NEW subscriber's ring
+                // reads and could still produce phantom pages for a
+                // stale-generation credit. A FAILED attach (Error) cancels
+                // nothing — the previous session still matches its live
+                // subscriber and deferral. Each arm cancels BEFORE the paced
+                // insert below, so the new session is never the one removed.
+                let attach_terminal_id = attach.terminal_id.clone();
                 let attached = match handle_attach(
                     attach,
                     state,
                     conn_id,
                     conn_sink,
                     terminal_output_batch_v1,
+                    paced_terminal_replay_v1,
+                    paced_exit_notify.clone(),
                 ) {
-                    Some(err) => send(ws_tx, &err).await,
-                    None => true,
+                    AttachReply::Error(err) => send(ws_tx, &err).await,
+                    AttachReply::Legacy => {
+                        paced_sessions.cancel(&attach_terminal_id);
+                        true
+                    }
+                    AttachReply::Paced(start) => {
+                        paced_sessions.cancel(&attach_terminal_id);
+                        // The paced replay core (responsive-terminal-restore
+                        // W1): sink the first page (the registry produced it
+                        // under the attach lock), emit the session start, and
+                        // — when the first page already covers the target —
+                        // hand the session to the off-dispatch drain task (a
+                        // short or empty replay drains to completion without
+                        // ever needing a credit, still never on the
+                        // dispatcher).
+                        crate::paced_replay::start_session(
+                            &state.registry,
+                            conn_id,
+                            conn_sink,
+                            paced_sessions,
+                            *start,
+                            requested_since_seq,
+                            attach_max_replay_bytes,
+                            ws_tx.clone(),
+                            create_cancel_rx.clone(),
+                        );
+                        true
+                    }
                 };
                 // The window closes with the guard (exactly-once).
                 drop(attach_guard);
@@ -1542,7 +1728,36 @@ async fn handle_client_text(
             }
         }
         ClientMessage::TerminalDetach(detach) => {
+            // Responsive-terminal-restore: an explicit detach cancels the
+            // connection's paced session for this terminal (the registry-side
+            // deferral dies with the subscriber the detach removes).
+            paced_sessions.cancel(&detach.terminal_id);
             handle_detach(&detach, ws_tx, state, conn_id).await
+        }
+        // Responsive-terminal-restore Workstream 1: the paced replay
+        // continuation credit. All rules sit under the connection's
+        // negotiated capability — a non-negotiated connection's credits are
+        // inert (logged, then ignored).
+        ClientMessage::TerminalReplayCredit(replay_credit) => {
+            if !paced_terminal_replay_v1 {
+                tracing::info!(
+                    terminal_id = %replay_credit.terminal_id,
+                    consumed_seq = replay_credit.consumed_seq,
+                    status = crate::paced_replay::CreditVerdict::NonNegotiated.as_str(),
+                    "ws.restore.credit"
+                );
+                true
+            } else {
+                handle_replay_credit(
+                    &replay_credit,
+                    &state.registry,
+                    conn_id,
+                    conn_sink,
+                    paced_sessions,
+                    ws_tx,
+                    create_cancel_rx,
+                )
+            }
         }
         ClientMessage::TerminalKill(kill) => {
             // b8ke ext r24 F2: the kill's coordinator transitions record
@@ -7088,23 +7303,44 @@ async fn maybe_restamp_on_attach(
 }
 
 /// `terminal.attach` — resolve the terminal in the shared registry and attach THIS
-/// connection to it: the registry enqueues `terminal.attach.ready`, replays the
-/// scrollback (seq-ordered, stamped with this attach's id + `source:'replay'`), and
-/// registers the connection so live output fans out — all onto `conn_sink`, which
-/// the select loop drains to the socket. Attaching to an unknown terminal returns
-/// the reference's `error{INVALID_TERMINAL_ID, "Terminal not running"}` frame for
-/// the caller to send (`ws-handler.ts:2730-2735`; restored by kata dtfn — the SPA's
-/// recovery ladder recreates the pane). `None` = attached.
+/// connection to it: the registry enqueues `terminal.attach.ready` and replays the
+/// scrollback (seq-ordered, stamped with this attach's id + `source:'replay'`) onto
+/// `conn_sink`, which the select loop drains to the socket. Attaching to an
+/// unknown terminal returns the reference's `error{INVALID_TERMINAL_ID,
+/// "Terminal not running"}` frame for the caller to send
+/// (`ws-handler.ts:2730-2735`; restored by kata dtfn — the SPA's recovery ladder
+/// recreates the pane). `Ok(None)` = attached with no reply.
+///
+/// Responsive-terminal-restore Workstream 1: a NEGOTIATED
+/// (`pacedTerminalReplayV1`) attach to a Running terminal with an
+/// attachRequestId returns the paced session start instead — the registry
+/// armed the subscriber's deferral and produced the FIRST page under the
+/// attach lock; the caller sinks that page after the lock is released and
+/// owns the pacing session (credits, tail drain, completion).
+///
+/// TERM-07: the attach's `maxReplayBytes` threads through BOTH
+/// geometry-authorized and geometry-skipped paths into the registry call,
+/// where it is recorded on the subscriber with no delivery-behavior change
+/// (the paced-start observability event reports it; the increment-3
+/// snapshot work consumes it).
+enum AttachReply {
+    Legacy,
+    Error(Box<ServerMessage>),
+    Paced(Box<freshell_terminal::PacedAttachStart>),
+}
+
 fn handle_attach(
     attach: TerminalAttach,
     state: &WsState,
     conn_id: u64,
     conn_sink: &FrameSink,
     terminal_output_batch_v1: bool,
-) -> Option<ServerMessage> {
+    paced_terminal_replay_v1: bool,
+    paced_exit_notify: Option<freshell_terminal::PacedExitNotify>,
+) -> AttachReply {
     // STATE-SYNC FIX 1 increment 2a: stamp the canonical identity onto
     // `attach.ready` from the shared identity registry (create-time
-    // resume ids AND locator-associated ids both live there); the
+    // resume ids AND locator-associated ids both live here); the
     // registry crate is identity-agnostic, so it's resolved here.
     let canonical_session_ref = state.identity.session_ref_for(&attach.terminal_id);
 
@@ -7118,9 +7354,28 @@ fn handle_attach(
         attach.expected_session_ref.as_ref(),
         canonical_session_ref.as_ref(),
     );
+    // TERM-07 seam: the client's replay-budget request rides both paths.
+    let max_replay_bytes = attach.max_replay_bytes;
+    // Round-2 finding F3: the negotiated forward-page upper bound rides
+    // the same paths as a PacedAttachOptions input — the registry clamps
+    // it to its own cap and records the effective budget on the session
+    // so every later page honors the same bound. Round-2 finding F1: the
+    // connection's staged-exit notification hook installs with the paced
+    // subscriber ATOMICALLY with the attach (a post-attach registration
+    // would race the very natural exit it exists to sequence), so a
+    // natural exit while the deferral is armed can move this connection's
+    // session into its exit-drain.
+    let paced_options = freshell_terminal::PacedAttachOptions {
+        replay_page_bytes: attach.replay_page_bytes,
+        paced_exit_notify,
+    };
     let outcome = if geometry_identity_ok {
         let cols = attach.cols.clamp(0, u16::MAX as i64) as u16;
         let rows = attach.rows.clamp(0, u16::MAX as i64) as u16;
+        // `paced_terminal_replay_v1` gates the paced replay core
+        // (responsive-terminal-restore): a negotiated attach with an
+        // attachRequestId to a Running terminal returns the paced session
+        // start; every other shape keeps the legacy inline replay.
         state.registry.attach_with_geometry(
             &attach.terminal_id,
             conn_id,
@@ -7128,14 +7383,17 @@ fn handle_attach(
             attach.attach_request_id.clone(),
             attach.since_seq.unwrap_or(0),
             terminal_output_batch_v1,
+            paced_terminal_replay_v1,
             canonical_session_ref,
             // Mode replay-sync: the client's positive surface-fresh marker
             // (xterm recreation / user reset). Forwards the wire field 1:1; the
             // registry owns the emit-vs-skip gating.
             attach.surface_reset,
+            max_replay_bytes,
             attach.intent,
             cols,
             rows,
+            paced_options,
         )
     } else {
         state.registry.attach(
@@ -7145,12 +7403,18 @@ fn handle_attach(
             attach.attach_request_id.clone(),
             attach.since_seq.unwrap_or(0),
             terminal_output_batch_v1,
+            paced_terminal_replay_v1,
             canonical_session_ref,
             attach.surface_reset,
+            max_replay_bytes,
+            paced_options,
         )
     };
     if outcome.found {
-        return None;
+        return match outcome.paced {
+            Some(start) => AttachReply::Paced(Box::new(start)),
+            None => AttachReply::Legacy,
+        };
     }
     // Kata dtfn: `AttachOutcome{found:false}` was silently discarded here,
     // wedging any attach against an unknown id (stale pre-restart id, typo'd
@@ -7159,7 +7423,7 @@ fn handle_attach(
     // gate accepts it (attachRequestIds live in the `pane:N:nanoid` namespace,
     // never colliding with createRequestIds — see ws-client's
     // clearTrackedCreate-on-error behavior).
-    Some(ServerMessage::Error(ErrorMsg {
+    AttachReply::Error(Box::new(ServerMessage::Error(ErrorMsg {
         owner_kind: None,
         owner_generation: None,
         owner_epoch: None,
@@ -7173,7 +7437,99 @@ fn handle_attach(
         terminal_id: Some(attach.terminal_id),
         terminal_exit_code: None,
         live_terminal_id: None,
-    }))
+    })))
+}
+
+/// One `terminal.replay.credit` on a negotiated connection
+/// (responsive-terminal-restore Workstream 1): validate against the active
+/// session's generation + outstanding-page window, and on acceptance
+/// produce the next page (or the negotiated retention gap + continuation,
+/// or — once the cursor reaches the target — the tail drain that completes
+/// the session). Every non-accepted verdict is inert (observed via
+/// `ws.restore.credit`, never a client-visible error).
+fn handle_replay_credit(
+    replay_credit: &freshell_protocol::TerminalReplayCredit,
+    registry: &freshell_terminal::TerminalRegistry,
+    conn_id: u64,
+    conn_sink: &FrameSink,
+    paced_sessions: &mut crate::paced_replay::PacedSessions,
+    writer: &connection_writer::WriterSender,
+    cancel: &tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    use crate::paced_replay::TransitionDisposition;
+    // Identifiers/measurements only, per the restore observability contract.
+    let observe = |verdict: crate::paced_replay::CreditVerdict| {
+        tracing::info!(
+            terminal_id = %replay_credit.terminal_id,
+            consumed_seq = replay_credit.consumed_seq,
+            status = verdict.as_str(),
+            "ws.restore.credit"
+        );
+    };
+    let Some(session) = paced_sessions.get_mut(&replay_credit.terminal_id) else {
+        // No active session accepts this credit (completed, detached,
+        // draining, or a terminal never paced): a stale generation.
+        observe(crate::paced_replay::CreditVerdict::StaleGeneration);
+        return true;
+    };
+    let verdict = crate::paced_replay::validate_credit(session, replay_credit);
+    observe(verdict);
+    if verdict != crate::paced_replay::CreditVerdict::Accepted {
+        return true;
+    }
+    // Round-2 finding F3: the SESSION's effective page budget (the
+    // attach's `replayPageBytes` request clamped to the registry cap,
+    // recorded on the session at attach) sizes the credited pages — the
+    // whole session honors the requested bound, not just the first page.
+    let budget = session.page_budget;
+    // E2R2 finding (the exit-arming race) — invariant 1, THE PRE-ARM:
+    // arming precedes the drive so the drive pages toward the extended
+    // phase target immediately. The arm is monotone/idempotent and
+    // NEVER a transition commitment: the disposition below re-decides
+    // atomically after the drive, so an exit staged inside this
+    // credit's window — after this arm's read, during the drive — is
+    // absorbed by the disposition's own single-hold read (E2R3: the
+    // pre-fix check-then-act window is closed structurally, not
+    // re-ordered).
+    crate::paced_replay::arm_staged_exit_from_registry(registry, conn_id, session);
+    let outcome = crate::paced_replay::drive_session(registry, conn_id, conn_sink, session, budget);
+    // E2R3 — THE ATOMIC TRANSITION DISPOSITION: extend-vs-transfer is
+    // committed from ONE registry lock hold AFTER the drive. An exit
+    // staged before the disposition's hold extends the credited phase
+    // (the exit rides the acknowledging credit of the page reaching the
+    // frozen head — E2R2 invariant 2 lives in the disposition now); the
+    // atomically-confirmed absence of a staged exit is what makes the
+    // transfer below safe; an exit staged strictly after the hold is
+    // the drain's documented uncredited tail content (the atomicity
+    // boundary is exactly the transfer decision).
+    match crate::paced_replay::settle_exit_transition(
+        registry, conn_id, conn_sink, session, outcome,
+    ) {
+        TransitionDisposition::Stay => {}
+        // The credited phase covered its target and everything it must
+        // acknowledge is acknowledged (or the armed exit head is fully
+        // covered): the session moves WHOLE into the spawned drain task
+        // — the connection dispatcher stays free (input, other panes,
+        // controls) while the un-credited drain pages, and credits that
+        // arrive during the drain are inert stale generations.
+        TransitionDisposition::Transfer => {
+            if let Some(session) = paced_sessions.remove(&replay_credit.terminal_id) {
+                crate::paced_replay::spawn_paced_drain(
+                    registry.clone(),
+                    conn_id,
+                    writer.clone(),
+                    Arc::clone(conn_sink),
+                    session,
+                    budget,
+                    cancel.clone(),
+                );
+            }
+        }
+        TransitionDisposition::Gone => {
+            paced_sessions.remove(&replay_credit.terminal_id);
+        }
+    }
+    true
 }
 
 /// Node's `resizeIfSessionMatches` identity guard
@@ -10540,12 +10896,15 @@ mod pane_reconcile_gate_tests {
             1,
             &conn_sink,
             false,
+            false,
             false, // pane_reconcile_v1: NOT negotiated on this connection
             false,
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
+            &mut Default::default(),
+            &None,
         )
         .await;
         assert!(
@@ -10566,10 +10925,13 @@ mod pane_reconcile_gate_tests {
             false,
             false,
             false,
+            false,
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
+            &mut Default::default(),
+            &None,
         )
         .await;
         assert!(pong_ok);
@@ -10610,10 +10972,13 @@ mod pane_reconcile_gate_tests {
             false,
             false,
             false,
+            false,
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
+            &mut Default::default(),
+            &None,
         )
         .await;
         assert!(ok);
@@ -10634,10 +10999,13 @@ mod pane_reconcile_gate_tests {
                 false,
                 false,
                 false,
+                false,
                 &interactive_create_tx,
                 &create_cancel_rx,
                 &mut host_stats_last_refresh_at,
                 &mut conn_identity,
+                &mut Default::default(),
+                &None,
             )
             .await;
             assert!(ok, "attempt {attempt}: a full queue must be answered");
@@ -10975,10 +11343,13 @@ mod host_stats_dispatch_tests {
                 false,
                 false,
                 false,
+                false,
                 &interactive_create_tx,
                 &create_cancel_rx,
                 &mut host_stats_last_refresh_at,
                 &mut conn_identity,
+                &mut Default::default(),
+                &None,
             )
             .await;
             assert!(ok);
@@ -11006,10 +11377,13 @@ mod host_stats_dispatch_tests {
             false,
             false,
             false,
+            false,
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
+            &mut Default::default(),
+            &None,
         )
         .await;
         assert!(ok);
@@ -11027,10 +11401,13 @@ mod host_stats_dispatch_tests {
             false,
             false,
             false,
+            false,
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
+            &mut Default::default(),
+            &None,
         )
         .await;
         assert!(pong_ok);
@@ -11069,10 +11446,13 @@ mod host_stats_dispatch_tests {
             false,
             false,
             false,
+            false,
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
+            &mut Default::default(),
+            &None,
         )
         .await;
         assert!(ok);
@@ -11096,10 +11476,13 @@ mod host_stats_dispatch_tests {
             false,
             false,
             false,
+            false,
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
+            &mut Default::default(),
+            &None,
         )
         .await;
         assert!(ok);
@@ -11141,10 +11524,13 @@ mod host_stats_dispatch_tests {
             false,
             false,
             false,
+            false,
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
+            &mut Default::default(),
+            &None,
         )
         .await;
         assert!(ok);
@@ -11156,5 +11542,1017 @@ mod host_stats_dispatch_tests {
         // A rejected refresh must NOT claim the floor slot (Node stamps only
         // after passing the floor, with a live service).
         assert!(host_stats_last_refresh_at.is_none());
+    }
+}
+
+/// E2R2 finding (the credited natural-exit exit-arming race): focused,
+/// DETERMINISTIC exercises of the transition's two race windows. The
+/// production entry points run against a REAL in-process PTY registry —
+/// the staging is real (`finish_pty_exit` from the PTY reader thread),
+/// the pages are real, the spawned drain is a real tokio task — but the
+/// DISPATCHER is the test itself: each credit is a direct
+/// `handle_replay_credit` call, so the "notify queued but not yet
+/// dispatched" window (the exact race state the integration socket cannot
+/// order deterministically) is constructed by simply not dispatching
+/// anything else. Credit timing is controlled explicitly — the
+/// parser-consumption boundary is the thing under test.
+///
+/// THE INVARIANT under test (E2R2, stated per the finding):
+/// 1. Arming always precedes driving: an arm that extends `phase_target`
+///    beyond `credited` MUST be followed by a drive that produces the
+///    next page — no state may exist where the target exceeds the
+///    credited cursor and no page was just emitted (the WEDGE).
+/// 2. `terminal.exit` rides the CREDIT verdict that acknowledges
+///    consumption of the page reaching `exit_head` — never the drive
+///    that emits it.
+/// 3. Monotone arming: a restaging never moves `exit_head` backward and
+///    never double-delivers.
+/// 4. Retention loss mid-wait reports the exact bounds-carrying gap;
+///    the exit still rides the acknowledging credit.
+///
+/// THE INVARIANT under test (E2R3, the third sharpening — the phase
+/// transition is ATOMIC with respect to exit staging):
+/// 5. The session's phase-transition decision — extend the credited
+///    phase with a staged exit vs transfer to the uncredited tail
+///    drain vs arm at session start — reads the staged-exit state and
+///    commits the disposition under ONE registry lock hold. No
+///    check-then-act window may remain in which a concurrently staged
+///    exit can change which transition was correct: an exit staged
+///    before the decision's hold is absorbed by the SAME handling (the
+///    phase extends; the exit rides the acknowledging credit of the
+///    page reaching the frozen head), and an exit staged strictly after
+///    the atomic transfer decision is the drain's documented
+///    uncredited tail content.
+///
+/// The E2R3 races are modeled deterministically (never sleep-based):
+/// the registry's ONE-SHOT staging hook fires the natural-exit staging
+/// INSIDE a staged-exit read's own lock hold, immediately after that
+/// read — the PTY reader's concurrent staging at a precise point of
+/// the decision path. The quiet script never exits for these tests: a
+/// real exit would stage at its own uncontrolled moment.
+#[cfg(test)]
+mod paced_exit_race_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Everything the session sinks (pages, gaps, exits), in order.
+    type Collector = Arc<Mutex<Vec<ServerMessage>>>;
+
+    fn collector_sink(collector: &Collector) -> FrameSink {
+        let collector = Arc::clone(collector);
+        Arc::new(move |message| {
+            collector.lock().expect("collector lock").push(message);
+        })
+    }
+
+    fn outputs(collector: &Collector) -> Vec<String> {
+        collector
+            .lock()
+            .expect("collector lock")
+            .iter()
+            .filter_map(|m| match m {
+                ServerMessage::TerminalOutput(frame) => Some(frame.data.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn exit_count(collector: &Collector) -> usize {
+        collector
+            .lock()
+            .expect("collector lock")
+            .iter()
+            .filter(|m| matches!(m, ServerMessage::TerminalExit(_)))
+            .count()
+    }
+
+    fn last_is_exit(collector: &Collector) -> bool {
+        collector
+            .lock()
+            .expect("collector lock")
+            .last()
+            .is_some_and(|m| matches!(m, ServerMessage::TerminalExit(_)))
+    }
+
+    /// Poll `probe` until it returns `Some` or the deadline passes —
+    /// the deterministic observation points (output landed in the ring,
+    /// the exit staged, the drain delivered).
+    async fn wait_for<T>(mut probe: impl FnMut() -> Option<T>, what: &str) -> T {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(value) = probe() {
+                return value;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The deterministic terminal under test: a shell script that produces
+    /// output only in response to input lines, then a final marker, then
+    /// exits. Nothing is emitted before the first input, so the ring's
+    /// head is deterministically 0 until the test writes. Each pad step
+    /// prints a UNIQUE marker (`PAD-STEP-<i>`): `step`'s marker wait is a
+    /// substring match over the whole retained ring, so a repeated
+    /// marker would let step i+1 return on step i's output before its
+    /// own ingestion — the attach would then race the remaining pads'
+    /// asynchronous ingestion (a real flake: the first page could cover
+    /// the whole raced window and fail the bounded-prefix assert).
+    fn race_script(pads: usize, final_marker: &str) -> String {
+        let mut script = String::new();
+        for pad in 0..pads {
+            script.push_str(&format!("read x; printf 'PAD-STEP-{pad}\\n'; "));
+        }
+        script.push_str(&format!("read x; printf '{}\\n'; exit\n", final_marker));
+        script
+    }
+
+    /// The QUIET twin (E2R3): identical output behavior, but the script
+    /// NEVER exits and echo is OFF — the concurrent-staging
+    /// transition-race tests stage the natural exit themselves via the
+    /// registry's deterministic in-lock hook, at a precise point
+    /// inside the decision path, and they COUNT FRAMES (budget 0: one
+    /// frame per page, so the credit whose drive reaches the attach
+    /// target is nameable in advance). A real script exit would stage
+    /// at its own uncontrolled moment, and a live PTY's input echo
+    /// coalesces with the step's output nondeterministically (sometimes
+    /// one frame, sometimes two) — `stty -echo` plus the ECHO-OFF
+    /// banner (the harness's [`RaceHarness::wait_ready`] gate) makes
+    /// every post-banner step produce EXACTLY its printf frame. Pad
+    /// markers are unique per step for the same reason as the exiting
+    /// script's (see [`race_script`]).
+    fn quiet_race_script(pads: usize, final_marker: &str) -> String {
+        let mut script = String::from("stty -echo; printf 'ECHO-OFF\\n'; ");
+        for pad in 0..pads {
+            script.push_str(&format!("read x; printf 'PAD-STEP-{pad}\\n'; "));
+        }
+        script.push_str(&format!("read x; printf '{}\\n'; ", final_marker));
+        script.push_str("while :; do read x; done");
+        script
+    }
+
+    struct RaceHarness {
+        registry: freshell_terminal::TerminalRegistry,
+        terminal_id: String,
+        collector: Collector,
+        sink: FrameSink,
+        writer: connection_writer::WriterSender,
+        /// The cancel channel's sender stays alive with the harness (the
+        /// production run_loop holds it for the connection's lifetime) —
+        /// a closed channel wakes the drain's cancel arm immediately.
+        _cancel_tx: tokio::sync::watch::Sender<bool>,
+        /// The writer pump stays alive with the harness (in production it
+        /// owns the socket until the connection ends): its Drop closes the
+        /// writer queue, and a closed queue makes every drain-admission
+        /// reservation return None (the drain would exit silently). It is
+        /// never polled here — the pages and the exit sink through the
+        /// registry subscriber, not the writer.
+        _writer_pump: connection_writer::WriterPump,
+        cancel_rx: tokio::sync::watch::Receiver<bool>,
+        sessions: crate::paced_replay::PacedSessions,
+        conn_id: u64,
+        arid: String,
+    }
+
+    impl RaceHarness {
+        /// Spawn the script PTY, negotiate nothing (the registry attach is
+        /// the production paced path), and wire the session table, the
+        /// collector sink, and a real (pump-less) writer. The writer's
+        /// admission gate grants a reservation whenever the queue is empty,
+        /// so the spawned drain completes its CaughtUp hold in-process.
+        fn new(name: &str, pads: usize, final_marker: &str) -> Self {
+            // Small pages: every drive emits at most a couple of frames,
+            // so the credit-by-credit walk crosses the target boundary in
+            // observable steps.
+            Self::new_with_script(name, race_script(pads, final_marker), 240)
+        }
+
+        /// The QUIET twin (E2R3): the script never exits and the page
+        /// budget is 0 — ONE frame per page, the registry's own
+        /// deterministic-cursor idiom — so the concurrent-staging tests
+        /// can name the EXACT credit whose drive reaches the attach
+        /// target (the racing credit) without probing page boundaries.
+        fn new_quiet(name: &str, pads: usize, final_marker: &str) -> Self {
+            Self::new_with_script(name, quiet_race_script(pads, final_marker), 0)
+        }
+
+        fn new_with_script(name: &str, script: String, page_budget: i64) -> Self {
+            let registry = freshell_terminal::TerminalRegistry::new();
+            registry.set_paced_page_max_bytes(page_budget);
+            let terminal_id = format!("T-{name}");
+            let exit_registry = registry.clone();
+            let exit_terminal_id = terminal_id.clone();
+            let on_exit: freshell_terminal::pty::ExitHook = Box::new(move |exit_code: i64| {
+                exit_registry.finish_pty_exit(&exit_terminal_id, exit_code);
+            });
+            let spec = freshell_platform::SpawnSpec {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), script],
+                env_overrides: BTreeMap::new(),
+                cwd: None,
+                cols: 120,
+                rows: 30,
+            };
+            registry
+                .create(
+                    &spec,
+                    &BTreeMap::new(),
+                    terminal_id.clone(),
+                    "S".into(),
+                    "shell",
+                    None,
+                    None,
+                    None,
+                    Some(on_exit),
+                )
+                .expect("spawn race-script PTY");
+            let collector: Collector = Arc::new(Mutex::new(Vec::new()));
+            let sink = collector_sink(&collector);
+            let (writer, writer_pump) = connection_writer::WriterSender::new(
+                16 * 1024 * 1024,
+                1024 * 1024,
+                std::time::Duration::from_secs(5),
+            );
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            Self {
+                registry,
+                terminal_id,
+                collector,
+                sink,
+                writer,
+                _cancel_tx: cancel_tx,
+                _writer_pump: writer_pump,
+                cancel_rx,
+                sessions: crate::paced_replay::PacedSessions::default(),
+                conn_id: 1,
+                arid: format!("arid-{name}"),
+            }
+        }
+
+        fn attach_paced(&self, since_seq: i64) -> freshell_terminal::PacedAttachStart {
+            let outcome = self.registry.attach(
+                &self.terminal_id,
+                self.conn_id,
+                Arc::clone(&self.sink),
+                Some(self.arid.clone()),
+                since_seq,
+                false,
+                true,
+                None,
+                None,
+                None,
+                freshell_terminal::PacedAttachOptions::default(),
+            );
+            outcome.paced.expect("the paced attach path")
+        }
+
+        /// Wait for the quiet script's ECHO-OFF banner: the `stty -echo`
+        /// before it has taken effect by then, so every later input line
+        /// produces EXACTLY its printf frame — no echo frames, no
+        /// echo/output coalescing. The banner itself is the ring's
+        /// deterministic frame 1, which the frame-counting tests fold
+        /// into their seeded windows.
+        async fn wait_ready(&self) {
+            let registry = self.registry.clone();
+            let terminal_id = self.terminal_id.clone();
+            wait_for(
+                move || {
+                    registry
+                        .directory()
+                        .iter()
+                        .find(|entry| entry.terminal_id == terminal_id)
+                        .map(|entry| entry.snapshot.clone())
+                        .filter(|snapshot| snapshot.contains("ECHO-OFF"))
+                },
+                "the quiet script's ECHO-OFF banner",
+            )
+            .await;
+        }
+
+        fn start_session(&mut self, start: freshell_terminal::PacedAttachStart, since: i64) {
+            crate::paced_replay::start_session(
+                &self.registry,
+                self.conn_id,
+                &self.sink,
+                &mut self.sessions,
+                start,
+                since,
+                None,
+                self.writer.clone(),
+                self.cancel_rx.clone(),
+            );
+        }
+
+        fn session(&mut self) -> crate::paced_replay::PacedSession {
+            self.try_session()
+                .expect("the session is in the credited table")
+        }
+
+        fn try_session(&mut self) -> Option<crate::paced_replay::PacedSession> {
+            self.sessions
+                .get_mut(&self.terminal_id)
+                .map(|session| session.clone())
+        }
+
+        fn credit(&mut self, consumed_seq: i64) {
+            let credit = freshell_protocol::TerminalReplayCredit {
+                terminal_id: self.terminal_id.clone(),
+                stream_id: "S".into(),
+                attach_request_id: self.arid.clone(),
+                consumed_seq,
+            };
+            handle_replay_credit(
+                &credit,
+                &self.registry,
+                self.conn_id,
+                &self.sink,
+                &mut self.sessions,
+                &self.writer,
+                &self.cancel_rx,
+            );
+        }
+
+        /// Write one input line and wait for the marker it produces to be
+        /// observable in the ring (the deterministic per-step barrier).
+        async fn step(&self, line: &str, marker: &str) {
+            let registry = self.registry.clone();
+            let terminal_id = self.terminal_id.clone();
+            let wanted = marker.to_string();
+            let outcome = self
+                .registry
+                .input(&self.terminal_id, format!("{line}\n").as_bytes());
+            assert!(outcome.found, "the input write reaches the live PTY");
+            wait_for(
+                move || {
+                    registry
+                        .directory()
+                        .iter()
+                        .find(|entry| entry.terminal_id == terminal_id)
+                        .map(|entry| entry.snapshot.clone())
+                        .filter(|snapshot| snapshot.contains(&wanted))
+                },
+                &format!("the ring to hold {marker}"),
+            )
+            .await;
+        }
+
+        async fn wait_staged(&self) -> i64 {
+            let registry = self.registry.clone();
+            let terminal_id = self.terminal_id.clone();
+            let conn_id = self.conn_id;
+            wait_for(
+                move || registry.staged_paced_exit(&terminal_id, conn_id),
+                "the natural exit to stage behind the armed deferral",
+            )
+            .await
+        }
+
+        fn head(&self) -> i64 {
+            self.registry
+                .replay_bounds(&self.terminal_id)
+                .expect("replay bounds")
+                .head_seq
+        }
+
+        /// The ring head once in-flight PTY chunks have landed. A small
+        /// write can split across PTY read chunks — a marker's trailing
+        /// bytes may land as a separate ring frame microseconds after the
+        /// marker text first appears (observed on 2-core CI runners,
+        /// never on the 96-core dev box) — so frame counts are only
+        /// stable once the ring is quiet. Progress-based: the quiet
+        /// clock resets on every observed head advance, and the fixed
+        /// bound trips only on a dead PTY, never a slow one.
+        async fn settled_head(&self) -> i64 {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut last = self.head();
+            let mut quiet_since = tokio::time::Instant::now();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                let now = self.head();
+                if now != last {
+                    last = now;
+                    quiet_since = tokio::time::Instant::now();
+                } else if quiet_since.elapsed() >= std::time::Duration::from_millis(25) {
+                    return now;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the ring head never settled — a dead PTY (the quiet window \
+                     resets on every advance, so this trips only on a dead one)"
+                );
+            }
+        }
+
+        /// Assert NO terminal.exit is delivered while an exit page sits
+        /// uncredited — the invariant-2 hold, over a deterministic window.
+        async fn assert_exit_held(&self) {
+            let before = exit_count(&self.collector);
+            let hold = std::time::Instant::now() + std::time::Duration::from_millis(1_500);
+            while std::time::Instant::now() < hold {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let now = exit_count(&self.collector);
+                assert_eq!(
+                    now, before,
+                    "terminal.exit must NOT deliver while the page reaching the \
+                     armed exit head is uncredited — it rides the credit that \
+                     acknowledges that page (invariant 2)"
+                );
+            }
+        }
+
+        async fn assert_exit_arrives_and_is_last(&self, expected_code: i64) {
+            let collector = Arc::clone(&self.collector);
+            wait_for(
+                move || (exit_count(&collector) > 0).then_some(()),
+                "terminal.exit to arrive on the acknowledging credit",
+            )
+            .await;
+            assert_eq!(
+                exit_count(&self.collector),
+                1,
+                "exactly one terminal.exit may ever arrive (invariant 3)"
+            );
+            assert!(
+                last_is_exit(&self.collector),
+                "terminal.exit must be the client's last frame"
+            );
+            let code = self
+                .collector
+                .lock()
+                .expect("collector lock")
+                .iter()
+                .find_map(|m| match m {
+                    ServerMessage::TerminalExit(exit) => Some(exit.exit_code),
+                    _ => None,
+                })
+                .expect("the exit frame");
+            assert_eq!(code, expected_code);
+        }
+    }
+
+    /// E2R3, (a) THE CONCURRENT-STAGING RACE at the credit path: the
+    /// ordering the finding pins at the credit handler, in the one state
+    /// where it strands the stream: the client's first page was EMPTY (its
+    /// cursor already sat at the attach head: `credited == page_end ==
+    /// target`), and the exit staged between the attach and
+    /// `start_session` with NEW output past that target. The arm extends
+    /// the phase target beyond the credited cursor, so the drive MUST
+    /// produce the next page — a keep-with-no-page wedges the session
+    /// forever (nothing outstanding, so no credit can ever come).
+    #[tokio::test]
+    async fn empty_first_page_exit_race_extends_the_drive_not_a_wedge() {
+        let mut harness = RaceHarness::new("wedge", 0, "FINAL-WEDGE");
+        // The client attaches fully caught up: since == head == 0 (the
+        // script emits nothing before its first input), so the first page
+        // is empty and the session starts with nothing outstanding.
+        let head_at_attach = harness.head();
+        assert_eq!(head_at_attach, 0, "the script is quiet until driven");
+        let start = harness.attach_paced(head_at_attach);
+        assert_eq!(
+            start.session.page_end, start.session.effective_since,
+            "the empty first page leaves nothing outstanding"
+        );
+        // The exit stages with new output while the notify is still
+        // queued (the test IS the undispatched dispatcher window).
+        harness.step("go", "FINAL-WEDGE").await;
+        let exit_code = harness.wait_staged().await;
+        let exit_head = harness.head();
+        assert!(
+            exit_head > start.session.target,
+            "the exit added output past the original target"
+        );
+        harness.start_session(start, head_at_attach);
+        // INVARIANT 1: the arm extended the target beyond the credited
+        // cursor, so the drive MUST have produced the next page — the
+        // pre-fix keep-with-no-page wedged here with NOTHING outstanding
+        // (no page, no exit, ever). The session owes exactly one
+        // uncredited page and its first frames are already sunk.
+        let session = harness.session();
+        assert!(
+            session.credited < session.page_end,
+            "the drive produced the extended phase's next page \
+             (no wedge state: credited {}, page_end {})",
+            session.credited,
+            session.page_end,
+        );
+        assert!(
+            !outputs(&harness.collector).is_empty(),
+            "the extended phase's first page was sunk to the client"
+        );
+        // INVARIANT 2: the exit waits for the credit that acknowledges
+        // the page reaching the armed exit head. Credit the pages one by
+        // one until that page is outstanding, hold it uncredited, then
+        // acknowledge it — the exit rides THAT credit.
+        let mut guards = 0;
+        loop {
+            let session = harness.session();
+            assert!(
+                session.page_end <= exit_head,
+                "pages never overshoot the frozen head"
+            );
+            if session.page_end == exit_head {
+                break;
+            }
+            harness.assert_exit_held().await;
+            let consumed = session.page_end;
+            harness.credit(consumed);
+            guards += 1;
+            assert!(guards < 10_000, "the credit walk must converge");
+        }
+        harness.assert_exit_held().await;
+        harness.credit(exit_head);
+        harness.assert_exit_arrives_and_is_last(exit_code).await;
+        assert!(
+            outputs(&harness.collector)
+                .iter()
+                .any(|data| data.contains("FINAL-WEDGE")),
+            "the deferred final output was delivered before the exit"
+        );
+        assert!(
+            harness.sessions.get_mut(&harness.terminal_id).is_none(),
+            "the session left the credited table on the acknowledging credit"
+        );
+        assert_eq!(
+            harness
+                .registry
+                .staged_paced_exit(&harness.terminal_id, harness.conn_id),
+            None,
+            "the subscriber retired with the delivered exit"
+        );
+    }
+
+    /// (b) THE PREMATURE EXIT, through the credit path: the exit stages
+    /// mid-restore (the staging is in the registry before any credit
+    /// runs — the notify-undispatched window), the credits drive the
+    /// session through the original target and on to the exit page, and
+    /// the page that reaches the armed exit head is read but NOT
+    /// credited. No exit may deliver on the drive that emitted it — the
+    /// removal rides the credit that acknowledges that page.
+    #[tokio::test]
+    async fn exit_page_read_uncredited_holds_the_exit_for_its_credit() {
+        let mut harness = RaceHarness::new("preempt", 8, "FINAL-PREEMPT");
+        // Seed the pre-exit window: every pad step lands in the ring
+        // deterministically before the paced attach (each step waits for
+        // its OWN unique marker, so the attach cannot race a pad's
+        // asynchronous ingestion).
+        for step in 0..8 {
+            harness.step("pad", &format!("PAD-STEP-{step}")).await;
+        }
+        let head_at_attach = harness.head();
+        assert!(head_at_attach > 0, "the pre-exit window is non-empty");
+        let start = harness.attach_paced(0);
+        assert!(
+            start.session.page_end < start.session.target,
+            "the first page is a bounded prefix (mid-restore)"
+        );
+        harness.start_session(start, 0);
+        // The exit stages with new output past the attach target, before
+        // any credit runs (the undispatched-notify race window).
+        harness.step("go", "FINAL-PREEMPT").await;
+        let exit_code = harness.wait_staged().await;
+        let exit_head = harness.head();
+        assert!(
+            exit_head > head_at_attach,
+            "the exit added output past the original target"
+        );
+        // Credit the pages one by one — the drive must keep producing
+        // (invariant 1) — until the page reaching the FROZEN exit head is
+        // outstanding. THE PARSER-CONSUMPTION BOUNDARY: that page is
+        // read (sunk) but NOT credited.
+        let mut guards = 0;
+        let converged = loop {
+            let Some(session) = harness.try_session() else {
+                // The session left the credited table mid-walk — the
+                // pre-fix premature removal (the armed session was
+                // removed on the drive that EMITTED the exit page, while
+                // that page was still uncredited).
+                break false;
+            };
+            assert!(
+                session.page_end <= exit_head,
+                "pages never overshoot the frozen head"
+            );
+            if session.page_end == exit_head {
+                break true;
+            }
+            let consumed = session.page_end;
+            harness.credit(consumed);
+            guards += 1;
+            assert!(guards < 10_000, "the credit walk must converge");
+        };
+        assert!(
+            outputs(&harness.collector)
+                .iter()
+                .any(|data| data.contains("FINAL-PREEMPT")),
+            "the exit page carrying the final marker was read"
+        );
+        if !converged {
+            // THE PREMATURE-EXIT RACE (RED pre-fix): the removal already
+            // delivered (or is about to deliver) terminal.exit through the
+            // drain's CaughtUp hold — BEFORE any credit could acknowledge
+            // the page reaching the armed exit head.
+            let collector = Arc::clone(&harness.collector);
+            wait_for(
+                move || (exit_count(&collector) > 0).then_some(()),
+                "the premature exit (the violation under test)",
+            )
+            .await;
+            panic!(
+                "invariant 2 violated: the session was removed from the \
+                 credited table on the drive that EMITTED the page reaching \
+                 the armed exit head, and terminal.exit delivered while that \
+                 page was uncredited — the exit must ride the credit that \
+                 acknowledges it"
+            );
+        }
+        // THE HOLD (invariant 2): the page reaching exit_head is
+        // uncredited — the pre-fix removal delivered terminal.exit here.
+        harness.assert_exit_held().await;
+        // The acknowledging credit: the exit arrives and is the last frame.
+        harness.credit(exit_head);
+        harness.assert_exit_arrives_and_is_last(exit_code).await;
+        assert!(
+            harness.sessions.get_mut(&harness.terminal_id).is_none(),
+            "the session left the credited table on the acknowledging credit"
+        );
+        // (c) no double-delivery: a spurious duplicate credit after the
+        // exit is inert, and the terminal cannot stage a second exit.
+        let before = exit_count(&harness.collector);
+        harness.credit(exit_head);
+        assert_eq!(
+            exit_count(&harness.collector),
+            before,
+            "a post-exit credit grants nothing (no second exit)"
+        );
+        assert!(
+            !harness.registry.finish_pty_exit(&harness.terminal_id, 99),
+            "a second exit never restages (monotone, once-only)"
+        );
+    }
+
+    /// E2R3, (a) THE CONCURRENT-STAGING RACE at the credit path: the
+    /// natural exit stages INSIDE the credit handling's window — the
+    /// registry's one-shot hook fires the staging inside the arm read's
+    /// own lock scope, immediately after the read observes the
+    /// pre-staging state (the deterministic model of the PTY reader
+    /// staging concurrently with the decision's use of its read; never
+    /// a sleep-based race). The racing credit is the one whose drive
+    /// reaches the attach target — with budget 0 (one frame per page)
+    /// the walk is countable, so the racing credit is named, not probed.
+    /// Absolute frame counts are deliberately NOT pinned: a small write
+    /// can split across PTY read chunks on slow runners (a marker's
+    /// trailing bytes landing as a separate ring frame microseconds
+    /// later), so the walk pins head PROGRESSION via settled reads.
+    ///
+    /// PRE-FIX (RED): the arm's read went stale (check-then-act) — the
+    /// handler sees `exit_head == None`, `uncredited_exit_page()` is
+    /// false, and the session transfers to the uncredited drain; the
+    /// drain dumps the remaining suffix and delivers terminal.exit
+    /// WITHOUT the credit that would have acknowledged the page
+    /// reaching the frozen head.
+    ///
+    /// POST-FIX (GREEN): the phase-transition decision is ATOMIC — the
+    /// disposition re-reads the staged-exit state under ONE registry
+    /// lock hold after the drive, so the concurrently staged exit is
+    /// absorbed by the SAME handling: the credited phase extends
+    /// through the frozen head, the final output pages only on
+    /// continuation credits, and terminal.exit rides the credit that
+    /// acknowledges the page reaching the armed exit head.
+    #[tokio::test]
+    async fn credit_path_exit_staged_inside_the_window_extends_the_credited_phase() {
+        let mut harness = RaceHarness::new_quiet("creditrace", 1, "FINAL-CREDRACE");
+        harness.wait_ready().await;
+        let banner_head = harness.settled_head().await;
+        assert!(
+            banner_head >= 1,
+            "the ECHO-OFF banner is in the ring before any step"
+        );
+        // Seed the replay window: one pad step lands the pad marker (the
+        // harness script keeps echo off). Transport may split a step's
+        // bytes across ring frames on slow runners, so the walk pins head
+        // PROGRESSION with settled reads, not absolute frame counts; the
+        // first page (one frame per page) leaves the rest for the racing
+        // credit's drive.
+        harness.step("pad", "PAD-STEP-0").await;
+        let target = harness.settled_head().await;
+        assert!(
+            target > banner_head,
+            "the pad step advanced the ring past the banner (echo off)"
+        );
+        let start = harness.attach_paced(0);
+        assert_eq!(
+            start.session.page_end, 1,
+            "budget 0: the first page is exactly frame 1"
+        );
+        harness.start_session(start, 0);
+        // The "final output": frames past the attach target — the exit
+        // will freeze THIS (settled) head.
+        harness.step("go", "FINAL-CREDRACE").await;
+        let exit_head = harness.settled_head().await;
+        assert!(
+            exit_head > target,
+            "the final-marker step advanced the head past the attach target"
+        );
+        let exit_code = 0;
+        // THE RACING CREDIT: acknowledges frame 1 — its drive produces
+        // the page reaching the attach target, and the exit stages
+        // INSIDE this credit's arm→decision window (the hook fires
+        // inside the arm read's lock scope, right after the read).
+        harness
+            .registry
+            .set_paced_exit_stage_hook_for_tests(harness.conn_id, exit_code);
+        harness.credit(1);
+        let Some(session) = harness.try_session() else {
+            // THE CONCURRENT-STAGING VIOLATION (RED pre-fix): the credit
+            // whose drive reached the target transferred the session to
+            // the uncredited drain even though the natural exit staged
+            // INSIDE the credit's window — the drain then dumped the
+            // remaining suffix and delivered terminal.exit without the
+            // credit acknowledging the page reaching the frozen head.
+            let collector = Arc::clone(&harness.collector);
+            wait_for(
+                move || (exit_count(&collector) > 0).then_some(()),
+                "the premature exit (the violation under test)",
+            )
+            .await;
+            panic!(
+                "the phase transition was decided from a stale staged-exit \
+                 read: the session transferred to the uncredited drain while \
+                 the natural exit staged concurrently with the credit's arm \
+                 — the transition decision must be atomic with respect to \
+                 exit staging"
+            );
+        };
+        // GREEN: the atomic disposition absorbed the concurrently staged
+        // exit — the credited phase EXTENDED through the frozen head.
+        assert_eq!(
+            session.exit_head,
+            Some(exit_head),
+            "the disposition armed the staged exit's frozen head"
+        );
+        assert!(
+            session.credited < session.page_end,
+            "the racing credit's page (reaching the original target) is the \
+             one outstanding uncredited page"
+        );
+        // Pages flow ONLY on continuation credits; the exit rides the
+        // credit acknowledging the page reaching the armed exit head.
+        let mut guards = 0;
+        loop {
+            let session = harness.session();
+            assert!(
+                session.page_end <= exit_head,
+                "pages never overshoot the frozen head"
+            );
+            if session.page_end == exit_head {
+                break;
+            }
+            harness.assert_exit_held().await;
+            let consumed = session.page_end;
+            harness.credit(consumed);
+            guards += 1;
+            assert!(guards < 10_000, "the credit walk must converge");
+        }
+        harness.assert_exit_held().await;
+        harness.credit(exit_head);
+        harness.assert_exit_arrives_and_is_last(exit_code).await;
+        assert!(
+            outputs(&harness.collector)
+                .iter()
+                .any(|data| data.contains("FINAL-CREDRACE")),
+            "the deferred final output was delivered before the exit"
+        );
+        assert!(
+            harness.sessions.get_mut(&harness.terminal_id).is_none(),
+            "the session left the credited table on the acknowledging credit"
+        );
+        assert_eq!(
+            harness
+                .registry
+                .staged_paced_exit(&harness.terminal_id, harness.conn_id),
+            None,
+            "the subscriber retired with the delivered exit"
+        );
+    }
+
+    /// E2R3, (b) THE SAME INTERLEAVE at start_session: the exit stages
+    /// during the attach/start window — the hook fires inside the
+    /// start's arm read's lock scope, immediately after it. The EMPTY
+    /// first page (the client's cursor already sat at the attach head)
+    /// is the start state whose disposition the window poisons.
+    ///
+    /// PRE-FIX (RED): the start's arm read goes stale — start_session
+    /// transfers the session to the uncredited drain with everything
+    /// acknowledged, and the drain dumps the final suffix +
+    /// terminal.exit with no credit at all.
+    ///
+    /// POST-FIX (GREEN): the session STARTS with the exit armed, pages
+    /// flow on continuation credits, and the exit rides the final
+    /// acknowledging credit.
+    #[tokio::test]
+    async fn start_session_exit_staged_during_attach_arms_before_any_transfer() {
+        let mut harness = RaceHarness::new_quiet("startrace", 0, "FINAL-STARTRACE");
+        harness.wait_ready().await;
+        // The client attaches fully caught up: since == head == 1 (the
+        // ECHO-OFF banner frame) — the first page is EMPTY (nothing
+        // outstanding at start).
+        let head_at_attach = harness.head();
+        assert_eq!(
+            head_at_attach, 1,
+            "the ECHO-OFF banner is the ring's frame 1"
+        );
+        let start = harness.attach_paced(head_at_attach);
+        assert_eq!(
+            start.session.page_end, start.session.effective_since,
+            "the empty first page leaves nothing outstanding"
+        );
+        // The exit stages with final output past the attach head while
+        // the start path is the in-flight decision (the hook fires
+        // inside the start arm read's lock scope, right after it).
+        harness.step("go", "FINAL-STARTRACE").await;
+        let exit_head = harness.head();
+        assert_eq!(
+            exit_head, 2,
+            "the final-marker step adds exactly one frame past the head"
+        );
+        let exit_code = 0;
+        harness
+            .registry
+            .set_paced_exit_stage_hook_for_tests(harness.conn_id, exit_code);
+        harness.start_session(start, head_at_attach);
+        let Some(session) = harness.try_session() else {
+            // THE CONCURRENT-STAGING VIOLATION (RED pre-fix): the start
+            // transferred the session to the uncredited drain even though
+            // the natural exit staged during the attach/start window.
+            let collector = Arc::clone(&harness.collector);
+            wait_for(
+                move || (exit_count(&collector) > 0).then_some(()),
+                "the premature exit (the violation under test)",
+            )
+            .await;
+            panic!(
+                "start_session decided the phase transition from a stale \
+                 staged-exit read: the session transferred to the uncredited \
+                 drain while the natural exit staged during the attach \
+                 window — the transition decision must be atomic with \
+                 respect to exit staging"
+            );
+        };
+        // GREEN: the session STARTS with the exit armed and the
+        // extended phase's first page outstanding (no wedge state).
+        assert_eq!(
+            session.exit_head,
+            Some(exit_head),
+            "the start armed the staged exit's frozen head"
+        );
+        assert!(
+            session.credited < session.page_end,
+            "the start's wedge-guard drive produced the extended phase's \
+             first page"
+        );
+        assert!(
+            !outputs(&harness.collector).is_empty(),
+            "the extended phase's first page was sunk to the client"
+        );
+        // Pages flow on credits; the exit rides the final acknowledging
+        // credit.
+        let mut guards = 0;
+        loop {
+            let session = harness.session();
+            assert!(
+                session.page_end <= exit_head,
+                "pages never overshoot the frozen head"
+            );
+            if session.page_end == exit_head {
+                break;
+            }
+            harness.assert_exit_held().await;
+            let consumed = session.page_end;
+            harness.credit(consumed);
+            guards += 1;
+            assert!(guards < 10_000, "the credit walk must converge");
+        }
+        harness.assert_exit_held().await;
+        harness.credit(exit_head);
+        harness.assert_exit_arrives_and_is_last(exit_code).await;
+        assert!(
+            outputs(&harness.collector)
+                .iter()
+                .any(|data| data.contains("FINAL-STARTRACE")),
+            "the deferred final output was delivered before the exit"
+        );
+        assert!(
+            harness.sessions.get_mut(&harness.terminal_id).is_none(),
+            "the session left the credited table on the acknowledging credit"
+        );
+    }
+
+    /// E2R3, (c) THE ATOMICITY BOUNDARY — the legitimately
+    /// post-transfer exit: staged STRICTLY AFTER the atomic transfer
+    /// decision (the disposition that confirmed, under its one lock
+    /// hold, that no exit was staged), it is the uncredited drain's
+    /// documented tail content. The drain delivers the remaining tail
+    /// pages and then the staged exit at its completing verdict —
+    /// WITHOUT any credit after the transfer. That is exactly the
+    /// documented tail semantics, not a loss and not a re-entry into
+    /// the credited phase: the atomicity scope ends at the transfer
+    /// decision's lock hold.
+    ///
+    /// The staging lands in the synchronous window after the
+    /// transferring credit and before the spawned drain task's first
+    /// poll (the current-thread runtime has not yielded), so the
+    /// "strictly after the atomic transfer" ordering is deterministic.
+    #[tokio::test]
+    async fn post_transfer_staged_exit_is_the_drains_documented_tail_content() {
+        let mut harness = RaceHarness::new_quiet("boundary", 1, "FINAL-BOUNDARY");
+        harness.wait_ready().await;
+        let banner_head = harness.settled_head().await;
+        assert!(
+            banner_head >= 1,
+            "the ECHO-OFF banner is in the ring before any step"
+        );
+        harness.step("pad", "PAD-STEP-0").await;
+        let target = harness.settled_head().await;
+        assert!(
+            target > banner_head,
+            "the pad step advanced the ring past the banner (echo off)"
+        );
+        let start = harness.attach_paced(0);
+        assert_eq!(
+            start.session.page_end, 1,
+            "budget 0: the first page is exactly frame 1"
+        );
+        harness.start_session(start, 0);
+        // The tail the drain will page: frames past the attach
+        // target, ingested BEFORE the transferring credit (the drain's
+        // fixed target captures it at its start).
+        harness.step("go", "FINAL-BOUNDARY").await;
+        let head_at_transfer = harness.settled_head().await;
+        assert!(
+            head_at_transfer > target,
+            "the final-marker step advanced the head past the attach target"
+        );
+        // The transferring credits: their drives walk the pages up to
+        // the attach target with NO exit staged — the disposition
+        // atomically confirms that under its lock hold and transfers.
+        // No hook is armed: nothing stages concurrently here. (On a
+        // fast box the first credit is the transferring one; transport
+        // frame-splitting on slow runners may add intermediate pages,
+        // so credit until the drive reaches the target. Every call is
+        // synchronous — the current-thread runtime cannot yield between
+        // the transferring credit and the strictly-post-transfer
+        // staging below.)
+        let mut transfer_steps = 0;
+        loop {
+            if harness.try_session().is_none() {
+                break;
+            }
+            let consumed = harness.session().page_end;
+            harness.credit(consumed);
+            transfer_steps += 1;
+            assert!(transfer_steps < 10_000, "the transfer walk must converge");
+        }
+        assert!(
+            harness.try_session().is_none(),
+            "the credited phase completed and the session moved to the drain"
+        );
+        // STRICTLY POST-TRANSFER staging: from outside any decision,
+        // after the atomic transfer and before the drain's first poll.
+        assert!(
+            harness
+                .registry
+                .stage_natural_exit_for_test(&harness.terminal_id, harness.conn_id, 0),
+            "the post-transfer staging lands on the live deferred subscriber"
+        );
+        // The drain delivers the tail pages and THEN the staged exit at
+        // its completing verdict — no credit is ever sent after the
+        // transfer (the documented uncredited tail semantics).
+        harness.assert_exit_arrives_and_is_last(0).await;
+        assert!(
+            outputs(&harness.collector)
+                .iter()
+                .any(|data| data.contains("FINAL-BOUNDARY")),
+            "the tail frames were delivered before the exit"
+        );
+        // A post-exit credit is inert: the session left the credited
+        // table at the transfer and the subscriber retired with the
+        // exit.
+        let before = exit_count(&harness.collector);
+        harness.credit(head_at_transfer);
+        assert_eq!(
+            exit_count(&harness.collector),
+            before,
+            "a post-exit credit grants nothing (stale generation)"
+        );
+        assert_eq!(
+            harness
+                .registry
+                .staged_paced_exit(&harness.terminal_id, harness.conn_id),
+            None,
+            "the subscriber retired with the delivered exit"
+        );
     }
 }

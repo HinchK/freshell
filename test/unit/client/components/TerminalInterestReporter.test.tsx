@@ -2,15 +2,16 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { render, act } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
-import panesReducer, { setActivePane, toggleZoom } from '@/store/panesSlice'
+import panesReducer, { setActivePane, toggleZoom, updatePaneContent } from '@/store/panesSlice'
 import tabsReducer from '@/store/tabsSlice'
 import { TerminalInterestReporter } from '@/components/TerminalInterestReporter'
 
-type Snapshot = { focusedTerminalId: string | null; visibleTerminalIds: string[] }
+type Snapshot = { focusedTerminalId: string | null; visibleTerminalIds: string[]; claimedTerminalIds?: string[] }
 
 const wsMocks = vi.hoisted(() => ({
   sendTerminalInterest: vi.fn((snapshot: Snapshot) => true),
   messageHandlers: [] as Array<(message: { type: string }) => void>,
+  serverCapabilities: {} as Record<string, true | undefined>,
 }))
 
 vi.mock('@/lib/ws-client', () => ({
@@ -22,6 +23,7 @@ vi.mock('@/lib/ws-client', () => ({
       }
     },
     sendTerminalInterest: wsMocks.sendTerminalInterest,
+    getServerCapabilities: () => wsMocks.serverCapabilities,
   }),
 }))
 
@@ -73,6 +75,38 @@ function makeStore(workspaceVisible = true) {
   })
 }
 
+function makeMultiTabStore() {
+  const store = configureStore({
+    reducer: { panes: panesReducer, tabs: tabsReducer },
+    preloadedState: {
+      tabs: {
+        tabs: [
+          {
+            id: 'tab-1',
+            title: 'Tab 1',
+            status: 'active' as const,
+            type: 'shell' as const,
+            createdAt: '2026-01-01T00:00:00.000Z',
+            sessionKey: null,
+            layoutSnapshot: null,
+          },
+        ],
+        activeTabId: 'tab-1',
+      } as any,
+      panes: {
+        layouts: {
+          'tab-1': twoPanes(),
+          'tab-2': leaf('pane-hidden', 'TERM-HIDDEN'),
+        },
+        activePane: { 'tab-1': 'pane-a' },
+        zoomedPane: {},
+        paneTitles: {},
+      } as any,
+    },
+  })
+  return store
+}
+
 const unmounters: Array<() => void> = []
 
 async function mountReporter(store: TestStore, workspaceVisible = true) {
@@ -105,6 +139,7 @@ describe('TerminalInterestReporter', () => {
   beforeEach(() => {
     wsMocks.sendTerminalInterest.mockClear()
     wsMocks.messageHandlers.length = 0
+    wsMocks.serverCapabilities = {}
   })
   afterEach(() => {
     while (unmounters.length) unmounters.pop()!()
@@ -174,5 +209,49 @@ describe('TerminalInterestReporter', () => {
     await mountReporter(store, false)
     expect(wsMocks.sendTerminalInterest).toHaveBeenCalled()
     expect(lastSnapshot()).toEqual({ focusedTerminalId: null, visibleTerminalIds: [] })
+  })
+
+  // ── Hidden-pane lifetime claims (responsive-terminal-restore WS1) ──
+
+  it('rides claimedTerminalIds when the ready echo advertised the capability', async () => {
+    wsMocks.serverCapabilities = { terminalInterestV1: true, terminalLifetimeClaimV1: true }
+    const store = makeMultiTabStore()
+    await mountReporter(store)
+    expect(lastSnapshot()).toEqual({
+      focusedTerminalId: 'TERM-A',
+      visibleTerminalIds: ['TERM-A', 'TERM-B'],
+      claimedTerminalIds: ['TERM-A', 'TERM-B', 'TERM-HIDDEN'],
+    })
+  })
+
+  it('strips claims without the echo — an old server sees today’s exact snapshot shape', async () => {
+    // No terminalLifetimeClaimV1 echo: the snapshot the reporter hands to
+    // sendTerminalInterest stays byte-identical to today's (no claim field).
+    wsMocks.serverCapabilities = { terminalInterestV1: true }
+    const store = makeMultiTabStore()
+    await mountReporter(store)
+    expect(lastSnapshot()).toEqual({
+      focusedTerminalId: 'TERM-A',
+      visibleTerminalIds: ['TERM-A', 'TERM-B'],
+    })
+    expect('claimedTerminalIds' in lastSnapshot()).toBe(false)
+  })
+
+  it('re-publishes when a HIDDEN tab’s layout changes (claim assignment/withdrawal)', async () => {
+    wsMocks.serverCapabilities = { terminalInterestV1: true, terminalLifetimeClaimV1: true }
+    const store = makeMultiTabStore()
+    await mountReporter(store)
+    await flushPublisher()
+    wsMocks.sendTerminalInterest.mockClear()
+
+    // A hidden tab's pane swaps its terminalId (e.g. pane reconcile adopt):
+    // the claim set must follow without any active-tab change.
+    store.dispatch(updatePaneContent({
+      tabId: 'tab-2',
+      paneId: store.getState().panes.layouts['tab-2']!.id,
+      content: { kind: 'terminal', terminalId: 'TERM-REBOUND', status: 'running', createRequestId: 'req-hidden' } as any,
+    }))
+    await flushPublisher()
+    expect(lastSnapshot().claimedTerminalIds).toEqual(['TERM-A', 'TERM-B', 'TERM-REBOUND'])
   })
 })

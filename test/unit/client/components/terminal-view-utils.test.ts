@@ -128,6 +128,26 @@ describe('terminal-view-utils', () => {
     })
   })
 
+  it('carries the paced replayPageBytes request on the attach when provided (and omits it otherwise)', () => {
+    const base = {
+      content: undefined,
+      terminalId: 'term-paced-utils',
+      intent: 'keepalive_delta' as const,
+      cols: 80,
+      rows: 24,
+      sinceSeq: 30,
+      attachRequestId: 'attach-paced-utils',
+      priority: 'background' as const,
+    }
+
+    expect(buildTerminalAttachMessage({ ...base, replayPageBytes: 128 * 1024 })).toMatchObject({
+      type: 'terminal.attach',
+      terminalId: 'term-paced-utils',
+      replayPageBytes: 128 * 1024,
+    })
+    expect(buildTerminalAttachMessage(base)).not.toHaveProperty('replayPageBytes')
+  })
+
   it('builds attach, input, and resize messages with expectedSessionRef when canonical identity exists', () => {
     const content: TerminalPaneContent = {
       kind: 'terminal',

@@ -25,7 +25,7 @@ use freshell_protocol::ServerMessage;
 mod delivery;
 #[path = "terminal_interest.rs"]
 mod terminal_interest;
-use delivery::{Delivery, DeliveryQueue, Range};
+use delivery::{Delivery, DeliveryQueue, EvictedOutput, Range};
 use freshell_terminal::output_queue::output_frame_meta;
 use futures_util::{Sink, SinkExt};
 use terminal_interest::InterestState;
@@ -92,6 +92,25 @@ struct Control {
 /// replay.
 const CONTROL_STREAK_LIMIT: usize = 8;
 
+/// Minimum spacing between `ws.terminal_stream.queue_overflow_spill` events
+/// per connection (responsive-terminal-restore Workstream 3 observability).
+/// Under sustained eviction a single admission can evict many frames —
+/// hundreds of evictions per second under incident-scale pressure — so
+/// per-eviction events would flood the log; evictions inside the window are
+/// folded into the next event's `suppressed` count. Identifiers and
+/// measurements only.
+const SPILL_EVENT_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// One rate-limited spill (queue-overflow eviction) observability event.
+struct SpillEvent {
+    terminal_id: String,
+    stream_id: String,
+    from_seq: i64,
+    to_seq: i64,
+    suppressed: u64,
+    pending_bytes: usize,
+}
+
 struct Queues {
     output: DeliveryQueue<Message>,
     interest: InterestState,
@@ -106,7 +125,84 @@ struct Queues {
     /// are strictly increasing in true admission order.
     next_seq: u64,
     closed: bool,
+    /// Successful socket sends completed on this connection (drain-progress
+    /// liveness, responsive-terminal-restore Workstream 3): incremented by
+    /// `finish_frame` for every frame whose send resolved Ok — output and
+    /// control alike, since the pump serializes all sends. Eviction and
+    /// superseded attachments reduce queued bytes WITHOUT touching this.
+    completed_sends: u64,
+    /// Rate-limited spill-event bookkeeping (see
+    /// [`SPILL_EVENT_MIN_INTERVAL`]): when the last
+    /// `ws.terminal_stream.queue_overflow_spill` event was emitted, and how
+    /// many evictions have been folded into the next one since. Evictions
+    /// are counted at ADMISSION time (task-007 review M2); leasing the
+    /// coalesced gap later is delivery, not a spill occurrence.
+    spill_last_logged: Option<std::time::Instant>,
+    spill_suppressed: u64,
+    /// Total bytes reserved by in-flight drain admissions
+    /// (responsive-terminal-restore W1, round-5 finding 1): the paced
+    /// drain task reserves its page's budget BEFORE building and sinking
+    /// the page, so concurrent pane drains can never double-book the
+    /// admission watermark (the reserve-then-admit gate). Released by the
+    /// [`DrainAdmission`] guard's Drop — after the page's bytes are real
+    /// queued backlog, or unused when the admission produced no page.
+    drain_reserved: usize,
 }
+
+impl Queues {
+    /// Rate-limited spill-event bookkeeping (task-007 review M2, landed by
+    /// task-010): returns `Some` when an event should be emitted NOW (this
+    /// eviction's range plus the count of evictions suppressed since the
+    /// previous event), `None` when this eviction is folded into a future
+    /// event. Called under the admission lock at EVICTION time — the moment
+    /// the spill happens — so a connection that dies while backlogged (its
+    /// coalesced gap never leased to the socket) still leaves spill evidence
+    /// in the live log.
+    fn note_spill(&mut self, terminal_id: &str, range: &Range) -> Option<SpillEvent> {
+        let now = std::time::Instant::now();
+        let due = self
+            .spill_last_logged
+            .is_none_or(|last| now.duration_since(last) >= SPILL_EVENT_MIN_INTERVAL);
+        if !due {
+            self.spill_suppressed = self.spill_suppressed.saturating_add(1);
+            return None;
+        }
+        let suppressed = self.spill_suppressed;
+        self.spill_suppressed = 0;
+        self.spill_last_logged = Some(now);
+        Some(SpillEvent {
+            terminal_id: terminal_id.to_string(),
+            stream_id: range.stream_id.clone(),
+            from_seq: range.from_seq,
+            to_seq: range.to_seq,
+            suppressed,
+            pending_bytes: self
+                .output
+                .pending_bytes()
+                .saturating_add(self.in_flight_output_bytes),
+        })
+    }
+
+    /// Map the delivery queue's admission-time eviction records through the
+    /// per-connection rate limiter (task-007 review M2). Call under the
+    /// admission lock immediately after `push`; emit the returned events only
+    /// AFTER the lock is dropped (never hold the admission lock across a log
+    /// write).
+    fn take_admission_spills(&mut self, evicted: Vec<EvictedOutput>) -> Vec<SpillEvent> {
+        evicted
+            .into_iter()
+            .filter_map(|evicted| self.note_spill(&evicted.terminal_id, &evicted.range))
+            .collect()
+    }
+}
+
+/// Emission-time resolver for one terminal's current restore-contract
+/// replay-retention bounds (responsive-terminal-restore): installed ONLY on
+/// connections whose `hello` negotiated `pacedTerminalReplayV1`, backed by
+/// the registry's [`freshell_terminal::TerminalRegistry::replay_bounds`].
+/// Generic over the registry so the writer's unit tests can drive the pump
+/// deterministically without a PTY.
+type GapBoundsSource = Arc<dyn Fn(&str) -> Option<freshell_terminal::ReplayBounds> + Send + Sync>;
 
 struct Shared {
     queues: Mutex<Queues>,
@@ -114,6 +210,22 @@ struct Shared {
     control_limit: usize,
     ready: Notify,
     stop: watch::Sender<Option<Stop>>,
+    /// Drain-side backpressure signal (responsive-terminal-restore W1):
+    /// the connection's current output backlog (`pending + in-flight`),
+    /// updated by the writer pump on every completed frame send. The
+    /// paced drain task waits on it between pages so the un-credited
+    /// drain is bounded by the connection queue's REAL backpressure —
+    /// the sink itself (`push_server`) admits without yielding (it
+    /// evicts the oldest queued output past the byte limit), so without
+    /// this gate a drain could self-spill its own unconsumed pages.
+    backlog: watch::Sender<usize>,
+    /// Restore-contract bounds for materialized `terminal.output.gap`
+    /// frames: set ONLY on negotiated connections, ONCE, by the connection
+    /// setup BEFORE the pump is spawned (the same pre-spawn setup rule as
+    /// `enable_terminal_interest`) — a gap can never be leased before the
+    /// source exists. Unset keeps gap frames byte-identical to the
+    /// pre-capability wire shape.
+    gap_bounds: std::sync::OnceLock<GapBoundsSource>,
 }
 
 /// A nonblocking, bounded outbox. Its Sink flush means "accepted by this
@@ -139,6 +251,53 @@ struct NextFrame {
     flushed: Option<oneshot::Sender<()>>,
 }
 
+/// One granted drain-admission reservation (round-5 finding 1): the
+/// holder may build and sink one budget-bounded paced page — its bytes
+/// were accounted atomically under the queue's lock BEFORE the page was
+/// produced, alongside every other in-flight drain reservation. The
+/// guard is the reservation's lifetime: dropping it releases the
+/// capacity (after the page's bytes became real queued backlog, or unused
+/// when the admission produced no page — a retention gap, a Gone
+/// verdict, a cancelled session).
+pub(crate) struct DrainAdmission {
+    shared: Arc<Shared>,
+    bytes: usize,
+}
+
+impl Drop for DrainAdmission {
+    fn drop(&mut self) {
+        // Also runs after the pump's Drop reset the queue state: the
+        // saturating subtraction keeps a stale guard's release inert.
+        let mut backlog_publish: Option<usize> = None;
+        if let Ok(mut queues) = self.shared.queues.lock() {
+            queues.drain_reserved = queues.drain_reserved.saturating_sub(self.bytes);
+            // Round-2 finding F5: the release FREES admission capacity —
+            // publish the backlog so tasks waiting on the gate
+            // (`reserve_drain_admission`) re-evaluate NOW instead of
+            // sleeping until an unrelated socket send or keepalive
+            // publishes it. A drain that completed without admitting (a
+            // CaughtUp/Gone verdict: no page, no send) otherwise strands
+            // concurrent drains behind capacity that already came back.
+            // `watch::send` wakes every waiter even for an equal value
+            // (the change mark is versioned, not value-compared), and the
+            // post-pump-Drop reset path publishes the same way the pump's
+            // own Drop does.
+            backlog_publish = Some(
+                queues
+                    .output
+                    .pending_bytes()
+                    .saturating_add(queues.in_flight_output_bytes),
+            );
+        }
+        if let Some(backlog) = backlog_publish {
+            // Best-effort like every other publish (a closed channel means
+            // no drain is waiting — nothing to wake). Never held under the
+            // queue lock.
+            let _ = self.shared.backlog.send(backlog);
+        }
+    }
+}
+
 impl WriterSender {
     pub(super) fn new(
         output_limit: usize,
@@ -146,6 +305,8 @@ impl WriterSender {
         write_timeout: Duration,
     ) -> (Self, WriterPump) {
         let (stop_tx, stop_rx) = watch::channel(None);
+        let (backlog_tx, backlog_rx) = watch::channel(0usize);
+        let _ = backlog_rx; // receivers subscribe per wait; the sender owns the channel
         let shared = Arc::new(Shared {
             queues: Mutex::new(Queues {
                 output: DeliveryQueue::new(output_limit, metadata_limit(output_limit)),
@@ -156,11 +317,17 @@ impl WriterSender {
                 controls_since_last_output: 0,
                 next_seq: 0,
                 closed: false,
+                completed_sends: 0,
+                spill_last_logged: None,
+                spill_suppressed: 0,
+                drain_reserved: 0,
             }),
             output_limit: output_limit.max(1),
             control_limit: control_limit.max(1),
             ready: Notify::new(),
             stop: stop_tx,
+            backlog: backlog_tx,
+            gap_bounds: std::sync::OnceLock::new(),
         });
         (
             Self {
@@ -276,7 +443,11 @@ impl WriterSender {
                 return false;
             }
         };
-        if meta.is_none() && !exit {
+        // Restore contract: a directly pushed `terminal.output.gap` (the paced
+        // replay core's retention gaps) joins the OUTPUT queue as a sequenced
+        // control like `terminal.exit` — see the gap arm below.
+        let sequenced_gap = matches!(&msg, ServerMessage::TerminalOutputGap(_));
+        if meta.is_none() && !exit && !sequenced_gap {
             return self
                 .push_control(Message::Text(json.into()), None, supersedes.as_deref())
                 .is_ok();
@@ -288,7 +459,14 @@ impl WriterSender {
         let seq = queues.next_seq;
         queues.next_seq += 1;
         let bytes = json.len();
-        if let Some(meta) = meta {
+        // All three queued shapes below share one admission tail: the push,
+        // the admission-time spill evidence, and the notify/fail mapping.
+        // Spill observability (task-007 review M2, landed by task-010):
+        // evictions surface HERE — the moment they happen — including on the
+        // error path (a dying connection's evictions are exactly the
+        // undercounted spills the review found), and the events are emitted
+        // only after the admission lock is dropped.
+        let pushed = if let Some(meta) = meta {
             let range = Range {
                 stream_id: meta.stream_id,
                 attach_request_id: meta.attach_request_id,
@@ -296,54 +474,87 @@ impl WriterSender {
                 to_seq: meta.seq_end,
             };
             let priority = queues.interest.priority(&meta.terminal_id);
-            if queues
-                .output
-                .push(
-                    &meta.terminal_id,
-                    priority,
-                    Message::Text(json.into()),
-                    bytes,
-                    Some(range),
-                    seq,
-                )
-                .is_err()
-            {
-                drop(queues);
-                self.fail(WriterExit::OutputCapacityExceeded);
-                return false;
-            }
-        } else {
+            queues.output.push(
+                &meta.terminal_id,
+                priority,
+                Message::Text(json.into()),
+                bytes,
+                Some(range),
+                seq,
+            )
+        } else if let ServerMessage::TerminalExit(exit) = &msg {
             // Preserve final-output -> exit. It must not use the control lane.
-            let ServerMessage::TerminalExit(exit) = msg else {
-                unreachable!("sequenced exit only")
-            };
             let priority = queues.interest.priority(&exit.terminal_id);
             // Sequenced exits are zero-weight, exactly as legacy queued them:
             // they can never force an eviction nor close the connection, and
             // they still cost one service unit per frame (count-bounded by
             // the metadata limit).
-            if queues
-                .output
-                .push(
-                    &exit.terminal_id,
-                    priority,
-                    Message::Text(json.into()),
-                    0,
-                    None,
-                    seq,
-                )
-                .is_err()
-            {
-                drop(queues);
-                self.fail(WriterExit::OutputCapacityExceeded);
-                return false;
-            }
+            let pushed = queues.output.push(
+                &exit.terminal_id,
+                priority,
+                Message::Text(json.into()),
+                0,
+                None,
+                seq,
+            );
             // A dead terminal never needs its attach fallback again.
-            queues.interest.detach(&exit.terminal_id);
-        }
+            if pushed.is_ok() {
+                queues.interest.detach(&exit.terminal_id);
+            }
+            pushed
+        } else {
+            // Restore contract (responsive-terminal-restore): a
+            // `terminal.output.gap` pushed DIRECTLY by the paced replay core
+            // (retention loss at attach / mid-replay expiry) is sequenced
+            // WITH the terminal's output — exactly the `terminal.exit`
+            // zero-weight non-evictable control treatment. The control lane
+            // would preempt it AHEAD of already-admitted pages, breaking
+            // per-terminal sequence order (the queue's own gap markers, by
+            // contrast, materialize at lease time from eviction and never
+            // pass through here).
+            let ServerMessage::TerminalOutputGap(gap) = &msg else {
+                unreachable!("meta-less output frames are exit or gap only")
+            };
+            let priority = queues.interest.priority(&gap.terminal_id);
+            queues.output.push(
+                &gap.terminal_id,
+                priority,
+                Message::Text(json.into()),
+                0,
+                None,
+                seq,
+            )
+        };
+        let evicted = queues.output.take_evictions();
+        let spills = queues.take_admission_spills(evicted);
         drop(queues);
-        self.shared.ready.notify_one();
-        true
+        Self::emit_spill_events(spills);
+        match pushed {
+            Ok(()) => {
+                self.shared.ready.notify_one();
+                true
+            }
+            Err(_) => {
+                self.fail(WriterExit::OutputCapacityExceeded);
+                false
+            }
+        }
+    }
+
+    /// Log the rate-limited spill events collected at admission time. Must
+    /// be called with the admission lock NOT held.
+    fn emit_spill_events(spills: Vec<SpillEvent>) {
+        for spill in spills {
+            tracing::warn!(
+                terminal_id = %spill.terminal_id,
+                stream_id = %spill.stream_id,
+                from_seq = spill.from_seq,
+                to_seq = spill.to_seq,
+                suppressed = spill.suppressed,
+                pending_bytes = spill.pending_bytes,
+                "ws.terminal_stream.queue_overflow_spill"
+            );
+        }
     }
 
     pub(super) fn enable_terminal_interest(&self) {
@@ -355,26 +566,58 @@ impl WriterSender {
             .enable();
     }
 
+    /// Hidden-pane lifetime claims (responsive-terminal-restore Workstream 1):
+    /// arm the connection's `terminal.interest.claimedTerminalIds` handling.
+    /// Called ONCE by the connection setup when the hello negotiated
+    /// `terminalLifetimeClaimV1`; a connection that never negotiated keeps
+    /// its snapshots' claim fields ignored server-side.
+    pub(super) fn enable_terminal_lifetime_claims(&self) {
+        self.shared
+            .queues
+            .lock()
+            .expect("writer queue lock")
+            .interest
+            .enable_claims();
+    }
+
+    /// Restore contract (responsive-terminal-restore): install the
+    /// negotiated-connection gap-bounds source. Called ONCE by the
+    /// connection setup, BEFORE the writer pump is spawned (a gap can never
+    /// be leased before the source exists). The source resolves a
+    /// terminal's current `head_seq`/earliest-replayable position at
+    /// gap-emission time; connections that never negotiated leave the
+    /// source unset and their gap frames stay byte-identical to the
+    /// pre-capability wire shape.
+    pub(super) fn set_paced_replay_gap_bounds(&self, source: GapBoundsSource) {
+        let _ = self.shared.gap_bounds.set(source);
+    }
+
     /// Apply one full presentation-interest snapshot. A rejected snapshot is
     /// returned without replacing the last accepted state; scheduling changes
-    /// are queued-data-only (no attach, resize, spawn, or kill).
+    /// are queued-data-only (no attach, resize, spawn, or kill). On
+    /// acceptance, the negotiated claim-set diff is handed back to the
+    /// dispatcher, which applies it to the terminal registry (the writer owns
+    /// only the connection-local interest state).
     pub(super) fn set_terminal_interest(
         &self,
         snapshot: &freshell_protocol::client_messages::TerminalInterest,
-    ) -> Result<(), &'static str> {
+    ) -> Result<Option<terminal_interest::InterestClaimChange>, &'static str> {
         let mut queues = self.shared.queues.lock().expect("writer queue lock");
         if queues.closed {
             return Err("Connection writer is closed");
         }
-        if queues.interest.apply(snapshot)? {
+        if let Some(change) = queues.interest.apply(snapshot)? {
             let Queues {
                 output, interest, ..
             } = &mut *queues;
             output.update_priorities(|id| interest.priority(id));
+            drop(queues);
+            self.shared.ready.notify_one();
+            Ok(Some(change))
+        } else {
+            drop(queues);
+            Ok(None)
         }
-        drop(queues);
-        self.shared.ready.notify_one();
-        Ok(())
     }
 
     /// Pre-snapshot fallback: a client that never negotiated terminalInterestV1
@@ -412,6 +655,102 @@ impl WriterSender {
             .output
             .pending_bytes()
             .saturating_add(queues.in_flight_output_bytes)
+    }
+
+    /// The drain-side backpressure watermark (responsive-terminal-restore
+    /// W1): half the connection's output-queue budget. A producer that
+    /// has pushed the backlog to (or past) this mark must wait for the
+    /// writer pump to drain real frames before pushing more — the gate
+    /// that keeps the un-credited paced drain bounded by the connection
+    /// queue's actual consumption instead of its eviction behavior.
+    pub(crate) fn backlog_watermark(&self) -> usize {
+        (self.shared.output_limit / 2).max(1)
+    }
+
+    /// Try to reserve `bytes` of DRAIN admission capacity under the
+    /// queue's own lock (round-5 finding 1, the atomic reserve-then-admit
+    /// gate): the grant accounts for the page the caller is about to
+    /// admit AND for every other in-flight drain reservation, so
+    /// concurrent pane drains can never double-book the watermark the way
+    /// the old check-then-act gate did (each woken drain observed the
+    /// same pre-admission backlog and every one admitted a full page on
+    /// top of it). `None` means not grantable now, or the writer is gone
+    /// (the caller's cancel path owns the exit).
+    ///
+    /// The grant limit is `max(watermark, bytes)`: a page that FITS the
+    /// watermark admits while the aggregate — backlog, every other
+    /// reservation, and this page — stays at-or-below the watermark,
+    /// leaving the cap's upper half as headroom for live traffic, so a
+    /// gated drain can never push the queue into evicting its own pages.
+    /// A page LARGER than the watermark (a degenerate queue/page
+    /// relationship the server boot's page-budget clamp exists to
+    /// prevent) still admits into a fully drained queue, so the gate can
+    /// never DEADLOCK, whatever the budget.
+    fn try_reserve_drain_admission(&self, bytes: usize) -> Option<DrainAdmission> {
+        let mut queues = self.shared.queues.lock().expect("writer queue lock");
+        if queues.closed {
+            return None;
+        }
+        let backlog = queues
+            .output
+            .pending_bytes()
+            .saturating_add(queues.in_flight_output_bytes);
+        let limit = self.backlog_watermark().max(bytes);
+        if backlog
+            .saturating_add(queues.drain_reserved)
+            .saturating_add(bytes)
+            > limit
+        {
+            return None;
+        }
+        queues.drain_reserved = queues.drain_reserved.saturating_add(bytes);
+        Some(DrainAdmission {
+            shared: Arc::clone(&self.shared),
+            bytes,
+        })
+    }
+
+    /// Wait until the connection's output backlog can absorb a drain page
+    /// of `bytes` (reserve-then-admit, round-5 finding 1): the reservation
+    /// is granted atomically against the backlog, every other in-flight
+    /// drain reservation, and the page itself. The `watch` channel is fed
+    /// by the writer pump on every completed frame send, and a `watch`
+    /// receiver retains unseen-change marks, so subscribe-then-check-then-
+    /// await can never miss a wakeup: this is REAL backpressure (the
+    /// sink's `push_server` admits without yielding; the reservation is
+    /// what bounds a producing drain by the connection queue's actual
+    /// consumption). `None` = the writer pump is gone; the caller's
+    /// cancel path owns the exit.
+    pub(crate) async fn reserve_drain_admission(&self, bytes: usize) -> Option<DrainAdmission> {
+        loop {
+            if let Some(permit) = self.try_reserve_drain_admission(bytes) {
+                return Some(permit);
+            }
+            let mut rx = self.shared.backlog.subscribe();
+            // Re-check after subscribing: a drain between the first check
+            // and the subscription is covered by the retained change mark.
+            if let Some(permit) = self.try_reserve_drain_admission(bytes) {
+                return Some(permit);
+            }
+            if rx.changed().await.is_err() {
+                // The writer pump is gone; the caller's cancel path owns
+                // the exit.
+                return None;
+            }
+        }
+    }
+
+    /// Total successful socket sends completed on this connection (drain-
+    /// progress liveness, responsive-terminal-restore Workstream 3). The
+    /// catastrophic-backpressure monitor feeds its per-tick delta into its
+    /// window decision: sends are the ONLY progress signal (eviction and
+    /// supersede reduce queued bytes without being sends).
+    pub(super) fn completed_sends(&self) -> u64 {
+        self.shared
+            .queues
+            .lock()
+            .expect("writer queue lock")
+            .completed_sends
     }
 }
 
@@ -488,6 +827,35 @@ impl WriterPump {
             let (frame, bytes) = match delivery {
                 Delivery::Frame { payload, bytes } => (payload, bytes),
                 Delivery::Gap { terminal_id, range } => {
+                    // Restore contract (responsive-terminal-restore): a
+                    // negotiated connection's gap carries the terminal's
+                    // CURRENT bounds, resolved at emission time. The source
+                    // (registry-backed) takes the per-terminal lock, whose
+                    // holders — subscriber fan-out, attach replays — acquire
+                    // THIS admission lock under theirs, so resolving under
+                    // the admission lock would invert the established lock
+                    // order and can deadlock: release, resolve, re-acquire.
+                    let bounds = match self.shared.gap_bounds.get() {
+                        Some(source) => {
+                            drop(queues);
+                            let bounds = source(&terminal_id);
+                            queues = self.shared.queues.lock().expect("writer queue lock");
+                            if queues.closed {
+                                // A concurrent stop won the race while the
+                                // admission lock was released. The queue is
+                                // dead (Drop clears it) and the pump returns
+                                // via the stop watch — never lease output
+                                // past a stop.
+                                return Ok(None);
+                            }
+                            bounds
+                        }
+                        None => None,
+                    };
+                    // Spill observability (task-007 review M2) now fires at
+                    // ADMISSION time, when the eviction happens — see
+                    // `Queues::take_admission_spills`. Leasing the coalesced
+                    // gap here is delivery, not a spill occurrence.
                     let message =
                         ServerMessage::TerminalOutputGap(freshell_protocol::TerminalOutputGap {
                             terminal_id,
@@ -496,6 +864,8 @@ impl WriterPump {
                             from_seq: range.from_seq,
                             to_seq: range.to_seq,
                             reason: freshell_protocol::TerminalOutputGapReason::QueueOverflow,
+                            head_seq: bounds.map(|b| b.head_seq),
+                            oldest_retained_seq: bounds.map(|b| b.oldest_retained_seq),
                         });
                     let json = serde_json::to_string(&message)
                         .map_err(|_| WriterExit::SerializationFailed)?;
@@ -509,12 +879,14 @@ impl WriterPump {
             queues.in_flight_output_bytes = bytes;
             queues.output.set_reserved_bytes(bytes);
             queues.controls_since_last_output = 0;
-            return Ok(Some(NextFrame {
+            let next = NextFrame {
                 frame,
                 control_bytes: 0,
                 output_bytes: bytes,
                 flushed: None,
-            }));
+            };
+            drop(queues);
+            return Ok(Some(next));
         }
         if let Some(control) = queues.controls.pop_front() {
             queues.controls_since_last_output += 1;
@@ -534,6 +906,16 @@ impl WriterPump {
         queues.in_flight_output_bytes = queues.in_flight_output_bytes.saturating_sub(output_bytes);
         let reserved = queues.in_flight_output_bytes;
         queues.output.set_reserved_bytes(reserved);
+        // Drain-progress liveness: one successful socket send just completed
+        // (output or control — the pump serializes all sends, so either
+        // proves the socket accepted bytes).
+        queues.completed_sends = queues.completed_sends.saturating_add(1);
+        let backlog = queues.output.pending_bytes().saturating_add(reserved);
+        drop(queues);
+        // Drain-side backpressure signal (responsive-terminal-restore W1):
+        // publish the new backlog so gated producers (the paced drain
+        // task) wake as the queue drains. Sent with no queue lock held.
+        let _ = self.shared.backlog.send(backlog);
     }
 
     /// Generic over the real transport so tests can stop a flush at a precise
@@ -644,12 +1026,16 @@ impl Drop for WriterPump {
             queues.control_bytes = 0;
             queues.in_flight_output_bytes = 0;
             queues.controls_since_last_output = 0;
+            queues.drain_reserved = 0;
             queues.output = DeliveryQueue::new(
                 self.shared.output_limit,
                 metadata_limit(self.shared.output_limit),
             );
             queues.interest = InterestState::default();
         }
+        // Wake any gated producers: the backlog is gone with the writer,
+        // and their own cancel paths own the exit.
+        let _ = self.shared.backlog.send(0);
     }
 }
 

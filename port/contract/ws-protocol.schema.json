@@ -522,6 +522,10 @@
             "capabilities": {
               "additionalProperties": false,
               "properties": {
+                "pacedTerminalReplayV1": {
+                  "const": true,
+                  "type": "boolean"
+                },
                 "paneReconcileFreshAgentV1": {
                   "const": true,
                   "type": "boolean"
@@ -531,6 +535,10 @@
                   "type": "boolean"
                 },
                 "terminalInterestV1": {
+                  "const": true,
+                  "type": "boolean"
+                },
+                "terminalLifetimeClaimV1": {
                   "const": true,
                   "type": "boolean"
                 },
@@ -1017,6 +1025,12 @@
               ],
               "type": "string"
             },
+            "replayPageBytes": {
+              "description": "Optional upper bound on each paced replay page's serialized bytes (pacedTerminalReplayV1 connections only), clamped to the server's page-budget cap. Pages are bounded by max(requested, the atomic frame size): a single frame larger than the request forms its own atomic page, bounded by the server fragment cap.",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991,
+              "type": "integer"
+            },
             "rows": {
               "maximum": 500,
               "minimum": 2,
@@ -1055,6 +1069,15 @@
         {
           "additionalProperties": false,
           "properties": {
+            "claimedTerminalIds": {
+              "items": {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 1024,
+              "type": "array"
+            },
             "focusedTerminalId": {
               "anyOf": [
                 {
@@ -1343,6 +1366,43 @@
           "required": [
             "type",
             "terminalId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attachRequestId": {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            "consumedSeq": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "streamId": {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            "terminalId": {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "terminal.replay.credit",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "terminalId",
+            "streamId",
+            "attachRequestId",
+            "consumedSeq"
           ],
           "type": "object"
         },
@@ -4834,6 +4894,10 @@
         "capabilities": {
           "additionalProperties": false,
           "properties": {
+            "pacedTerminalReplayV1": {
+              "const": true,
+              "type": "boolean"
+            },
             "paneReconcileFreshAgentV1": {
               "const": true,
               "type": "boolean"
@@ -4843,6 +4907,10 @@
               "type": "boolean"
             },
             "terminalInterestV1": {
+              "const": true,
+              "type": "boolean"
+            },
+            "terminalLifetimeClaimV1": {
               "const": true,
               "type": "boolean"
             },
@@ -7815,6 +7883,10 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "pacedTerminalReplayV1": {
+          "const": true,
+          "type": "boolean"
+        },
         "paneReconcileFreshAgentV1": {
           "const": true,
           "type": "boolean"
@@ -7824,6 +7896,10 @@
           "type": "boolean"
         },
         "terminalInterestV1": {
+          "const": true,
+          "type": "boolean"
+        },
+        "terminalLifetimeClaimV1": {
           "const": true,
           "type": "boolean"
         }
@@ -8041,6 +8117,12 @@
             "background"
           ],
           "type": "string"
+        },
+        "replayPageBytes": {
+          "description": "Optional upper bound on each paced replay page's serialized bytes (pacedTerminalReplayV1 connections only), clamped to the server's page-budget cap. Pages are bounded by max(requested, the atomic frame size): a single frame larger than the request forms its own atomic page, bounded by the server fragment cap.",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "type": "integer"
         },
         "rows": {
           "maximum": 500,
@@ -8452,6 +8534,15 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "claimedTerminalIds": {
+          "items": {
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 1024,
+          "type": "array"
+        },
         "focusedTerminalId": {
           "anyOf": [
             {
@@ -8746,6 +8837,44 @@
         "type",
         "upsert",
         "remove"
+      ],
+      "type": "object"
+    },
+    "TerminalReplayCreditSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "attachRequestId": {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        "consumedSeq": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "streamId": {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        "terminalId": {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.replay.credit",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "terminalId",
+        "streamId",
+        "attachRequestId",
+        "consumedSeq"
       ],
       "type": "object"
     },

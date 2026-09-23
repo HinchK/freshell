@@ -2052,6 +2052,44 @@ async fn main() -> ExitCode {
                     as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
             })
         });
+    // TERM-09 backpressure config, fail-fast validated
+    // (responsive-terminal-restore Workstream 3): refuse to boot on a
+    // configuration whose disconnect threshold sits at or below the spill
+    // bound — the production incident's inverted shape. Structured event for
+    // the JSONL log (names the offending env vars), plain stderr line for
+    // the console, matching the AUTH_TOKEN refusal pattern.
+    let term09 = match resolve_term09_config() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!(error = %error, "server.config.term09_invalid");
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Responsive-terminal-restore round-5 (finding 1, degenerate
+    // settings): clamp the paced-replay page budget to the queue-derived
+    // admission ceiling — the ONE place both knobs are known. The drain's
+    // reserve-then-admit gate grants a page while backlog + reservations
+    // + page stay at-or-below the watermark (queue cap / 2); a page
+    // budget above that ceiling could only admit into a fully drained
+    // queue, and one above the whole cap would self-spill on admission
+    // (a 64 KiB queue — the supported floor — is smaller than the default
+    // 128 KiB page). With default settings this is a no-op (128 KiB <<
+    // the 8 MiB watermark); the clamp only bites the small-queue
+    // settings, honestly bounding pages to what the queue can carry.
+    {
+        let paced_page_ceiling =
+            freshell_ws::backpressure::paced_page_budget_ceiling(term09.queue_max_bytes);
+        if registry.paced_page_max_bytes() > paced_page_ceiling {
+            tracing::info!(
+                page_budget = registry.paced_page_max_bytes(),
+                clamped_page_budget = paced_page_ceiling,
+                queue_max_bytes = term09.queue_max_bytes,
+                "server.config.paced_page_budget_clamped"
+            );
+            registry.set_paced_page_max_bytes(paced_page_ceiling);
+        }
+    }
     let ws_state = WsState {
         auto_resume_tx,
         auto_resume_cancels: Default::default(),
@@ -2110,7 +2148,7 @@ async fn main() -> ExitCode {
         hello_timeout_ms: resolve_hello_timeout_ms(),
         allowed_origins: Arc::new(resolve_allowed_origins()),
         ws_max_payload_bytes: resolve_ws_max_payload_bytes(),
-        term09: freshell_ws::backpressure::Term09Config::from_env(),
+        term09,
         create_protect,
         // THE kata-enn3 pin: the WS door holds the SAME gate Arc as the
         // REST door (never a second budget minted here).
@@ -3471,6 +3509,23 @@ fn resolve_ws_max_payload_bytes() -> usize {
         .unwrap_or(16 * 1024 * 1024)
 }
 
+/// TERM-09 terminal-stream backpressure config from env, fail-fast validated
+/// (responsive-terminal-restore Workstream 3): normal output pressure must
+/// reach bounded admission/spill (eviction + generation-scoped gap)
+/// STRICTLY before any pressure-related disconnect, so a configuration whose
+/// disconnect threshold sits at or below the spill bound refuses to boot —
+/// the caller logs a structured error naming the offending env vars and
+/// exits before binding any port. Validation lives HERE (the boot/env path),
+/// not inside `WsState`: test harnesses inject `Term09Config` values
+/// directly, including deliberately inverted shapes that make the monitor's
+/// last-resort window observable end to end.
+fn resolve_term09_config(
+) -> Result<freshell_ws::backpressure::Term09Config, freshell_ws::backpressure::Term09ConfigError> {
+    let config = freshell_ws::backpressure::Term09Config::from_env();
+    config.validate()?;
+    Ok(config)
+}
+
 /// SAFE-03: resolve the WS Origin allow-list from process env, mirroring
 /// `server/auth.ts#parseAllowedOrigins` (`ALLOWED_ORIGINS`) plus
 /// `server/network-manager.ts`'s user-facing `EXTRA_ALLOWED_ORIGINS` knob
@@ -4538,6 +4593,96 @@ mod tests {
                 None => std::env::remove_var(self.name),
             }
         }
+    }
+
+    /// TERM-09 boot wiring (responsive-terminal-restore Workstream 3): the
+    /// boot resolution must fail fast on a configuration that would restore
+    /// the spill≥disconnect inversion, naming the offending env vars — and
+    /// accept every correctly-ordered shape. Env-dependent cases in ONE test
+    /// fn (whole-process env mutation; no other test in this crate reads the
+    /// TERMINAL_* vars).
+    #[test]
+    fn term09_boot_resolution_fails_fast_on_inverted_env() {
+        let _queue = EnvVarGuard::unset("TERMINAL_CLIENT_QUEUE_MAX_BYTES");
+        let _catastrophic = EnvVarGuard::unset("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES");
+        let _stall = EnvVarGuard::unset("TERMINAL_WS_CATASTROPHIC_STALL_MS");
+
+        // Defaults must boot and satisfy the strict ordering.
+        let defaults = resolve_term09_config().expect("defaults must resolve");
+        assert!(defaults.catastrophic_buffered_bytes > defaults.queue_max_bytes);
+
+        // An inverted override (disconnect below spill — the production
+        // incident's shape) refuses to boot, naming both env vars.
+        let _inverted = EnvVarGuard::set("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES", "1048576");
+        let err = resolve_term09_config().expect_err("inverted env must refuse boot");
+        let message = err.to_string();
+        assert!(
+            message.contains("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES")
+                && message.contains("TERMINAL_CLIENT_QUEUE_MAX_BYTES"),
+            "the boot error must name the offending env vars: {message}"
+        );
+        drop(_inverted);
+
+        // An equalized pair (disconnect == spill) also refuses.
+        let _equalized_queue = EnvVarGuard::set("TERMINAL_CLIENT_QUEUE_MAX_BYTES", "268435456");
+        let _equalized_cat =
+            EnvVarGuard::set("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES", "268435456");
+        resolve_term09_config().expect_err("equalized env must refuse boot");
+        drop(_equalized_queue);
+        drop(_equalized_cat);
+
+        // A correctly-ordered override boots.
+        let _ordered_queue = EnvVarGuard::set("TERMINAL_CLIENT_QUEUE_MAX_BYTES", "2097152");
+        let _ordered_cat = EnvVarGuard::set("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES", "8388608");
+        let tuned = resolve_term09_config().expect("ordered env must boot");
+        assert_eq!(tuned.queue_max_bytes, 2 * 1024 * 1024);
+        assert_eq!(tuned.catastrophic_buffered_bytes, 8 * 1024 * 1024);
+    }
+
+    /// Responsive-terminal-restore round-5 (finding 1, degenerate
+    /// settings): the boot wiring after `resolve_term09_config` clamps
+    /// the paced page budget to the queue-derived admission ceiling, so a
+    /// supported floor-sized queue never faces a default page larger
+    /// than the queue itself — the clamp the reserve-then-admit drain
+    /// gate relies on for its always-grantable, never-self-spilling
+    /// admissions.
+    #[test]
+    fn paced_page_budget_clamps_to_the_queue_admission_ceiling() {
+        // The exact relationship the boot applies (budget vs ceiling).
+        let clamp = |budget: i64, queue_max_bytes: usize| {
+            budget.min(freshell_ws::backpressure::paced_page_budget_ceiling(
+                queue_max_bytes,
+            ))
+        };
+        // Default settings: the default 128 KiB budget is far below the
+        // 16 MiB queue's 8 MiB ceiling — the clamp is a no-op.
+        assert_eq!(
+            clamp(
+                freshell_terminal::DEFAULT_PACED_PAGE_MAX_BYTES,
+                16 * 1024 * 1024,
+            ),
+            freshell_terminal::DEFAULT_PACED_PAGE_MAX_BYTES,
+        );
+        // THE DEGENERATE FLOOR: the supported 64 KiB queue (the TERM-09
+        // env floor) is SMALLER than the default 128 KiB page — the boot
+        // clamp caps the registry's budget at the 32 KiB watermark.
+        assert_eq!(
+            clamp(
+                freshell_terminal::DEFAULT_PACED_PAGE_MAX_BYTES,
+                freshell_ws::backpressure::TERM09_QUEUE_MAX_BYTES_FLOOR,
+            ),
+            32 * 1024,
+            "a 64 KiB queue must never carry a 128 KiB page"
+        );
+        // The wiring's mechanism: the registry carries the clamped value
+        // through the real setter/getter pair the boot uses.
+        let registry = freshell_terminal::TerminalRegistry::new();
+        let clamped = clamp(
+            registry.paced_page_max_bytes(),
+            freshell_ws::backpressure::TERM09_QUEUE_MAX_BYTES_FLOOR,
+        );
+        registry.set_paced_page_max_bytes(clamped);
+        assert_eq!(registry.paced_page_max_bytes(), 32 * 1024);
     }
 
     fn env_test_temp_dir(tag: &str) -> std::path::PathBuf {

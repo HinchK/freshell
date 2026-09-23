@@ -616,11 +616,17 @@ function findReconcileTerminalContent(
  * epoch — the lifecycle effect's ONLY re-fire signal on an unchanged
  * createRequestId (TerminalView excludes terminalId/status from its deps by
  * design; without the bump the fold stays invisible and the pane gray).
+ * The checkpoint stream identity survives a fold that keeps the SAME live
+ * terminal (the stream still belongs to it, and the next attach ack re-syncs
+ * it); only an identity change drops the stale streamId — task-009b found a
+ * same-terminal fold clearing it poisoned every later checkpoint resume
+ * ('stream_changed' — a full refetch where a delta belonged).
  * Callers own lookup and any extra identity/bookkeeping writes.
  */
 function foldLiveTerminalAttach(content: TerminalPaneContent, terminalId: string): void {
+  const sameTerminal = content.terminalId === terminalId
   content.terminalId = terminalId
-  content.streamId = undefined
+  if (!sameTerminal) content.streamId = undefined
   content.status = 'running'
   content.restoreError = undefined
   // kata b8ke: anchoring onto a live terminal resolves any typed launch
@@ -2342,9 +2348,40 @@ export const panesSlice = createSlice({
       const content = findReconcileTerminalContent(state, tabId, paneId)
       if (!content) return
 
+      const sessionRef = sanitizeSessionRef(action.payload.sessionRef)
+      // Goal-4 no-op gate (task-009b): a verdict that CONFIRMS the pane's
+      // exact current identity — same live terminal, same server instance,
+      // same sessionRef, no corrected/duplicate flags, and no stuck
+      // error/relaunch state the fold would repair — folds NOTHING. The
+      // unconditional epoch bump used to re-fire the lifecycle effect on
+      // every reconnect flap (App re-sends pane.reconcile on every ready),
+      // and the visible-pane re-drive superseded the in-flight checkpoint
+      // delta resume with a full viewport_hydrate refetch. Corrective
+      // verdicts — identity change, corrected/duplicate flags, error-state
+      // or status repair — still fold and bump below; the reconciler's
+      // repair purpose is untouched.
+      const noChangeFold =
+        content.terminalId === terminalId
+        && content.serverInstanceId === serverInstanceId
+        && !corrected
+        && !duplicate
+        && content.status === 'running'
+        && content.restoreError === undefined
+        && content.launchFailure === undefined
+        && content.pendingReconcile === undefined
+        && content.resumeSessionId === undefined
+        && (!sessionRef || sessionRefsEqual(content.sessionRef, sessionRef))
+      if (noChangeFold) {
+        // Bookkeeping still runs: the pane's reconcile pending window must
+        // close on its verdict (the pre-verdict create wait and the ready
+        // round's sender hold depend on it).
+        clearRestoreFallbackAttemptForPane(state, tabId, paneId)
+        clearReconcilePendingForPane(state, tabId, paneId)
+        return
+      }
+
       foldLiveTerminalAttach(content, terminalId)
       content.serverInstanceId = serverInstanceId
-      const sessionRef = sanitizeSessionRef(action.payload.sessionRef)
       if (sessionRef) {
         content.sessionRef = sessionRef
         content.resumeSessionId = undefined

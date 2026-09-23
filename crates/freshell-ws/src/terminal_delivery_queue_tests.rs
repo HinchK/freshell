@@ -192,6 +192,40 @@ fn late_arriving_focused_lane_has_no_historical_background_debt() {
     put(&mut q, "f", Priority::Focused, 0, 100);
     assert_eq!(next(&mut q).0, "f");
 }
+/// Task-007 review M2 (landed by task-010): every eviction surfaces at
+/// ADMISSION time as one record per evicted entry (the evicted frame's own
+/// terminal + range, in global-oldest eviction order), so the connection
+/// writer can emit the rate-limited spill event when the eviction HAPPENS —
+/// not when (or if) the coalesced gap is later leased to the socket. Records
+/// drain exactly once; supersede discards are NOT spills and surface nothing.
+#[test]
+fn eviction_records_surface_at_admission_time_per_evicted_entry() {
+    let mut q = DeliveryQueue::new(200, 1000);
+    put(&mut q, "t", Priority::Focused, 1, 120);
+    put(&mut q, "t", Priority::Focused, 2, 120);
+    put(&mut q, "t", Priority::Focused, 3, 120);
+    let evicted = q.take_evictions();
+    assert_eq!(
+        evicted.len(),
+        2,
+        "pushes 2 and 3 each evicted the global-oldest entry: {evicted:?}"
+    );
+    assert_eq!(evicted[0].terminal_id, "t");
+    assert_eq!((evicted[0].range.from_seq, evicted[0].range.to_seq), (1, 1));
+    assert_eq!((evicted[1].range.from_seq, evicted[1].range.to_seq), (2, 2));
+    assert!(
+        q.take_evictions().is_empty(),
+        "eviction records drain in one take"
+    );
+    // Supersede (discard_terminal) removes the RETAINED frame's queued
+    // bytes WITHOUT being an eviction episode — it must not fabricate spill
+    // records.
+    q.discard_terminal("t");
+    assert!(
+        q.take_evictions().is_empty(),
+        "supersede discards are not spills"
+    );
+}
 #[test]
 fn global_oldest_eviction_remains_explicit_and_generation_scoped() {
     let mut q = DeliveryQueue::new(250, 100);

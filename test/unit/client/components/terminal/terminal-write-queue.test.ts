@@ -330,6 +330,60 @@ describe('createTerminalWriteQueue', () => {
     expect(rafCallbacks).toHaveLength(0)
   })
 
+  it('keeps draining through ambient wall-clock stalls that land between items', () => {
+    // The load-race class observed in full-suite gates (shard runs and the
+    // Cloud Run vitest partition): an OS-scheduling or GC stall advances the
+    // wall clock in the gaps AROUND queue items while the drain itself
+    // consumes microseconds. A drain budget computed from ambient wall time
+    // sees the stall and defers items that cost ~nothing — under a
+    // synchronous frame mock (every e2e harness here) the remaining items
+    // never drain; on a loaded machine the queue throttles to one drained
+    // item per frame. The budget must bound the time the drain CONSUMES, not
+    // ambient time.
+    //
+    // Simulated interleaving via the `now` seam: the first write consumes
+    // ~1ms of real work; the drain's THIRD clock read observes 100ms of
+    // ambient time that passed between items without the queue doing any
+    // work. On an up-front-deadline drain this read lands on the loop's
+    // between-items check and aborts the drain after one item; per-item
+    // consumed-work accounting brackets only item work, so the stall is
+    // excluded and the drain continues.
+    const writes: string[] = []
+    const rafCallbacks: FrameRequestCallback[] = []
+    let nowMs = 0
+    let nowCalls = 0
+
+    const queue = createTerminalWriteQueue({
+      terminalInstanceId: 'surface-ambient-stall',
+      write: (chunk, onWritten) => {
+        writes.push(chunk)
+        nowMs += 1
+        onWritten?.()
+      },
+      requestFrame: (cb) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      },
+      cancelFrame: () => {},
+      now: () => {
+        nowCalls += 1
+        if (nowCalls === 3) {
+          // One ambient stall, observed on a read that brackets no drain work.
+          return nowMs + 100
+        }
+        return nowMs
+      },
+    })
+
+    queue.enqueue('A', undefined, { coalesce: false })
+    queue.enqueue('B', undefined, { coalesce: false })
+    queue.enqueue('C', undefined, { coalesce: false })
+
+    rafCallbacks.shift()?.(16)
+
+    expect(writes).toEqual(['A', 'B', 'C'])
+  })
+
   it('keeps submitted write scope active across async parser callbacks and serializes writes', () => {
     const writes: string[] = []
     const pendingCallbacks: Array<() => void> = []
@@ -438,5 +492,133 @@ describe('onItemApplied marker hook', () => {
     pendingWritten?.()
 
     expect(applied).toEqual([])
+  })
+})
+
+describe('onWriteCompleted surface-mutation ledger hook', () => {
+  it('fires for EVERY completed write — including stale generations; never for tasks', () => {
+    const completed: string[] = []
+    const rafCallbacks: FrameRequestCallback[] = []
+    let pendingWritten: (() => void) | undefined
+    const queue = createTerminalWriteQueue({
+      terminalInstanceId: 'surface-onwritecompleted',
+      write: (_chunk, onWritten) => {
+        pendingWritten = onWritten
+      },
+      onWriteCompleted: (item) => completed.push(`${item.mode}:${item.generation}`),
+      requestFrame: (cb) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      },
+      cancelFrame: () => {},
+    })
+
+    queue.setActiveGeneration('gen-1')
+    queue.enqueue('A', undefined, { mode: 'replay', generation: 'gen-1', coalesce: false })
+    rafCallbacks.shift()?.(0) // in flight
+    queue.setActiveGeneration('gen-2') // the in-flight write goes stale
+    queue.enqueueTask(() => {}, { mode: 'replay', generation: 'gen-2' })
+    rafCallbacks.shift()?.(0) // task runs while the stale write is still in flight
+    expect(completed).toEqual([])
+
+    // The stale write completes: its bytes already reached the surface when it
+    // was submitted — the mutation ledger must count it even though
+    // onItemApplied (generation-scoped) does not.
+    pendingWritten?.()
+    expect(completed).toEqual(['replay:gen-1'])
+  })
+})
+
+describe('onDrain (paced-replay credit flush tick)', () => {
+  it('fires exactly once after a withheld write burst is released in order', () => {
+    const rafCallbacks: FrameRequestCallback[] = []
+    const pendingWritten: Array<() => void> = []
+    const drains: number[] = []
+    let nowMs = 0
+
+    const queue = createTerminalWriteQueue({
+      terminalInstanceId: 'surface-drain-burst',
+      write: (_chunk, onWritten) => {
+        if (onWritten) pendingWritten.push(onWritten)
+      },
+      onDrain: () => {
+        drains.push(nowMs)
+      },
+      requestFrame: (cb) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      },
+      cancelFrame: () => {},
+      now: () => nowMs,
+    })
+
+    queue.setActiveGeneration('attach-paced')
+    queue.enqueue('one', undefined, { mode: 'replay', generation: 'attach-paced', coalesce: false })
+    queue.enqueue('two', undefined, { mode: 'replay', generation: 'attach-paced', coalesce: false })
+    queue.enqueue('three', undefined, { mode: 'replay', generation: 'attach-paced', coalesce: false })
+
+    rafCallbacks.shift()?.(0)
+    expect(pendingWritten).toHaveLength(1)
+    expect(drains).toEqual([])
+
+    // Release in order: each completion schedules the next submit; only the
+    // LAST completion finds the queue empty and fires the drain.
+    nowMs += 1
+    pendingWritten.shift()?.()
+    rafCallbacks.shift()?.(0)
+    nowMs += 1
+    pendingWritten.shift()?.()
+    rafCallbacks.shift()?.(0)
+    nowMs += 1
+    pendingWritten.shift()?.()
+
+    expect(pendingWritten).toEqual([])
+    expect(drains).toEqual([3])
+  })
+
+  it('drains a task enqueued while writes are withheld in the same single drain', () => {
+    const rafCallbacks: FrameRequestCallback[] = []
+    const pendingWritten: Array<() => void> = []
+    const tasks: string[] = []
+    const drains: number[] = []
+    let nowMs = 0
+
+    const queue = createTerminalWriteQueue({
+      terminalInstanceId: 'surface-drain-task-ride',
+      write: (_chunk, onWritten) => {
+        if (onWritten) pendingWritten.push(onWritten)
+      },
+      onDrain: () => {
+        drains.push(nowMs)
+      },
+      requestFrame: (cb) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      },
+      cancelFrame: () => {},
+      now: () => nowMs,
+    })
+
+    queue.setActiveGeneration('attach-paced')
+    queue.enqueue('one', undefined, { mode: 'replay', generation: 'attach-paced', coalesce: false })
+    rafCallbacks.shift()?.(0)
+    // A frontier flush task rides behind the withheld write.
+    queue.enqueueTask(() => tasks.push('flush'), { mode: 'replay', generation: 'attach-paced' })
+    // ...and a second page's write behind that.
+    queue.enqueue('two', undefined, { mode: 'replay', generation: 'attach-paced', coalesce: false })
+
+    expect(drains).toEqual([])
+    expect(tasks).toEqual([])
+
+    nowMs += 1
+    pendingWritten.shift()?.()
+    // The completion submits the task and the next write in one flush.
+    rafCallbacks.shift()?.(0)
+    expect(tasks).toEqual(['flush'])
+    nowMs += 1
+    pendingWritten.shift()?.()
+
+    expect(pendingWritten).toEqual([])
+    expect(drains).toEqual([2])
   })
 })

@@ -370,8 +370,11 @@ fn real_pty_capture_stream_flags_stuck_and_clears_on_meaningful() {
             Some("att-real".into()),
             0,
             false,
+            false,
             None,
-            None
+            None,
+            None,
+            freshell_terminal::PacedAttachOptions::default()
         )
         .found
     );

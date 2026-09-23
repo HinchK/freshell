@@ -95,6 +95,8 @@ describe('WsClient.connect', () => {
       terminalInterestV1: true,
       paneReconcileV1: true,
       paneReconcileFreshAgentV1: true,
+      pacedTerminalReplayV1: true,
+      terminalLifetimeClaimV1: true,
     })
 
     MockWebSocket.instances[0]._message({ type: 'ready' })
@@ -812,6 +814,28 @@ describe('WsClient.sendTerminalInterest', () => {
       .filter((m) => m.type === 'terminal.interest')
     expect(interest).toHaveLength(1)
     expect(interest[0].revision).toBe(1)
+  })
+
+  it('includes claimedTerminalIds only when the ready echoed terminalLifetimeClaimV1', async () => {
+    const c = new WsClient('ws://example/ws')
+    await openReady(c, true)
+    const claimedSnap = { ...snap, claimedTerminalIds: ['T-hidden'] }
+
+    // Interest negotiated but the lifetime-claim echo absent: the claim set
+    // must stay off the wire (an old server never sees the new field).
+    expect(c.sendTerminalInterest(claimedSnap)).toBe(true)
+    let interest = lastSocket().sent
+      .map((x) => JSON.parse(x))
+      .filter((m) => m.type === 'terminal.interest')
+    expect(interest.at(-1).claimedTerminalIds).toBeUndefined()
+
+    // Re-negotiate with the echo: the claim set rides the snapshot.
+    lastSocket()._message({ type: 'ready', capabilities: { terminalInterestV1: true, terminalLifetimeClaimV1: true } })
+    expect(c.sendTerminalInterest(claimedSnap)).toBe(true)
+    interest = lastSocket().sent
+      .map((x) => JSON.parse(x))
+      .filter((m) => m.type === 'terminal.interest')
+    expect(interest.at(-1).claimedTerminalIds).toEqual(['T-hidden'])
   })
 })
 

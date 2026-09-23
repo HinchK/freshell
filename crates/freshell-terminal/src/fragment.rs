@@ -48,13 +48,76 @@ pub fn attach_request_id_reserve_value() -> String {
 /// `TERMINAL_STREAM_BATCH_MAX_BYTES = max(1024, env.TERMINAL_STREAM_BATCH_MAX_BYTES
 /// || MAX_REALTIME_MESSAGE_BYTES)` (`constants.ts:3-6`). Env override honored for
 /// fidelity; unset -> 16384.
+///
+/// Round-2 finding F2 — the frame-fits-page invariant, enforced at the
+/// source: the result is CLAMPED to [`PACED_PAGE_BUDGET_FLOOR_BYTES`] (the
+/// smallest paced page budget any supported TERM-09 queue setting can
+/// produce), so no env override can mint a terminal.output frame whose
+/// serialized size exceeds the page budget floor. Every PTY byte is
+/// ingested through this cap (the OutputFramer fragments at construction),
+/// which makes the paced page builder's over-budget first frame — its
+/// atomic single-frame page — unreachable under supported settings; that
+/// arm stays as defense-in-depth.
 pub fn terminal_stream_batch_max_bytes() -> usize {
-    let from_env = std::env::var("TERMINAL_STREAM_BATCH_MAX_BYTES")
+    terminal_stream_batch_max_bytes_for_env(std::env::var("TERMINAL_STREAM_BATCH_MAX_BYTES"))
+}
+
+/// [`terminal_stream_batch_max_bytes`] resolved against an injected env
+/// read (the pure core — testable without process-env races).
+pub fn terminal_stream_batch_max_bytes_for_env(
+    from_env: Result<String, std::env::VarError>,
+) -> usize {
+    let from_env = from_env
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|n| n.is_finite() && *n > 0.0)
         .map(|n| n.floor() as usize);
-    from_env.unwrap_or(MAX_REALTIME_MESSAGE_BYTES).max(1024)
+    from_env
+        .unwrap_or(MAX_REALTIME_MESSAGE_BYTES)
+        .clamp(1024, PACED_PAGE_BUDGET_FLOOR_BYTES)
+}
+
+/// The paced page-budget FLOOR (responsive-terminal-restore round-2
+/// finding F2): the smallest page budget any supported deployment can hand
+/// the paced page builder. The page budget is clamped at server boot to
+/// `paced_page_budget_ceiling(queue_max_bytes) = queue/2`
+/// (`freshell_ws::backpressure`), and the queue cap is floor-enforced at
+/// 64 KiB (`TERM09_QUEUE_MAX_BYTES_FLOOR`, `Term09Config::validate`) — so
+/// 32 KiB is the minimum ceiling any supported settings can produce. The
+/// fragment cap is clamped to this floor so the frame-fits-page invariant
+/// holds structurally, whatever `TERMINAL_STREAM_BATCH_MAX_BYTES` says.
+/// (freshell-ws pins the cross-crate agreement:
+/// `paced_page_budget_ceiling(TERM09_QUEUE_MAX_BYTES_FLOOR) == this`.)
+pub const PACED_PAGE_BUDGET_FLOOR_BYTES: usize = 32 * 1024;
+
+/// The fixed page-envelope slack atop one frame's fragment-cap measure
+/// (E2R1 finding 2): a page message wraps the frame with the real
+/// envelope — a plain `terminal.output` (already accounted by the
+/// fragment measure's worst-case seq and 512-char attachRequestId
+/// reserve) or a `terminal.output.batch` (whose envelope adds the type
+/// delta, `serializedBytes` digits, the `source` literal, and one
+/// segment's metadata on top of the legacy measure). 512 bytes provably
+/// covers both forms for a maximal fragment (pinned by
+/// [`paced_atomic_page_serialized_ceiling`]'s test and the registry's
+/// atomic-page ceiling test).
+pub const ATOMIC_PAGE_ENVELOPE_OVERHEAD_BYTES: usize = 512;
+
+/// The worst-case serialized size of ONE paced replay page's ATOMIC
+/// single-frame result (E2R1 finding 2): the page builder always
+/// includes the first frame of a window even when that frame alone
+/// exceeds the requested page budget — a single frame larger than the
+/// request forms its own atomic page — and every frame is
+/// pre-fragmented to at most [`terminal_stream_batch_max_bytes`]
+/// (measured as the full `terminal.output` payload with a worst-case
+/// seq and a 512-char attachRequestId reserve). A page therefore never
+/// exceeds this ceiling WHATEVER the client requested: pages are bounded
+/// by max(requested, the atomic frame size), and the atomic frame size
+/// is bounded by the fragment cap plus the page envelope. Connection
+/// drain admission reserves THIS ceiling when the requested page budget
+/// sits below it, so a sub-cap request can never under-reserve what its
+/// drain can actually admit.
+pub fn paced_atomic_page_serialized_ceiling() -> usize {
+    terminal_stream_batch_max_bytes() + ATOMIC_PAGE_ENVELOPE_OVERHEAD_BYTES
 }
 
 /// `measureSerializedJsonBytes` — UTF-8 byte length of the compact JSON serialization.
@@ -169,8 +232,168 @@ mod tests {
     fn batch_max_defaults_to_16k() {
         // Env unset in the test harness -> max(1024, 16384).
         assert_eq!(
-            terminal_stream_batch_max_bytes(),
+            terminal_stream_batch_max_bytes_for_env(Err(std::env::VarError::NotPresent)),
             MAX_REALTIME_MESSAGE_BYTES
+        );
+    }
+
+    #[test]
+    fn fragment_cap_is_clamped_to_the_paced_page_budget_floor() {
+        // Round-2 finding F2 (the boot-clamp, applied at the source): an
+        // env override LARGER than the paced page budget floor must not
+        // survive — the effective fragment cap can never exceed the
+        // smallest page budget any supported queue setting can produce,
+        // or the env could mint a frame the page builder cannot pack.
+        assert_eq!(
+            terminal_stream_batch_max_bytes_for_env(Ok("1048576".to_string())),
+            PACED_PAGE_BUDGET_FLOOR_BYTES,
+            "a 1 MiB TERMINAL_STREAM_BATCH_MAX_BYTES override clamps to the 32 KiB page floor"
+        );
+        // A value BELOW the floor keeps fidelity (the clamp is an upper
+        // bound, not a fixed size).
+        assert_eq!(
+            terminal_stream_batch_max_bytes_for_env(Ok("2048".to_string())),
+            2048
+        );
+        // Garbage and non-positive values keep the default.
+        assert_eq!(
+            terminal_stream_batch_max_bytes_for_env(Ok("not-a-number".to_string())),
+            MAX_REALTIME_MESSAGE_BYTES
+        );
+        assert_eq!(
+            terminal_stream_batch_max_bytes_for_env(Ok("0".to_string())),
+            MAX_REALTIME_MESSAGE_BYTES
+        );
+    }
+
+    #[test]
+    fn a_control_heavy_chunk_measures_far_above_the_page_floor_but_splits_within_the_clamp() {
+        // The round-2 reviewer's reachability arithmetic, pinned as the
+        // class-closing evidence: the PTY reads at most 8 KiB per chunk,
+        // and a control-char-heavy chunk serializes to ~6 bytes per char
+        // under JSON escaping (~48 KiB for 8192 chars) — FAR above the
+        // 32 KiB page floor. But every PTY byte is ingested through the
+        // fragment splitter whose budget measure is the full serialized
+        // terminal.output JSON with the worst-case seq placeholder and
+        // the 512-char attachRequestId reserve, so the emitted FRAMES can
+        // never exceed the clamped cap — the frame-fits-page invariant.
+        let chunk = "\u{1}".repeat(8192);
+        let measured = measure_terminal_output_budget_payload_bytes("term", "stream", &chunk);
+        assert!(
+            measured > 48 * 1024,
+            "the reviewer's ~49 KiB measure: 8192 control chars escape to ~6 bytes each ({measured})"
+        );
+        assert!(
+            measured > PACED_PAGE_BUDGET_FLOOR_BYTES,
+            "the raw chunk measurably exceeds the page floor — only the splitter's fragments reach the ring ({measured})"
+        );
+        let fragments = fragment_terminal_output_for_payload_budget(
+            &chunk,
+            terminal_stream_batch_max_bytes_for_env(Ok("1048576".to_string())),
+            |c| measure_terminal_output_budget_payload_bytes("term", "stream", c),
+        )
+        .expect("the clamped budget always fits one code point");
+        assert!(fragments.len() > 1, "the chunk must split");
+        assert_eq!(fragments.concat(), chunk, "the split is lossless");
+        for fragment in &fragments {
+            let frame_bytes =
+                measure_terminal_output_budget_payload_bytes("term", "stream", fragment);
+            assert!(
+                frame_bytes <= PACED_PAGE_BUDGET_FLOOR_BYTES,
+                "every frame fits the smallest supported page budget ({frame_bytes})"
+            );
+        }
+    }
+
+    #[test]
+    fn paced_atomic_page_ceiling_covers_a_maximal_fragment_in_every_page_form() {
+        // E2R1 finding 2: the ceiling is the honest bound for the page
+        // builder's ATOMIC single-frame result — a frame larger than the
+        // requested page budget forms its own page, and that page must
+        // fit cap + envelope slack in EVERY wire form the projection can
+        // take for it. Build a MAXIMAL fragment (its budgeted
+        // terminal.output measure fits the fragment cap; one more ASCII
+        // char would not) and prove both forms.
+        let cap = terminal_stream_batch_max_bytes();
+        let ceiling = paced_atomic_page_serialized_ceiling();
+        assert!(ceiling > cap, "the ceiling is the cap plus envelope slack");
+
+        let mut len = cap;
+        while measure_terminal_output_budget_payload_bytes(
+            "term-atomic",
+            "stream",
+            &"A".repeat(len),
+        ) > cap
+        {
+            len -= 1;
+        }
+        let data = "A".repeat(len);
+        let measured = measure_terminal_output_budget_payload_bytes("term-atomic", "stream", &data);
+        assert!(
+            measured <= cap,
+            "the maximal fragment fits the fragment cap"
+        );
+        assert!(
+            measure_terminal_output_budget_payload_bytes(
+                "term-atomic",
+                "stream",
+                &"A".repeat(len + 1)
+            ) > cap,
+            "maximality: one more char would exceed the cap"
+        );
+
+        // Form 1 — the plain `terminal.output` page message, stamped with
+        // the WORST-CASE attachRequestId (512 chars) and real seq digits
+        // (far under the measure's placeholder width).
+        let page = json!({
+            "type": "terminal.output",
+            "terminalId": "term-atomic",
+            "streamId": "stream",
+            "seqStart": 1,
+            "seqEnd": 2,
+            "data": data,
+            "attachRequestId": attach_request_id_reserve_value(),
+            "source": "replay",
+        });
+        let plain_bytes = measure_serialized_json_bytes(&page);
+        assert!(
+            plain_bytes <= ceiling,
+            "the plain page form fits the atomic ceiling ({plain_bytes} > {ceiling})"
+        );
+
+        // Form 2 — the real batch projection over the same frame, at the
+        // production budget (batch_max = the fragment cap): whatever wire
+        // shape the single maximal frame takes — the full
+        // `terminal.output.batch`, or the oversize single-segment
+        // fallback — its serialized size must fit the ceiling.
+        let mut scanner = crate::barrier_scanner::BarrierScanner::new();
+        let frame = crate::batch::BatchInputFrame::classified(7, &data, &mut scanner, "stream");
+        let payloads = crate::batch::frames_to_wire_payloads(
+            &[frame],
+            "term-atomic",
+            "arid-max",
+            "replay",
+            cap as i64,
+        );
+        assert_eq!(
+            payloads.len(),
+            1,
+            "one maximal frame projects to exactly one page payload"
+        );
+        let batch_bytes = measure_serialized_json_bytes(&payloads[0]);
+        assert!(
+            batch_bytes <= ceiling,
+            "the batch page form fits the atomic ceiling ({batch_bytes} > {ceiling})"
+        );
+        // The envelope slack is honest, not arbitrary: the batch form's
+        // fixed envelope (type delta, serializedBytes digits, the source
+        // literal, one segment's metadata) fits inside the documented
+        // overhead constant.
+        assert!(
+            batch_bytes.saturating_sub(measured) <= ATOMIC_PAGE_ENVELOPE_OVERHEAD_BYTES,
+            "the batch envelope overhead stays within the documented slack ({} > {})",
+            batch_bytes.saturating_sub(measured),
+            ATOMIC_PAGE_ENVELOPE_OVERHEAD_BYTES
         );
     }
 

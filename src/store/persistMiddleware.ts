@@ -777,7 +777,25 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
         broadcastPersistedRaw(TURN_COMPLETION_STORAGE_KEY, rawTurnCompletion)
       }
     } catch (err) {
-      log.error('Failed to save to localStorage:', err)
+      // Task-008b review F1 (landed by task-010): a failed flush must not
+      // CONSUME the dirty cycle. Keeping the flags armed makes the NEXT
+      // flush opportunity (a new state change, a flushPersistedLayoutNow
+      // dispatch, or the visibilitychange/pagehide flushNow) retry the same
+      // dirty state instead of silently losing the write forever — the
+      // credible candidate for the one-shot codex-refresh rehydrate failure
+      // (persisted terminalId undefined + offline badge; never reproduced
+      // in ~100 attempts, consistent with a rare swallowed persist). The
+      // user-close authorization is restored too: the pending dirty state
+      // IS that close, and without restoring it the empty-tabs guard would
+      // refuse the retried write and permanently lose the user's close.
+      // No retry loop is added — failure costs exactly one structured
+      // error line, and a later successful flush clears the flags normally.
+      log.error('Failed to persist layout; keeping the dirty state to retry on the next flush', {
+        reason: 'persist_flush_failed',
+        error: err instanceof Error ? err.message : String(err),
+      })
+      userClosedTabsIntent = closedByUser
+      return
     }
 
     tabsDirty = false

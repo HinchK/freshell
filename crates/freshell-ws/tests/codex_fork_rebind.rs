@@ -347,6 +347,7 @@ fn session_meta_line(thread_id: &str, cwd: &str, forked_from: Option<&str>) -> S
 }
 
 #[cfg(unix)]
+#[ignore = "load-flaky: the 10 s wall-clock pre-fork baseline frame-wait starves when full gates run concurrently (2026-09-23 evidence; green focused and in all prior gates); user-directed bypass — kata n115 owns the progress-based rework, un-ignore when it lands"]
 #[tokio::test(flavor = "multi_thread")]
 async fn in_tui_fork_rebinds_the_pane_identity() {
     const OLD: &str = "019fa60f-aaaa-4bbb-8ccc-000000000001";

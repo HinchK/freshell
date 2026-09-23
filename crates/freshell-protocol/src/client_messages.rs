@@ -32,6 +32,15 @@ pub enum ClientMessage {
     TerminalAttach(TerminalAttach),
     #[serde(rename = "terminal.interest")]
     TerminalInterest(TerminalInterest),
+    /// Responsive-terminal-restore Workstream 1 (paced replay): the
+    /// continuation credit a `pacedTerminalReplayV1` client sends after fully
+    /// consuming an ordered replay page — `consumedSeq` is the last sequence
+    /// it consumed, `attachRequestId` scopes it to one attach generation.
+    /// Additive optional; protocol version stays 10. Ignored by servers that
+    /// predate the capability (accept-and-strip) and by connections whose
+    /// own hello did not negotiate it.
+    #[serde(rename = "terminal.replay.credit")]
+    TerminalReplayCredit(TerminalReplayCredit),
     #[serde(rename = "terminal.autoResumeCancel")]
     TerminalAutoResumeCancel(TerminalAutoResumeCancel),
     #[serde(rename = "terminal.detach")]
@@ -121,7 +130,7 @@ pub enum ClientMessage {
 
 /// The exact `type` discriminants of every client→server message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const CLIENT_MESSAGE_TYPES: [&str; 41] = [
+pub const CLIENT_MESSAGE_TYPES: [&str; 42] = [
     "amplifier.activity.list",
     "claude.activity.list",
     "client.diagnostic",
@@ -160,6 +169,7 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 41] = [
     "terminal.input",
     "terminal.interest",
     "terminal.kill",
+    "terminal.replay.credit",
     "terminal.resize",
     "ui.layout.sync",
     "ui.screenshot.result",
@@ -187,6 +197,19 @@ pub struct HelloCapabilities {
     /// advertises the capability back (§4.2). Absent for the frozen client.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_reconcile_v1: Option<bool>,
+    /// Paced terminal restore opt-in (responsive-terminal-restore Workstream
+    /// 1): the client understands bounded, ascending paced replay batches with
+    /// continuation credit. Additive optional — absent on the frozen client
+    /// and stripped-tolerant on older servers (no version bump).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paced_terminal_replay_v1: Option<bool>,
+    /// Hidden-pane lifetime claims (responsive-terminal-restore Workstream 1):
+    /// the client sends `terminal.interest.claimedTerminalIds` only after the
+    /// `ready` echo advertises the capability back. Additive optional — absent
+    /// on the frozen client and stripped-tolerant on older servers (no version
+    /// bump).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_lifetime_claim_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -240,6 +263,14 @@ pub struct TerminalInterest {
     pub revision: u64,
     pub focused_terminal_id: Option<String>,
     pub visible_terminal_ids: Vec<String>,
+    /// Hidden-pane lifetime claims (responsive-terminal-restore Workstream 1,
+    /// negotiated `terminalLifetimeClaimV1` only): terminals this connection
+    /// wants kept alive WITHOUT attaching. `None` carries no claim information
+    /// (the frozen shape); `Some(set)` supersedes the connection's previous
+    /// claim set snapshot-by-snapshot — omitting an id from a later snapshot
+    /// is the explicit withdrawal (release).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claimed_terminal_ids: Option<Vec<String>>,
 }
 
 // --- client.diagnostic ------------------------------------------------------
@@ -376,6 +407,30 @@ pub struct TerminalAttach {
     pub expected_session_ref: Option<SessionLocator>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_replay_bytes: Option<i64>,
+    /// Paced terminal restore (responsive-terminal-restore Workstream 1):
+    /// the negotiated forward-page limit — an optional UPPER BOUND on each
+    /// paced replay page's serialized bytes, honored only on
+    /// pacedTerminalReplayV1 connections and clamped to the server's own
+    /// page-budget cap (`min(requested, server cap)`). Round-2 finding F3:
+    /// the field used to be emitted by the client and silently stripped
+    /// here — it is now part of the honest wire contract. Additive
+    /// optional; a missing, malformed, or non-positive value falls back to
+    /// the server's default exactly like the pre-contract accept-and-strip
+    /// behavior (the lossy deserializer keeps a wrong-typed value from
+    /// failing the whole attach frame). Integer-valued number spellings
+    /// (`2048.0`, `2e3`) carry the same value as their canonical integer
+    /// forms and are accepted and validated the same way (E2R1 finding 3)
+    /// — never silently dropped. E2R1 finding 2 (the honest bound): pages
+    /// are bounded by max(requested, the atomic frame size) — a single
+    /// frame larger than the request forms its own ATOMIC single-frame
+    /// page, bounded by the server's fragment cap (every frame is
+    /// pre-fragmented, so one frame's serialized size never exceeds it).
+    #[serde(
+        default,
+        deserialize_with = "lossy_positive_i64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub replay_page_bytes: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<TerminalAttachPriority>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -402,6 +457,60 @@ pub struct TerminalAttach {
     pub observed_epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<u64>,
+}
+
+/// [`TerminalAttach::replay_page_bytes`]'s lossy deserializer (round-2
+/// finding F3): only a clean positive integer counts as a requested bound;
+/// a missing, malformed (wrong-typed, fractional), or non-positive value
+/// deserializes to `None` — the server's default — instead of failing the
+/// whole attach frame. This preserves the pre-contract accept-and-strip
+/// tolerance for buggy senders exactly.
+///
+/// E2R1 finding 3: integer-VALUED number spellings (`2048.0`, `2e3`)
+/// deserialize through Serde JSON's float storage variant, but they carry
+/// the same VALUE as their canonical integer spellings — JSON has one
+/// number type, and the TS/Zod side (`z.number().int().positive()`) plus
+/// the generated JSON Schema accept that value as an integer. The lossy
+/// deserializer accepts and validates them exactly like the canonical
+/// form; a protocol field a client emits is never silently ignored.
+fn lossy_positive_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    Ok(value
+        .as_ref()
+        .and_then(positive_integer_value)
+        .filter(|n| *n > 0))
+}
+
+/// The positive-integer VALUE of one JSON number: Serde JSON's integer
+/// storage directly, or its float storage when the value is integral
+/// (E2R1 finding 3 — `2048.0`/`2e3` parse as floats). Fractional,
+/// non-finite, non-positive, and out-of-i64-range values are `None` (the
+/// malformed/non-positive fallback, never a wrong bound).
+fn positive_integer_value(v: &serde_json::Value) -> Option<i64> {
+    let n = v.as_number()?;
+    if let Some(i) = n.as_i64() {
+        return Some(i);
+    }
+    let f = n.as_f64()?;
+    (f.is_finite() && f.fract() == 0.0 && f > 0.0 && f <= i64::MAX as f64).then_some(f as i64)
+}
+
+/// `terminal.replay.credit` (responsive-terminal-restore Workstream 1): one
+/// continuation credit for a paced replay session, granted after the prior
+/// page was consumed in order. `consumedSeq` must fall within the server's
+/// outstanding-page window `(credited, lastSentPageEnd]`; stale generations
+/// (a superseded `attachRequestId`) and out-of-window values are ignored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalReplayCredit {
+    pub terminal_id: String,
+    pub stream_id: String,
+    pub attach_request_id: String,
+    /// The last sequence the client fully consumed in order.
+    pub consumed_seq: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
