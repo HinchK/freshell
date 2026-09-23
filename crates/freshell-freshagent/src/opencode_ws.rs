@@ -6501,6 +6501,27 @@ impl FreshOpencodeState {
                                     SnapshotStatus::Running => "running",
                                     SnapshotStatus::Idle => "idle",
                                 };
+                                if matches!(status, SnapshotStatus::Idle) {
+                                    // Delta-review rounds 4+5: the daemon
+                                    // reporting this session IDLE is both
+                                    // the proven end of any orphaned
+                                    // daemon-side turn AND a potential
+                                    // STALE duplicate — the same idle is
+                                    // consumed independently by the
+                                    // drive's await_idle, and a bridge-side
+                                    // broadcast landing AFTER the next
+                                    // queued send's running would flip the
+                                    // client's flush gate mid-send. The
+                                    // gated handler broadcasts the idle
+                                    // only when the session is genuinely
+                                    // quiescent (or the deferral latch was
+                                    // just released), never as a stale
+                                    // trailing state-flip.
+                                    Self::observe_daemon_idle(&this, &real_id, session_id).await;
+                                    // The helper broadcast (or suppressed)
+                                    // the frame itself.
+                                    continue;
+                                }
                                 snapshot_event(session_id, status_str)
                             }
                             SdkProviderEvent::Changed { session_id, reason } => {
@@ -6515,31 +6536,13 @@ impl FreshOpencodeState {
                                 message,
                             } => {
                                 // adapter.ts:278-282 -- a turn error means the in-flight
-                                // turn did not positively complete; consulted by the
-                                // send task's completion gating once idle resolves.
+                                // turn did not positively complete; consulted by
+                                // the send task's completion gating once idle resolves.
                                 turn_errored.store(true, Ordering::SeqCst);
                                 error_event(session_id, message)
                             }
                         };
                         fresh_agent.broadcast(&event_frame(&real_id, inner));
-                        // Delta-review round 4: the daemon reporting this
-                        // session IDLE is the PROVEN end of any orphaned
-                        // daemon-side turn (a failed daemon-side interrupt
-                        // abort left the deferral latch armed) — AFTER the
-                        // idle frame is out (the emission-order contract:
-                        // the daemon's idle precedes the next queued
-                        // send's running), release the latch and arm the
-                        // automatic queue delivery. The helper is
-                        // self-gating: a no-op when nothing was deferred.
-                        if matches!(
-                            mapped,
-                            SdkProviderEvent::Snapshot {
-                                status: SnapshotStatus::Idle,
-                                ..
-                            }
-                        ) {
-                            Self::observe_daemon_idle(&this, &real_id).await;
-                        }
                     }
                     // The sidecar was lost; `run_turn`'s own `await_idle` independently
                     // surfaces `ServeError::SidecarLost`, which already excludes the
@@ -6552,31 +6555,56 @@ impl FreshOpencodeState {
         })
     }
 
-    /// Delta-review round 4: the serve bridge observed the daemon report
-    /// this session IDLE — the PROVEN end of any orphaned daemon-side
-    /// turn (a failed daemon-side interrupt abort left the deferral
-    /// latch armed; without this release the parked queue would strand
-    /// until a manual interrupt). The bridge has ALREADY broadcast its
-    /// idle frame when this runs (the emission-order contract: the
-    /// daemon's idle precedes the next queued send's running). Clears
-    /// the latch (WARN-observable on the release) and arms the detached
-    /// drain — the parked messages deliver automatically, in FIFO
-    /// order. The drain is self-gating: the always-spawn is a no-op
-    /// when nothing was deferred.
-    async fn observe_daemon_idle(this: &Self, real_id: &str) {
+    /// Delta-review rounds 4+5: the serve bridge observed the daemon
+    /// report this session IDLE. Two jobs, both under the session lock:
+    /// (1) RELEASE the failed-interrupt deferral latch — the daemon's
+    /// own idle is the PROVEN end of any orphaned daemon-side turn;
+    /// without this release the parked queue would strand until a
+    /// manual interrupt (round 4). (2) Broadcast the idle frame ONLY
+    /// when it cannot be a STALE duplicate (round 5): the same idle is
+    /// consumed independently by the drive's await_idle, and a
+    /// bridge-side broadcast landing AFTER the next queued send's
+    /// running would flip the client's flush gate mid-send (the
+    /// stale-idle race). The broadcast goes out ONLY when the session is
+    /// genuinely quiescent (no registered task, or one that is both
+    /// finished AND past its emissions, and an empty pending queue) —
+    /// never while any work is live or parked, stale or not. A
+    /// suppressed stale idle is dropped on the floor: the live drive's
+    /// own settle tail owns the authoritative idle. When the latch was
+    /// released the detached drain is armed — the parked messages
+    /// deliver automatically, in FIFO order (self-gating otherwise).
+    async fn observe_daemon_idle(this: &Self, real_id: &str, session_id: &str) {
         let session_arc = {
             let guard = this.sessions.lock().await;
             guard.get(real_id).cloned()
         };
-        if let Some(session_arc) = session_arc {
+        let (released, quiescent) = if let Some(session_arc) = session_arc {
             let mut session = session_arc.lock().await;
-            if session.orphaned_daemon_turn.swap(false, Ordering::SeqCst) {
+            let released = session.orphaned_daemon_turn.swap(false, Ordering::SeqCst);
+            if released {
                 tracing::warn!(target: "freshell_freshagent::opencode",
                     session_id = %real_id,
                     "fresh_agent_interrupt_orphan_released_by_daemon_idle");
             }
+            let quiescent = session
+                .turn_task
+                .as_ref()
+                .map(|t| t.is_finished() && t.settling.load(Ordering::SeqCst))
+                .unwrap_or(true)
+                && session.pending_sends.is_empty();
+            (released, quiescent)
+        } else {
+            // No session record (e.g. raced a teardown): the frame is
+            // stateless commentary, broadcast as before.
+            (false, true)
+        };
+        if quiescent {
+            this.fresh_agent
+                .broadcast(&event_frame(real_id, snapshot_event(session_id, "idle")));
         }
-        Self::drain_detached(this, real_id);
+        if released {
+            Self::drain_detached(this, real_id);
+        }
     }
 }
 
@@ -16949,7 +16977,7 @@ mod tests {
 
         // The daemon-side compact eventually settles; the bridge observes
         // the session's idle — the AUTOMATIC release + delivery:
-        FreshOpencodeState::observe_daemon_idle(&st, "ses_q9").await;
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q9", "ses_q9").await;
         await_prompt_posted(&http, "first auto").await;
         await_prompt_posted(&http, "second auto").await;
         {
@@ -17027,6 +17055,87 @@ mod tests {
             session_arc.lock().await.pending_sends.is_empty(),
             "a later queue is not poisoned — the drain drives"
         );
+    }
+
+    /// Delta-review round 5: the bridge's idle broadcast is gated on
+    /// genuine session quiescence. The same daemon idle is consumed
+    /// independently by the drive's await_idle — a bridge-side idle
+    /// processed AFTER the next queued send has started (the scheduling
+    /// race the round-5 reviewer identified) must be SUPPRESSED: a
+    /// stale trailing idle would flip the client's flush gate mid-send,
+    /// flushing another message into the send-overwrites-send direct
+    /// path and breaking one-at-a-time. The live drive's own settle
+    /// tail owns the authoritative idle.
+    #[tokio::test]
+    async fn a_stale_bridge_idle_during_a_live_queued_send_is_suppressed() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q11", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q11")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        // Two queued sends; the one-shot prompt gate parks the FIRST
+        // drained send (the FIFO rig's deterministic in-flight window).
+        let prompt_gate = http.arm_prompt_gate();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q11", "first live")),
+        )
+        .await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q11", "second live")),
+        )
+        .await;
+
+        // Release: the compact settles (its settle tail broadcasts the
+        // AUTHORITATIVE idle — a legitimate one, it precedes the next
+        // running), the drain drives the first send, and its prompt
+        // PARKS — the first send is LIVE.
+        summarize_gate.notify_waiters();
+        await_prompt_posted(&http, "first live").await;
+        // Consume everything the legitimate flow emitted up to here.
+        let _ = drain_frames(&mut rx);
+
+        // The bridge now processes the daemon's idle for the COMPACT —
+        // the stale duplicate racing the live queued send. It MUST be
+        // suppressed: NO new frame lands while the first send is live.
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q11", "ses_q11").await;
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            drain_frames(&mut rx).is_empty(),
+            "the stale bridge-side idle is suppressed while the first queued send is live — no new frame may land"
+        );
+        // And the queue is still parked (nothing drove past the live send).
+        assert!(!http
+            .recorded()
+            .iter()
+            .any(|r| { r.url.contains("prompt_async") && r_body_contains(r, "second live") }));
+
+        // Release the first send's prompt: it settles (its settle tail
+        // broadcasts the AUTHORITATIVE idle), the second drives, and the
+        // run completes with the emission-order contract intact.
+        prompt_gate.notify_waiters();
+        await_prompt_posted(&http, "second live").await;
+        let _ = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+        })
+        .await;
+        let session_arc = st.sessions.lock().await.get("ses_q11").cloned().unwrap();
+        assert!(session_arc.lock().await.pending_sends.is_empty());
     }
 
     /// Same rig with SummarizeOutcome::Answered500 + the gate (fixture

@@ -977,6 +977,15 @@ struct TurnTask {
         // never be poisoned. Tests:
         // the_daemon_idle_observation_releases_the_interrupt_deferral_and_delivers;
         // an_unmaterialized_interrupt_does_not_poison_the_deferral_latch.)
+        // (Delta-review round 5 amendment: the bridge's idle BROADCAST is
+        // gated on genuine session quiescence (no registered task or one
+        // both finished AND past its emissions, and an empty pending
+        // queue) — the same daemon idle is consumed independently by the
+        // drive's await_idle, and a bridge-side idle landing after the
+        // next queued send's running would flip the client's flush gate
+        // mid-send (the stale-idle race). The live drive's settle tail
+        // owns the authoritative idle. Test:
+        // a_stale_bridge_idle_during_a_live_queued_send_is_suppressed.)
         Self::drain_detached(self, &real_id);
 ```
 
