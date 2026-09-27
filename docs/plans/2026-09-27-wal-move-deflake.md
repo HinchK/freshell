@@ -22,7 +22,7 @@ The two freshell-sessions directory_index WAL-move tests landed by PR #819 (open
 
 **Goal:** The two WAL-move tests pass deterministically everywhere because the production change token actually sees sub-millisecond WAL appends, with a deterministic regression test proving it forever.
 
-**Architecture:** The root cause is in production code, not the tests: `OpencodeSource::direct_change_token` (crates/freshell-sessions/src/directory_index.rs:775-785) is `max(db_mtime, wal_mtime)` where both mtimes are **millisecond-truncated** (`file_mtime_ms`, directory_index.rs:917). A WAL append that lands in the same wall-clock millisecond as the cached token makes the token compare equal, so `refresh_snapshot`'s unchanged gate (directory_index.rs:2044-2050) skips the re-list forever — exactly the CI failure ("the WAL-move re-list must fire and settle" with the counter stuck at 1; not starvation: no amount of waiting helps). The fix switches the token to nanosecond mtimes (a new `file_mtime_ns` helper used only by the token; the amplifier's ms helper is display parity and stays). One task delivers the deterministic RED reproduction (mtimes pinned to known offsets inside one ms window) plus the GREEN production fix plus certification.
+**Architecture:** The root cause is in production code, not the tests: `OpencodeSource::direct_change_token` (crates/freshell-sessions/src/directory_index.rs:775-785) is `max(db_mtime, wal_mtime)` where both mtimes are **millisecond-truncated** (`file_mtime_ms`, directory_index.rs:917). A WAL append that lands in the same wall-clock millisecond as the cached token makes the token compare equal, so `refresh_snapshot`'s unchanged gate (directory_index.rs:2044-2050) skips the re-list forever — exactly the CI failure ("the WAL-move re-list must fire and settle" with the counter stuck at 1; not starvation: no amount of waiting helps). The collision (vs. budget starvation) is confirmed by the failing CI runs' own logs — each failed ONLY the two wal tests while every 2s-budget settle sibling passed (receipts: reports/load-bearing-finder.md, F-01). The fix switches the token to nanosecond mtimes (a new `file_mtime_ns` helper used only by the token; the amplifier's ms helper is display parity and stays), adds a belt settle-sleep to each test's first wal-write leg (house style at :4219; no assertion changes), and pins the sub-ms visibility contract with a deterministic regression test whose mtime pins carry a readback canary (a coarse filesystem self-identifies loudly instead of producing a misleading red). One task delivers the deterministic RED reproduction plus the GREEN production fix plus certification.
 
 **Tech Stack:** Rust (edition 2021, MSRV 1.96 — `std::fs::FileTimes`/`File::set_times` stable since 1.75), tokio (`#[tokio::test]` current-thread runtimes), rusqlite fixtures, pnpm-era repo test lanes.
 
@@ -30,7 +30,7 @@ The two freshell-sessions directory_index WAL-move tests landed by PR #819 (open
 
 - pnpm 10.34.5 exactly; frozen installs only; never `npm ci`/`npm install` in this tree. Focused vitest via `pnpm run test:vitest run <path> --config <config>`; cargo takes ONE positional test filter per invocation.
 - Broad coordinated gates behind the shared coordinator (`pnpm run test:status` to inspect; queue behind foreign holders; never kill them); broad runs set `FRESHELL_TEST_SUMMARY`; cloud vitest via `FRESHELL_VITEST_BACKEND=cloud`; agent-launched broad gates export `GCLOUD_ROBOT_REQUIRE=1` and `GCLOUD_ROBOT_HOME=/home/dan/code/skill-gcloud-robot/gcloud-robot`.
-- TDD red/green/refactor; never weaken, skip, or loosen the pinned assertions in the two #819 tests — this plan does not edit them at all.
+- TDD red/green/refactor; never weaken, skip, or loosen the pinned assertions in the two #819 tests — this plan adds only a one-line pre-write settle sleep to each (timing robustness, house style at directory_index.rs:4219); no assertion or expected value changes.
 - This run's gate treats exactly one failure as the ledger-recorded pre-existing exclusion: `TerminalView.stuckCard.test.tsx > restart (arm E)` in the cloud lane (receipts in run-state.md's baseline ledger). Any other failure in this run's gates is attributable to this run and must be fixed.
 - All work on branch `the-usual/wal-move-deflake` in `/home/dan/code/freshell/.worktrees/wal-move-deflake`; base_ref `d6643304361f5ac4dea2310f2579eb1bc9f485f3`; never touch the production server on port 3001; no PR creation without explicit user approval.
 - Commits use the repo's configured git identity (`Dan Shapiro <3732858+danshapiro@users.noreply.github.com>`); conventional commit messages.
@@ -42,7 +42,7 @@ The two freshell-sessions directory_index WAL-move tests landed by PR #819 (open
 ### Task 1: Nanosecond opencode change token + deterministic same-ms regression pin
 
 **Files:**
-- Modify: `crates/freshell-sessions/src/directory_index.rs` (tests module: new test after `opencode_wal_move_relists_without_rewalking_unchanged_sessions` ends ~line 4398; production: `direct_change_token` at :775-785; new helper next to `file_mtime_ms` at :917)
+- Modify: `crates/freshell-sessions/src/directory_index.rs` (tests module: new test inserted between `opencode_wal_move_relists_without_rewalking_unchanged_sessions` and `opencode_content_identical_relist_does_not_bump_generation`; production: `direct_change_token` at :775-785; new helper next to `file_mtime_ms` at :917; the two #819 tests at :4253+ and :4409+ — one pre-write settle sleep line each, no assertion changes)
 
 **Interfaces:**
 - Consumes: `SessionSource::direct_change_token(&self) -> Option<i64>` (trait, :195 — signature UNCHANGED; the unit of the opencode token changes from ms to ns); `CountingWrapper` test fixture (:2694-2760, `direct_list_calls: Arc<AtomicUsize>`); `test_index_with_ttl(Vec<Arc<dyn SessionSource>>, Duration)` (:2628); `opencode_data_home_with_sessions`, `set_opencode_session_model`, `OPENCODE_TEST_MODEL` (existing test helpers); `wait_until(Duration, impl FnMut() -> bool) -> bool` (:2589).
@@ -87,6 +87,14 @@ Add to the tests module in `crates/freshell-sessions/src/directory_index.rs`, im
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(db_t))
             .unwrap();
+        // Readback canary (F-02): a filesystem that cannot hold the pinned
+        // precision self-identifies HERE with a clear message, instead of
+        // producing a misleading token failure later.
+        assert_eq!(
+            std::fs::metadata(&db).unwrap().modified().unwrap(),
+            db_t,
+            "the filesystem must hold sub-millisecond mtime precision for this pin"
+        );
 
         let source =
             std::sync::Arc::new(CountingWrapper::new(OpencodeSource::new(data_home.clone())));
@@ -109,6 +117,11 @@ Add to the tests module in `crates/freshell-sessions/src/directory_index.rs`, im
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(wal_t))
             .unwrap();
+        assert_eq!(
+            std::fs::metadata(&wal).unwrap().modified().unwrap(),
+            wal_t,
+            "the filesystem must hold sub-millisecond mtime precision for this pin"
+        );
 
         tokio::time::sleep(Duration::from_millis(30)).await; // past the 10ms test TTL, deterministically stale
         let _ = index.snapshot().await; // stale-while-revalidate detaches the re-list
@@ -128,7 +141,9 @@ Add to the tests module in `crates/freshell-sessions/src/directory_index.rs`, im
 
 Run: `cargo test -p freshell-sessions --lib opencode_wal_move_within_the_same_millisecond_still_relists`
 
-Expected: FAIL after ~5s with `a sub-millisecond WAL move must still trigger the re-list` — the intended missing behavior, not a setup accident: the ms-truncated token (`file_mtime_ms`) floors both the cached db mtime (+100µs offset) and the wal mtime (+600µs offset) to the same millisecond, `refresh_snapshot`'s unchanged gate compares the tokens equal, and `direct_list` never runs (the counter stays 1 for the full 5s settle budget — the exact CI signature). If the test instead fails fast with a stat/set_times error or a `snap.len()` assertion, STOP: that is a fixture/OS accident, not the intended red.
+Expected: FAIL after ~5s with `a sub-millisecond WAL move must still trigger the re-list` — the intended missing behavior, not a setup accident: the ms-truncated token (`file_mtime_ms`) floors both the cached db mtime (+100µs offset) and the wal mtime (+600µs offset) to the same millisecond, `refresh_snapshot`'s unchanged gate compares the tokens equal, and `direct_list` never runs (the counter stays 1 for the full 5s settle budget — the exact CI signature). If the test instead fails fast with a stat/set_times error or a `snap.len()`/readback assertion, STOP: that is a fixture/OS accident, not the intended red.
+
+Witness the intended failure before proceeding (the red alone cannot distinguish unchanged-gate suppression from a detached sweep that never ran — F-04): temporarily add `eprintln!("witness db_ms={} wal_ms={} db_ns={:?} wal_ns={:?}", file_mtime_ms(&db), file_mtime_ms(&wal), std::fs::metadata(&db).unwrap().modified(), std::fs::metadata(&wal).unwrap().modified());` as the first line inside the `wait_until` closure (or run once before it), rerun, and confirm the two ms values are EQUAL while the ns values differ by exactly 500_000 — the collision, witnessed. Remove the `eprintln!` before continuing (it must not be committed).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -179,6 +194,20 @@ fn file_mtime_ns(path: &Path) -> Option<i64> {
 
 Nothing else changes: the trait signature stays `Option<i64>`; `DirectEntry.token` stays `i64` (in-memory only — `PersistState` persists no tokens, so old-process ms tokens never mix with new ns tokens); the amplifier's `file_mtime_ms` (amplifier.rs:241) is display-parity (`getActivityMtimeMs`, ms by contract) and is NOT touched.
 
+3c. Belt (F-03, house style at directory_index.rs:4219): in EACH of the two #819 tests, insert one settle sleep immediately before its FIRST `std::fs::write(&wal, b"wal-bytes-changed")` line (in `opencode_wal_move_relists_without_rewalking_unchanged_sessions` at ~:4300 and in `opencode_content_identical_relist_does_not_bump_generation` at ~:4429 — the exact legs the CI reds panicked on at :4304/:4433):
+
+```rust
+        // Belt (house style, cf. the pre-write sleep at :4219): settle 30ms
+        // before the wal write so the move lands in a later millisecond
+        // window even on a hypothetical coarse-mtime filesystem. The ns
+        // token makes this redundant on every supported FS (≥100ns
+        // granularity); it keeps the test deterministic regardless of any
+        // future token-precision regression.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+```
+
+No assertion, expected value, or existing sleep changes; the tests' phase-3 legs are untouched (never observed red; supported-FS granularity makes them moot).
+
 - [ ] **Step 4: Run the focused test**
 
 Run: `cargo test -p freshell-sessions --lib opencode_wal_move_within_the_same_millisecond_still_relists`
@@ -198,7 +227,7 @@ Run (three invocations — cargo takes ONE positional filter each):
 1. `cargo test -p freshell-sessions --lib opencode_wal_move_relists_without_rewalking_unchanged_sessions` — Expected: PASS
 2. `cargo test -p freshell-sessions --lib opencode_content_identical_relist_does_not_bump_generation` — Expected: PASS
 3. `cargo test -p freshell-sessions` (full crate, 319 tests including the new one) — Expected: PASS
-4. `cargo test -p freshell-server -p freshell-ws` (sessions' dependents' lanes) — Expected: PASS
+4. `cargo test -p freshell-server -p freshell-ws -p freshell-freshagent` (sessions' dependents' lanes — the crates whose Cargo.toml depend on freshell-sessions) — Expected: PASS
 
 Then the flake certification (house idiom: repeated runs, CI-like 2-core pin; the pre-fix evidence was 10/10 green locally so the certification must be strictly stronger than a single pass):
 
@@ -223,4 +252,4 @@ git add crates/freshell-sessions/src/directory_index.rs
 git commit -m "fix(sessions): nanosecond opencode change token so same-ms WAL appends re-list deterministically"
 ```
 
-The commit contains exactly one file: the new regression test, the `file_mtime_ns` helper, and the token's ns switch. The two #819 tests are untouched.
+The commit contains exactly one file: the new regression test with its readback canaries, the `file_mtime_ns` helper, the token's ns switch, and the one-line pre-write settle sleep in each of the two #819 tests (no assertion changes anywhere). The witness `eprintln!` from Step 2 must NOT be in the commit.
