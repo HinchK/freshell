@@ -105,6 +105,11 @@ describe('TerminalExitBanner', () => {
     )
     const bar = screen.getByTestId('terminal-vacant-recovery-bar')
     expect(bar).toHaveTextContent('codex session was stopped (code 0)')
+    // the-usual delta round 6 (rider): honest recovery copy — with NO
+    // resumable sessionRef the sentence must NOT promise resumption (the
+    // reopen degrades to a fresh conversation in the pane's mode).
+    expect(bar).toHaveTextContent('reopen it to start a new conversation')
+    expect(bar).not.toHaveTextContent('resume this conversation')
     const btn = screen.getByRole('button', { name: 'Reopen codex session' })
     fireEvent.click(btn)
     // The banner is pure presentational: the recovery-create dispatch is the
@@ -120,6 +125,11 @@ describe('TerminalExitBanner', () => {
         vacantRecovery canResume
       />,
     )
+    // the-usual delta round 6 (rider): the recovery sentence keeps its
+    // resume promise ONLY when the sessionRef can actually resume.
+    const bar = screen.getByTestId('terminal-vacant-recovery-bar')
+    expect(bar).toHaveTextContent('reopen it to resume this conversation')
+    expect(bar).not.toHaveTextContent('start a new conversation')
     expect(screen.getByRole('button', { name: 'Reopen codex session' }))
       .toHaveTextContent('Reopen — resumes this conversation')
   })

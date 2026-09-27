@@ -76,7 +76,15 @@ export function TerminalExitBanner({
         className="flex items-center justify-between gap-2 border-t border-border/60 bg-muted/60 px-3 py-1.5 text-sm text-muted-foreground"
       >
         <span>
-          {`${mode} session was stopped${exitCode !== null ? ` (code ${exitCode})` : ''} — reopen it to resume this conversation`}
+          {`${mode} session was stopped${exitCode !== null ? ` (code ${exitCode})` : ''} — ${
+            canResume
+              ? 'reopen it to resume this conversation'
+              // the-usual delta round 6 (rider): with no resumable sessionRef
+              // (provider mismatch), resetPaneForReconcileCreate degrades the
+              // respawn to a fresh conversation — the sentence must not
+              // promise resumption the button's own label already omits.
+              : 'reopen it to start a new conversation'
+          }`}
         </span>
         <button
           type="button"
