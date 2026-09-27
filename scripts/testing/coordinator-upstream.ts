@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { constants as osConstants } from 'node:os'
 import path from 'node:path'
@@ -11,7 +11,7 @@ import {
 } from '../lib/package-manager.js'
 
 import type { UpstreamPhase } from './coordinator-command-matrix.js'
-import { descendantPids, readProcessSnapshot } from './process-tree.js'
+import { descendantPids, readProcessSnapshot, type CommandResult } from './process-tree.js'
 
 const ACTIVE_ENV_KEY = 'FRESHELL_TEST_COORDINATOR_ACTIVE'
 const FAKE_UPSTREAM_ENV_KEY = 'FRESHELL_TEST_COORDINATOR_FAKE_UPSTREAM'
@@ -20,6 +20,10 @@ const PHASE_TIMEOUT_ENV_KEY = 'FRESHELL_TEST_COORDINATOR_PHASE_TIMEOUT_MS'
 const PHASE_WATCH_POLL_ENV_KEY = 'FRESHELL_TEST_COORDINATOR_PHASE_WATCH_POLL_MS'
 const DEFAULT_PHASE_TIMEOUT_MS = 2 * 60 * 60 * 1000
 const DEFAULT_PHASE_WATCH_POLL_MS = 10_000
+// The kill path runs inside a watchdog tick, so its synchronous process-table
+// read must be bounded: an unbounded ps/PowerShell stall would freeze the
+// event loop before the settle can finish.
+const KILL_SNAPSHOT_TIMEOUT_MS = 10_000
 
 export const PHASE_WATCHDOG_EXIT_CODE = 125
 
@@ -27,6 +31,13 @@ export type PhaseWatchdogReason = 'phase_timeout' | 'child_vanished'
 
 export interface SpawnAndWaitOptions {
   livenessProbe?: (pid: number | undefined) => boolean | undefined
+  /**
+   * Arm the hard per-phase timeout. Default enabled; only dispatches that
+   * never hold the coordinator gate (passthrough/delegated lanes) disable
+   * it — they keep lost-completion liveness detection but no cap and no
+   * kill.
+   */
+  hardTimeout?: boolean
 }
 
 function parsePositiveIntEnv(envVars: NodeJS.ProcessEnv, key: string, fallback: number): number {
@@ -63,6 +74,25 @@ function isChildAlive(pid: number | undefined): boolean | undefined {
   }
 }
 
+// Kill-path snapshot runner: mirrors process-tree's runCommand (same 16 MiB
+// maxBuffer) but bounds the synchronous read at KILL_SNAPSHOT_TIMEOUT_MS. On
+// timeout spawnSync returns the error-shaped result, which flows into
+// readProcessSnapshot's existing fallback/degraded handling.
+function boundedSnapshotRunner(command: string, args: readonly string[]): CommandResult {
+  const result = spawnSync(command, [...args], {
+    encoding: 'utf8',
+    maxBuffer: 16 * 1024 * 1024,
+    timeout: KILL_SNAPSHOT_TIMEOUT_MS,
+  })
+  return {
+    status: result.status,
+    signal: result.signal,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    error: result.error,
+  }
+}
+
 // Kill the phase child AND its descendants: the phase child of a broad run is
 // usually a package-manager wrapper around the real workload, so killing
 // only the direct child would release the gate while the workload keeps
@@ -72,7 +102,7 @@ function killProcessTree(pid: number | undefined): void {
     return
   }
   try {
-    const snapshot = readProcessSnapshot()
+    const snapshot = readProcessSnapshot(process.platform, boundedSnapshotRunner)
     const victims = [pid, ...descendantPids(pid, snapshot)]
     for (const victim of victims) {
       try {
@@ -152,6 +182,7 @@ export function resolveCargoCommand(): { command: string; args: string[] } {
 export async function runUpstreamPhase(
   phase: UpstreamPhase,
   envVars: NodeJS.ProcessEnv = process.env,
+  options: SpawnAndWaitOptions = {},
 ): Promise<number> {
   const childEnv: NodeJS.ProcessEnv = {
     ...envVars,
@@ -159,10 +190,10 @@ export async function runUpstreamPhase(
   }
 
   if (envVars[FAKE_UPSTREAM_ENV_KEY]) {
-    return runFakePhase(phase, childEnv)
+    return runFakePhase(phase, childEnv, options)
   }
 
-  return runRealPhase(phase, childEnv)
+  return runRealPhase(phase, childEnv, options)
 }
 
 interface SpawnSpec {
@@ -204,7 +235,7 @@ function resolveSpawnSpec(phase: UpstreamPhase, envVars: NodeJS.ProcessEnv): Spa
   }
 }
 
-async function runFakePhase(phase: UpstreamPhase, envVars: NodeJS.ProcessEnv): Promise<number> {
+async function runFakePhase(phase: UpstreamPhase, envVars: NodeJS.ProcessEnv, options: SpawnAndWaitOptions): Promise<number> {
   const fakeUpstreamPath = envVars[FAKE_UPSTREAM_ENV_KEY]
   if (!fakeUpstreamPath) {
     throw new Error('Fake upstream path was not provided.')
@@ -223,12 +254,13 @@ async function runFakePhase(phase: UpstreamPhase, envVars: NodeJS.ProcessEnv): P
     ],
     envVars,
     false,
+    options,
   )
 }
 
-async function runRealPhase(phase: UpstreamPhase, envVars: NodeJS.ProcessEnv): Promise<number> {
+async function runRealPhase(phase: UpstreamPhase, envVars: NodeJS.ProcessEnv, options: SpawnAndWaitOptions): Promise<number> {
   const spawnSpec = resolveSpawnSpec(phase, envVars)
-  return spawnAndWait(spawnSpec.command, spawnSpec.args, envVars, spawnSpec.viaShell === true)
+  return spawnAndWait(spawnSpec.command, spawnSpec.args, envVars, spawnSpec.viaShell === true, options)
 }
 
 export function spawnAndWait(
@@ -238,8 +270,14 @@ export function spawnAndWait(
   viaShell: boolean,
   options: SpawnAndWaitOptions = {},
 ): Promise<number> {
-  const pollMs = parsePositiveIntEnv(envVars, PHASE_WATCH_POLL_ENV_KEY, DEFAULT_PHASE_WATCH_POLL_MS)
   const timeoutMs = parsePositiveIntEnv(envVars, PHASE_TIMEOUT_ENV_KEY, DEFAULT_PHASE_TIMEOUT_MS)
+  const hardTimeoutEnabled = options.hardTimeout !== false
+  // The timeout is honored at the poll cadence, so the effective poll
+  // interval clamps down to the timeout when smaller; the clamp exists only
+  // to honor the cap and is removed with it.
+  const configuredPollMs = parsePositiveIntEnv(envVars, PHASE_WATCH_POLL_ENV_KEY, DEFAULT_PHASE_WATCH_POLL_MS)
+  const pollMs = hardTimeoutEnabled ? Math.min(configuredPollMs, timeoutMs) : configuredPollMs
+  const effectiveTimeoutMs = hardTimeoutEnabled ? timeoutMs : Number.POSITIVE_INFINITY
   const isAlive = options.livenessProbe ?? isChildAlive
 
   return new Promise((resolve, reject) => {
@@ -260,7 +298,7 @@ export function spawnAndWait(
         childAlive,
         consecutiveDeadTicks,
         elapsedMs: Date.now() - startedAtMs,
-        timeoutMs,
+        timeoutMs: effectiveTimeoutMs,
       })
 
       if (reason === undefined) {

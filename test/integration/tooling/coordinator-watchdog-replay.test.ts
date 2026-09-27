@@ -85,9 +85,12 @@ function coordinatorEnv(repo: string, behavior: Record<string, unknown>): NodeJS
   return env
 }
 
-async function runCoordinatorScenario(behavior: Record<string, unknown>): Promise<CoordinatorScenario> {
+async function runCoordinatorScenario(
+  behavior: Record<string, unknown>,
+  command: string = 'test',
+): Promise<CoordinatorScenario> {
   const { repo, commonDir } = await makeTempGitRepo()
-  const result = await run(process.execPath, [tsxCli, COORDINATOR_PATH, 'run', 'test'], repo, coordinatorEnv(repo, behavior))
+  const result = await run(process.execPath, [tsxCli, COORDINATOR_PATH, 'run', command], repo, coordinatorEnv(repo, behavior))
   return { outcome: { ...result, storeDir: getCoordinatorStoreDir(commonDir) }, repo, commonDir }
 }
 
@@ -120,6 +123,18 @@ describe('coordinator phase watchdog end to end', () => {
     expect(outcome.code).toBe(0)
     expect(outcome.stderr).not.toContain('phase_watchdog_settled')
     await expect(readHolder(outcome.storeDir)).resolves.toBeUndefined()
+  })
+
+  it('keeps a passthrough wedge alive past the phase timeout — no hard cap without the gate', { timeout: 60_000 }, async () => {
+    // test:watch is a passthrough dispatch: it never acquires the shared
+    // coordinator gate, so its phase keeps lost-completion liveness but no
+    // hard timeout. The child holds 1.5s against the 400ms configured phase
+    // timeout and must be allowed to finish green; an always-armed cap
+    // would SIGKILL it at ~400ms and fail the run with exit 125.
+    const { outcome } = await runCoordinatorScenario({ default: { holdMs: 1_500 } }, 'test:watch')
+
+    expect(outcome.code).toBe(0)
+    expect(outcome.stderr).not.toContain('phase_watchdog_settled')
   })
 
   it('records the watchdog failure as a run result other agents can see', { timeout: 60_000 }, async () => {

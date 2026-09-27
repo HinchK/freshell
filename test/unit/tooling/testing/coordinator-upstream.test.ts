@@ -5,7 +5,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { constants as osConstants } from 'node:os'
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { UpstreamPhase } from '../../../../scripts/testing/coordinator-command-matrix.js'
 import {
@@ -347,5 +347,114 @@ describe('phase watchdog', () => {
     await new Promise((resolve) => setTimeout(resolve, 500))
     expect(() => process.kill(directPid, 0)).toThrow()
     expect(() => process.kill(descendantPid, 0)).toThrow()
+  }, 20_000)
+
+  it('does not settle a hard-timeout-free dispatch at the configured phase timeout', async () => {
+    ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true // a red run of this case settles via the watchdog and logs to stderr
+    const exitPromise = runUpstreamPhase({
+      runner: 'npm',
+      script: 'test:balanced',
+      args: [],
+    }, fakeEnv({
+      'npm:test:balanced': { holdMs: 30_000 },
+    }, {
+      phaseWatchPollMs: '25',
+      phaseTimeoutMs: '150',
+    }), { hardTimeout: false })
+
+    const pid = await waitForCapturePid('npm:test:balanced')
+    expect(pid).toBeGreaterThan(0)
+
+    // Four times the configured timeout later the phase must still be
+    // pending: a dispatch that never holds the coordinator gate keeps no
+    // hard cap, so nothing may settle (let alone kill) the child.
+    const stillPending = await Promise.race([
+      exitPromise.then(() => false, () => false),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(true), 600)),
+    ])
+    expect(stillPending).toBe(true)
+
+    process.kill(pid, 'SIGKILL')
+    const expectedExitCode = process.platform === 'win32'
+      ? 1
+      : 128 + osConstants.signals.SIGKILL
+    await expect(exitPromise).resolves.toBe(expectedExitCode)
+  }, 20_000)
+
+  it('keeps lost-completion liveness detection armed when the hard timeout is disabled', async () => {
+    ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true // the watchdog settle event logs to stderr
+    const errSpy = vi.spyOn(console, 'error')
+    let observedChildPid: number | undefined
+    const exitCode = await spawnAndWait(
+      process.execPath,
+      [FIXTURE_PATH, JSON.stringify({ selector: 'passthrough-vanish' })],
+      fakeEnv({
+        default: { holdMs: 30_000 },
+      }, {
+        phaseWatchPollMs: '25',
+        // Small enough that an incorrectly armed hard timeout would settle
+        // (and kill) on the very first tick, before the vanish grace.
+        phaseTimeoutMs: '25',
+      }),
+      false,
+      {
+        hardTimeout: false,
+        livenessProbe: (pid) => {
+          observedChildPid = pid
+          return false
+        },
+      },
+    )
+
+    expect(exitCode).toBe(PHASE_WATCHDOG_EXIT_CODE)
+    // The settle must come from the vanish branch, not the disabled hard
+    // timeout: an armed cap would fire on the first tick with reason
+    // phase_timeout and SIGKILL the child; no watchdog at all would never
+    // settle.
+    const settleEvents = errSpy.mock.calls
+      .flat()
+      .map(String)
+      .filter((line) => line.includes('phase_watchdog_settled'))
+    expect(settleEvents).toHaveLength(1)
+    expect(settleEvents[0]).toContain('"reason":"child_vanished"')
+    // The vanish branch never kills: the child that is really still holding
+    // must have outlived the settle.
+    expect(() => process.kill(observedChildPid!, 0)).not.toThrow()
+    try {
+      process.kill(observedChildPid!, 'SIGKILL')
+    } catch {
+      // already exited
+    }
+  }, 15_000)
+
+  it('honors a phase timeout smaller than the poll cadence within one small poll', async () => {
+    ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true // the watchdog settle event logs to stderr
+    const exitPromise = runUpstreamPhase({
+      runner: 'npm',
+      script: 'test:balanced',
+      args: [],
+    }, fakeEnv({
+      'npm:test:balanced': { holdMs: 30_000 },
+    }, {
+      phaseWatchPollMs: '10_000',
+      phaseTimeoutMs: '250',
+    }))
+
+    let raceTimer: NodeJS.Timeout | undefined
+    const outcome = await Promise.race([
+      exitPromise,
+      new Promise<number>((resolve) => {
+        raceTimer = setTimeout(() => resolve(-1), 3_000)
+      }),
+    ])
+    clearTimeout(raceTimer)
+
+    try {
+      expect(outcome).toBe(PHASE_WATCHDOG_EXIT_CODE)
+    } finally {
+      // On a red run the phase is still pending here; let the armed
+      // watchdog clean up its child so no orphan outlives the test.
+      await exitPromise.catch(() => undefined)
+    }
   }, 20_000)
 })
