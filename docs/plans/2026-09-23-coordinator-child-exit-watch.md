@@ -765,19 +765,65 @@ describe('coordinator phase watchdog end to end', () => {
     // The lost-completion class is not externally fabricable through the real
     // coordinator CLI (the liveness probe is not injectable across a
     // process boundary), so this case proves the mechanism at process
-    // level: a driver process settles its phase through the child_vanished
-    // branch against a child that is really still alive, then must
-    // terminate by event-loop drain alone — a leaked ChildProcess handle
-    // (the native exit callback never arriving) would wedge it here.
+    // level. A driver process settles its phase through the child_vanished
+    // branch against a child that is really alive and stays alive for a
+    // minute; the driver must then terminate promptly by event-loop drain
+    // alone. Without child.unref() the leaked native handle keeps the
+    // driver wedged until the child's 60s hold expires, and the explicit
+    // 10s prompt-exit bound below fails exactly that regression.
     const driverPath = path.resolve(__dirname, '../../fixtures/testing/watchdog-process-exit-driver.ts')
+    const sentinelPath = path.join(tempRoot, `driver-sentinel-${Date.now()}.json`)
 
-    const result = await run(process.execPath, [tsxCli, driverPath, FIXTURE_PATH], REPO_ROOT, {
-      ...process.env,
-      FRESHELL_TEST_COORDINATOR_PHASE_WATCH_POLL_MS: '25',
+    // stdio 'ignore' is load-bearing: the fixture child inherits the
+    // driver's stdio, so piped streams would couple the driver's observable
+    // exit to the child's death and mask a wedged driver.
+    const driver = spawn(process.execPath, [tsxCli, driverPath, FIXTURE_PATH, sentinelPath], {
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        FRESHELL_TEST_COORDINATOR_PHASE_WATCH_POLL_MS: '25',
+      },
+      stdio: 'ignore',
     })
 
-    expect(result.stdout).toContain('DRIVER_DONE')
-    expect(result.code).toBe(0)
+    const driverExit = new Promise<number>((resolve, reject) => {
+      driver.once('error', reject)
+      driver.once('exit', (code) => resolve(code ?? 1))
+    })
+    let boundTimer: NodeJS.Timeout | undefined
+    const bounded = await Promise.race([
+      driverExit,
+      new Promise<'timeout'>((resolve) => {
+        boundTimer = setTimeout(() => resolve('timeout'), 10_000)
+      }),
+    ])
+    clearTimeout(boundTimer)
+
+    if (bounded === 'timeout') {
+      try {
+        process.kill(driver.pid!, 'SIGKILL')
+      } catch {
+        // already dead
+      }
+      throw new Error('driver did not terminate promptly after the lost-completion settle — leaked event-loop handle')
+    }
+    expect(bounded).toBe(0)
+
+    const sentinel = JSON.parse(await fsp.readFile(sentinelPath, 'utf8')) as {
+      status: string
+      childPid?: number
+    }
+    expect(sentinel.status).toBe('DRIVER_DONE')
+
+    // The driver settled while its child was still alive; clean up the
+    // orphan the driver's probe reported.
+    if (typeof sentinel.childPid === 'number') {
+      try {
+        process.kill(sentinel.childPid, 'SIGKILL')
+      } catch {
+        // already dead
+      }
+    }
   })
 })
 ```
@@ -788,35 +834,44 @@ Create the driver fixture at `test/fixtures/testing/watchdog-process-exit-driver
 
 ```typescript
 import process from 'node:process'
+import fsp from 'node:fs/promises'
 
 import { PHASE_WATCHDOG_EXIT_CODE, spawnAndWait } from '../../../scripts/testing/coordinator-upstream.js'
 
 const fixturePath = process.argv[2]
+const sentinelPath = process.argv[3]
+
+let observedChildPid: number | undefined
 
 const exitCode = await spawnAndWait(
   process.execPath,
   [fixturePath, JSON.stringify({ selector: 'driver-child' })],
   {
     ...process.env,
-    FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({ default: { holdMs: 5_000 } }),
+    FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({ default: { holdMs: 60_000 } }),
   },
   false,
   // Simulate the lost-completion class: the OS-level liveness answer is
-  // "gone" while the child is really alive, so the native exit callback can
-  // never arrive to close the handle.
-  { livenessProbe: () => false },
+  // "gone" while the child is really alive for a full minute, so the native
+  // exit callback cannot arrive to close the handle during the case.
+  { livenessProbe: (pid) => { observedChildPid = pid; return false } },
 )
 
 if (exitCode !== PHASE_WATCHDOG_EXIT_CODE) {
-  console.error(`driver expected ${PHASE_WATCHDOG_EXIT_CODE}, got ${exitCode}`)
+  await fsp.writeFile(sentinelPath, JSON.stringify({ status: 'DRIVER_UNEXPECTED_EXIT', exitCode })).catch(() => {})
   process.exit(1)
 }
 
-console.log('DRIVER_DONE')
+// Sentinel file, not stdout: the fixture child inherits this process's
+// stdio, so a pipe-based DONE signal would couple the driver's observable
+// completion to the child's much-later death.
+await fsp.writeFile(sentinelPath, JSON.stringify({ status: 'DRIVER_DONE', childPid: observedChildPid }))
 
 // No explicit process.exit: with the settled child's handle unreferenced,
-// the event loop drains and this process terminates on its own. A leaked
-// ChildProcess handle would keep it alive past any bound.
+// the event loop drains and this process terminates on its own while the
+// child is still alive. A leaked ChildProcess handle would keep this
+// process wedged until the child's 60s hold expires — the e2e case's 10s
+// prompt-exit bound fails exactly that regression.
 ```
 
 Before finalizing the file, the implementer must verify against the real source and adjust (these are load-bearing details, not trivia):
@@ -849,7 +904,7 @@ There is no new production code in this task if Tasks 1–2 are complete: the co
 
 Run: `pnpm run test:vitest run test/integration/tooling/coordinator-watchdog-replay.test.ts --config config/vitest/vitest.runtime.config.ts`
 
-Expected: PASS (all three cases).
+Expected: PASS (all four cases, including `DRIVER_DONE` from the process-level lost-completion driver).
 
 - [ ] **Step 5: Refactor while green**
 
