@@ -32,7 +32,7 @@
 - Structured events go to stderr as JSONL matching the existing `scripts/testing/run-rust-tests.ts` idiom: `{ severity, event, timestamp, ...fields }` with a stable snake_case event name.
 - Preserve existing coordinator behavior exactly where this plan does not change it: numeric exit-code passthrough, `128 + signal` mapping, spawn `error` → promise rejection (exit 1 at the run level), holder release via `clearHolderIfRunIdMatches` in the `finally` of `runCoordinatedCommand`.
 - Exit-code semantics: 124 remains queue-wait timeout; 125 is the new watchdog-settled phase failure. A child that itself exits 125 is disambiguated by the `phase_watchdog_settled` JSONL event's `reason` field.
-- Threat model: honest mistakes by cooperating agents. The watchdog may kill only processes it spawned (its own phase children); it must never signal foreign processes.
+- Threat model: honest mistakes by cooperating agents. On a phase timeout the watchdog kills only the process tree it spawned — the phase child and its descendants, discovered with the existing `process-tree.ts` helpers (`readProcessSnapshot` + `descendantPids`) — and must never signal foreign processes. The `child_vanished` path performs no killing (the child is already gone); descendants it may have left behind are unreachable post-mortem (a snapshot walk cannot start from a dead root pid) and remain a documented residual — the JSONL event carries the dead child's pid for forensics. The timeout kill takes a single snapshot pass; a descendant spawned in the instant between snapshot and kill is the accepted residual race.
 - Comments: brief, load-bearing only, matching existing repo style.
 - Work on the run worktree branch `the-usual/coordinator-child-exit-watch`; PR to main only after explicit user approval. No pushes of behavior changes to main.
 
@@ -51,10 +51,12 @@
 - Test: `test/unit/tooling/testing/coordinator-upstream.test.ts` (add cases)
 
 **Interfaces:**
-- Consumes: existing `spawnAndWait(command, args, envVars, viaShell)` shape; existing `FRESHELL_TEST_COORDINATOR_*` env-knob idiom (values parsed from the injected `envVars`, not `process.env`, so tests inject via `fakeEnv`).
+- Consumes: existing `spawnAndWait(command, args, envVars, viaShell)` shape; existing `FRESHELL_TEST_COORDINATOR_*` env-knob idiom (values parsed from the injected `envVars`, not `process.env`, so tests inject via `fakeEnv`); `readProcessSnapshot` and `descendantPids` from `./process-tree.js`.
 - Produces:
   - `export type PhaseWatchdogReason = 'phase_timeout' | 'child_vanished'`
   - `export function evaluatePhaseWatchdogTick(input: { childAlive: boolean | undefined; consecutiveDeadTicks: number; elapsedMs: number; timeoutMs: number }): PhaseWatchdogReason | undefined`
+  - `export interface SpawnAndWaitOptions { livenessProbe?: (pid: number | undefined) => boolean | undefined }`
+  - `export function spawnAndWait(command: string, args: string[], envVars: NodeJS.ProcessEnv, viaShell: boolean, options?: SpawnAndWaitOptions): Promise<number>` (newly exported so Task 1's own tests can drive the vanish wiring with an injected probe)
   - `export const PHASE_WATCHDOG_EXIT_CODE = 125`
   - New env knobs parsed from the injected env: `FRESHELL_TEST_COORDINATOR_PHASE_TIMEOUT_MS` (default `7_200_000` = 2h), `FRESHELL_TEST_COORDINATOR_PHASE_WATCH_POLL_MS` (default `10_000`).
   - JSONL stderr event `phase_watchdog_settled` with fields `reason`, `pid`, `elapsedMs`, `pollMs`, `timeoutMs`.
@@ -70,6 +72,7 @@ import {
   evaluatePhaseWatchdogTick,
   resolveVitestCommand,
   runUpstreamPhase,
+  spawnAndWait,
 } from '../../../../scripts/testing/coordinator-upstream.js'
 
 describe('phase watchdog', () => {
@@ -102,6 +105,34 @@ describe('phase watchdog', () => {
     }))
 
     expect(exitCode).toBe(PHASE_WATCHDOG_EXIT_CODE)
+  }, 15_000)
+
+  it('settles through the child_vanished branch when the liveness probe reports the child gone', async () => {
+    const probeCalls: Array<number | undefined> = []
+    const exitCode = await spawnAndWait(
+      process.execPath,
+      [FIXTURE_PATH, JSON.stringify({ selector: 'probe-test' })],
+      fakeEnv({
+        default: { holdMs: 1_500 },
+      }, {
+        phaseWatchPollMs: '25',
+        // A large timeout proves the settle can only come from the vanish branch.
+        phaseTimeoutMs: '30_000',
+      }),
+      false,
+      {
+        livenessProbe: (pid) => {
+          probeCalls.push(pid)
+          return false
+        },
+      },
+    )
+
+    expect(exitCode).toBe(PHASE_WATCHDOG_EXIT_CODE)
+    // The probe was consulted with the real child pid on at least the two
+    // consecutive dead ticks the grace requires.
+    expect(probeCalls.length).toBeGreaterThanOrEqual(2)
+    expect(probeCalls.every((pid) => typeof pid === 'number' && pid > 0)).toBe(true)
   }, 15_000)
 
   it('stays inert when the phase child exits on its own before any bound', async () => {
@@ -167,11 +198,17 @@ function fakeEnv(behavior: Record<string, unknown> = {}, options: FakeEnvOptions
 
 Run: `pnpm run test:vitest run test/unit/tooling/testing/coordinator-upstream.test.ts --config config/vitest/vitest.config.ts`
 
-Expected: FAIL — the new `describe('phase watchdog')` block fails to import `evaluatePhaseWatchdogTick`/`PHASE_WATCHDOG_EXIT_CODE` (module has no such exports); the behavior cases cannot pass because no watchdog exists.
+Expected: FAIL — the new `describe('phase watchdog')` block fails to import `evaluatePhaseWatchdogTick`, `PHASE_WATCHDOG_EXIT_CODE`, and `spawnAndWait` (module has no such exports); the behavior cases cannot pass because no watchdog exists.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
 In `scripts/testing/coordinator-upstream.ts`:
+
+Add the import alongside the existing ones:
+
+```typescript
+import { descendantPids, readProcessSnapshot } from './process-tree.js'
+```
 
 Add constants and helpers (below the existing env keys at the top):
 
@@ -184,6 +221,10 @@ const DEFAULT_PHASE_WATCH_POLL_MS = 10_000
 export const PHASE_WATCHDOG_EXIT_CODE = 125
 
 export type PhaseWatchdogReason = 'phase_timeout' | 'child_vanished'
+
+export interface SpawnAndWaitOptions {
+  livenessProbe?: (pid: number | undefined) => boolean | undefined
+}
 
 function parsePositiveIntEnv(envVars: NodeJS.ProcessEnv, key: string, fallback: number): number {
   const parsed = Number.parseInt(envVars[key] ?? '', 10)
@@ -217,6 +258,35 @@ function isChildAlive(pid: number | undefined): boolean | undefined {
   }
 }
 
+// Kill the phase child AND its descendants: the phase child of a broad run is
+// usually a package-manager wrapper around the real workload, so killing
+// only the direct child would release the gate while the workload keeps
+// running. The snapshot walk is the repo's existing process-tree primitive.
+function killProcessTree(pid: number | undefined): void {
+  if (pid === undefined) {
+    return
+  }
+  try {
+    const snapshot = readProcessSnapshot()
+    const victims = [pid, ...descendantPids(pid, snapshot)]
+    for (const victim of victims) {
+      try {
+        process.kill(victim, 'SIGKILL')
+      } catch {
+        // already dead
+      }
+    }
+    return
+  } catch {
+    // Process-table snapshot unavailable: fall back to the direct child.
+    try {
+      process.kill(pid, 'SIGKILL')
+    } catch {
+      // already dead
+    }
+  }
+}
+
 function emitPhaseWatchdogEvent(reason: PhaseWatchdogReason, fields: {
   pid: number | undefined
   elapsedMs: number
@@ -233,17 +303,19 @@ function emitPhaseWatchdogEvent(reason: PhaseWatchdogReason, fields: {
 }
 ```
 
-Replace `spawnAndWait` with the watchdog-armed version (preserving the existing `error`→reject and `exit`→code semantics exactly):
+Replace `spawnAndWait` with the watchdog-armed, exported version (preserving the existing `error`→reject and `exit`→code semantics exactly):
 
 ```typescript
-function spawnAndWait(
+export function spawnAndWait(
   command: string,
   args: string[],
   envVars: NodeJS.ProcessEnv,
   viaShell: boolean,
+  options: SpawnAndWaitOptions = {},
 ): Promise<number> {
   const pollMs = parsePositiveIntEnv(envVars, PHASE_WATCH_POLL_ENV_KEY, DEFAULT_PHASE_WATCH_POLL_MS)
   const timeoutMs = parsePositiveIntEnv(envVars, PHASE_TIMEOUT_ENV_KEY, DEFAULT_PHASE_TIMEOUT_MS)
+  const isAlive = options.livenessProbe ?? isChildAlive
 
   return new Promise((resolve, reject) => {
     const startedAtMs = Date.now()
@@ -257,7 +329,7 @@ function spawnAndWait(
     let consecutiveDeadTicks = 0
 
     const watchdog = setInterval(() => {
-      const childAlive = isChildAlive(child.pid)
+      const childAlive = isAlive(child.pid)
       consecutiveDeadTicks = childAlive === false ? consecutiveDeadTicks + 1 : 0
       const reason = evaluatePhaseWatchdogTick({
         childAlive,
@@ -271,8 +343,8 @@ function spawnAndWait(
       }
 
       // The child hung (or its completion signal was lost with the process
-      // gone): fail the phase instead of awaiting forever. SIGKILL because a
-      // hung runner must not survive the failed run.
+      // gone): fail the phase instead of awaiting forever. On timeout the
+      // whole spawned tree dies so no workload outlives the failed run.
       emitPhaseWatchdogEvent(reason, {
         pid: child.pid,
         elapsedMs: Date.now() - startedAtMs,
@@ -280,7 +352,7 @@ function spawnAndWait(
         timeoutMs,
       })
       if (reason === 'phase_timeout') {
-        child.kill('SIGKILL')
+        killProcessTree(child.pid)
       }
       finish({ kind: 'code', code: PHASE_WATCHDOG_EXIT_CODE })
     }, pollMs)
@@ -339,42 +411,27 @@ git add scripts/testing/coordinator-upstream.ts test/unit/tooling/testing/coordi
 git commit -m "feat(coordinator): fail hanging phase children via a bounded phase watchdog
 
 A dispatched phase whose child exceeds FRESHELL_TEST_COORDINATOR_PHASE_TIMEOUT_MS
-(default 2h) is SIGKILLed and settles the phase with exit 125 plus a
+(default 2h) has its whole spawned process tree SIGKILLed and settles the phase with exit 125 plus a
 phase_watchdog_settled JSONL event, instead of awaiting forever while holding
 the repo-wide gate (kata freshell#t4c8, 2026-09-22 incident class)."
 ```
 
 ---
 
-### Task 2: Dead-child detection (the lost-completion branch)
+### Task 2: Dead-child detection and tree-reap proof (the lost-completion branch)
 
 **Files:**
-- Modify: `test/fixtures/testing/fake-coordinated-workload.mjs` (add `pid` to the capture record)
+- Modify: `test/fixtures/testing/fake-coordinated-workload.mjs` (add `pid` to the capture record; add the `spawnDescendant` behavior)
 - Modify: `scripts/testing/coordinator-upstream.ts` (only if the tick accounting from Task 1 needs a fix — the branch itself is already wired by `evaluatePhaseWatchdogTick`'s `child_vanished` arm)
 - Test: `test/unit/tooling/testing/coordinator-upstream.test.ts` (add cases)
 
 **Interfaces:**
-- Consumes: Task 1's `evaluatePhaseWatchdogTick`, `PHASE_WATCHDOG_EXIT_CODE`, watchdog wiring, `fakeEnv` knob options.
-- Produces: the fixture capture record now includes `pid: number` (the fixture process's own pid) — Task 3's e2e also consumes this.
+- Consumes: Task 1's `evaluatePhaseWatchdogTick`, `PHASE_WATCHDOG_EXIT_CODE`, exported `spawnAndWait` (with `SpawnAndWaitOptions`), watchdog wiring and `killProcessTree`, `fakeEnv` knob options.
+- Produces: the fixture capture record now includes `pid: number` (the fixture process's own pid), a second capture line `{ selector, role: 'descendant', pid }` when the new `spawnDescendant: true` behavior is set, and the fixture behavior `spawnDescendant` itself — Task 3's e2e consumes none of these but the unit seam keeps the reap proof hermetic.
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
-Fixture change (`test/fixtures/testing/fake-coordinated-workload.mjs`, in the `captureFile` block):
-
-```javascript
-  await fs.appendFile(
-    captureFile,
-    `${JSON.stringify({
-      selector: payload.selector,
-      command: payload.command,
-      args: payload.args,
-      pid: process.pid,
-      active: process.env.FRESHELL_TEST_COORDINATOR_ACTIVE,
-    })}\n`,
-  )
-```
-
-New cases in `test/unit/tooling/testing/coordinator-upstream.test.ts`:
+Add these cases to `test/unit/tooling/testing/coordinator-upstream.test.ts` (the fixture seam they depend on — `pid` in the capture record, and the `spawnDescendant` behavior — is deliberately NOT added yet; that is this task's green step):
 
 ```typescript
   it('settles promptly at the signal-mapped code when the child is killed outside the watchdog', async () => {
@@ -389,17 +446,10 @@ New cases in `test/unit/tooling/testing/coordinator-upstream.test.ts`:
       phaseTimeoutMs: '10_000',
     }))
 
-    const deadline = Date.now() + 10_000
-    let pid: number | undefined
-    while (pid === undefined && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 25))
-      const lines = await fsp.readFile(captureFile, 'utf8').catch(() => '')
-      const parsed = lines.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
-      pid = parsed.find((entry) => entry.selector === 'npm:test:balanced')?.pid
-    }
+    const pid = await waitForCapturePid('npm:test:balanced')
     expect(pid).toBeGreaterThan(0)
 
-    process.kill(pid!, 'SIGKILL')
+    process.kill(pid, 'SIGKILL')
 
     const expectedExitCode = process.platform === 'win32'
       ? 1
@@ -407,13 +457,13 @@ New cases in `test/unit/tooling/testing/coordinator-upstream.test.ts`:
     await expect(exitPromise).resolves.toBe(expectedExitCode)
   }, 20_000)
 
-  it('reaps the phase child it kills on timeout', async () => {
+  it('reaps the phase child AND its descendants when the watchdog kills on timeout', async () => {
     const exitPromise = runUpstreamPhase({
       runner: 'npm',
       script: 'test:balanced',
       args: [],
     }, fakeEnv({
-      'npm:test:balanced': { holdMs: 30_000 },
+      'npm:test:balanced': { holdMs: 30_000, spawnDescendant: true },
     }, {
       phaseWatchPollMs: '25',
       phaseTimeoutMs: '250',
@@ -421,41 +471,100 @@ New cases in `test/unit/tooling/testing/coordinator-upstream.test.ts`:
 
     await expect(exitPromise).resolves.toBe(PHASE_WATCHDOG_EXIT_CODE)
 
-    const deadline = Date.now() + 5_000
-    let pid: number | undefined
-    while (pid === undefined && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 25))
-      const lines = await fsp.readFile(captureFile, 'utf8').catch(() => '')
-      const parsed = lines.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
-      pid = parsed.find((entry) => entry.selector === 'npm:test:balanced')?.pid
-    }
-    expect(pid).toBeGreaterThan(0)
+    const directPid = await waitForCapturePid('npm:test:balanced')
+    const descendantPid = await waitForCapturePid('npm:test:balanced', { role: 'descendant' })
+    expect(directPid).toBeGreaterThan(0)
+    expect(descendantPid).toBeGreaterThan(0)
+
+    // Both the direct child and its spawned descendant must be gone: the
+    // watchdog killed the whole tree, not just the wrapper.
     await new Promise((resolve) => setTimeout(resolve, 500))
-    expect(() => process.kill(pid!, 0)).toThrow()
+    expect(() => process.kill(directPid, 0)).toThrow()
+    expect(() => process.kill(descendantPid, 0)).toThrow()
   }, 20_000)
 ```
 
-(Write the two cases exactly; the second uses the fixture's newly captured `pid` to prove the SIGKILLed child is really gone rather than leaked into the background.)
+with this shared poll helper (defined once in the file's helpers section, before the `describe` blocks):
+
+```typescript
+async function waitForCapturePid(selector: string, filter?: { role?: string }): Promise<number> {
+  const deadline = Date.now() + 10_000
+  let lastLines = ''
+  while (Date.now() < deadline) {
+    const raw = await fsp.readFile(captureFile, 'utf8').catch(() => '')
+    lastLines = raw
+    const parsed = raw.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    const match = parsed.find((entry) =>
+      entry.selector === selector && (!filter?.role || entry.role === filter.role))
+    if (typeof match?.pid === 'number' && match.pid > 0) {
+      return match.pid
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  throw new Error(`capture pid for ${selector}${filter?.role ? ` (role=${filter.role})` : ''} never appeared; last capture: ${lastLines}`)
+}
+```
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
 Run: `pnpm run test:vitest run test/unit/tooling/testing/coordinator-upstream.test.ts --config config/vitest/vitest.config.ts`
 
-Expected: FAIL — the capture record has no `pid` field, so `expect(pid).toBeGreaterThan(0)` fails (undefined), proving the fixture seam is not yet in place. The kill-verification case then cannot run.
+Expected: FAIL — both new cases fail inside `waitForCapturePid` because the fixture's capture record has no `pid` (and no descendant line exists at all): the helper times out with `match?.pid` undefined / no match. This is the missing fixture seam, not a syntax or setup accident.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-Apply the fixture `pid` capture shown in Step 1. No `coordinator-upstream.ts` change is expected — Task 1 already wired the `child_vanished` arm. If the killed-outside case flakes because the watchdog's dead-tick grace can theoretically race a real `exit` delivery, fix the accounting in the watchdog tick (never weaken the two-tick grace; the real `exit` event must always win when it is deliverable).
+Extend `test/fixtures/testing/fake-coordinated-workload.mjs`. First the import:
+
+```javascript
+import { spawn } from 'node:child_process'
+```
+
+Then, inside the capture block, add `pid` to the existing record:
+
+```javascript
+  await fs.appendFile(
+    captureFile,
+    `${JSON.stringify({
+      selector: payload.selector,
+      command: payload.command,
+      args: payload.args,
+      pid: process.pid,
+      active: process.env.FRESHELL_TEST_COORDINATOR_ACTIVE,
+    })}\n`,
+  )
+```
+
+And after the capture block (before the `stdout`/`stderr` handling), the new `spawnDescendant` behavior:
+
+```javascript
+if (behavior.spawnDescendant) {
+  const descendant = spawn(process.execPath, ['-e', 'setInterval(() => {}, 60000)'], {
+    stdio: 'ignore',
+  })
+  if (captureFile) {
+    await fs.appendFile(
+      captureFile,
+      `${JSON.stringify({
+        selector: payload.selector,
+        role: 'descendant',
+        pid: descendant.pid ?? null,
+      })}\n`,
+    )
+  }
+}
+```
+
+No `coordinator-upstream.ts` change is expected in this task — Task 1 already wired the `child_vanished` arm and the tree-kill. If the killed-outside case ever flakes because the watchdog's dead-tick grace raced a real `exit` delivery, fix the accounting in the watchdog tick — never weaken the two-tick grace; the real `exit` event must always win when it is deliverable (empirically settled: 100/100 external-SIGKILL iterations at 5 ms and 25 ms poll cadences, the real exit always won).
 
 - [ ] **Step 4: Run the focused test**
 
 Run: `pnpm run test:vitest run test/unit/tooling/testing/coordinator-upstream.test.ts --config config/vitest/vitest.config.ts`
 
-Expected: PASS — the signal-mapped kill settles at `128 + SIGKILL` (the real exit event beats the grace), and the timeout-killed child is provably reaped.
+Expected: PASS — the signal-mapped kill settles at `128 + SIGKILL` (the real exit event beats the grace), and both the timeout-killed phase child and its spawned descendant are provably reaped.
 
 - [ ] **Step 5: Refactor while green**
 
-The two poll-for-capture loops are near-duplicates. Extract a local `async function waitForCapturePid(selector: string): Promise<number>` helper in the test file and use it in both cases. Re-run Step 4's command; expected PASS.
+The capture polling already shares one `waitForCapturePid` helper (defined in Step 1). Review the two new cases for any remaining duplication or dead setup (e.g. `fakeNpmEntry` usage inherited from the file template); simplify if something concrete emerges, otherwise state that no refactor is needed. Re-run Step 4's command; expected PASS.
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -469,7 +578,7 @@ Expected: PASS. (Existing `toMatchObject` assertions select named fields, so the
 
 ```bash
 git add test/fixtures/testing/fake-coordinated-workload.mjs test/unit/tooling/testing/coordinator-upstream.test.ts
-git commit -m "test(coordinator): prove dead-child detection and timeout reaping with pid capture"
+git commit -m "test(coordinator): prove dead-child detection and full tree reaping with pid capture"
 ```
 
 ---
@@ -670,7 +779,7 @@ Deduplicate the store-dir resolution inside the test file (one helper, used by a
 Add the agent-facing knob documentation to `AGENTS.md` in the Test Coordination section (after the `test:status` bullet):
 
 ```markdown
-- Phase-child watchdog: a dispatched phase child that wedges or whose completion signal is lost fails the run with exit 125 (JSONL `phase_watchdog_settled` on stderr) and releases the gate instead of holding it indefinitely. Knobs: `FRESHELL_TEST_COORDINATOR_PHASE_TIMEOUT_MS` (default 7200000 = 2h, hard per-phase cap; a hung child is SIGKILLed) and `FRESHELL_TEST_COORDINATOR_PHASE_WATCH_POLL_MS` (default 10000, liveness poll cadence; two consecutive dead polls settle a lost completion).
+- Phase-child watchdog: a dispatched phase child that wedges or whose completion signal is lost fails the run with exit 125 (JSONL `phase_watchdog_settled` on stderr) and releases the gate instead of holding it indefinitely. Knobs: `FRESHELL_TEST_COORDINATOR_PHASE_TIMEOUT_MS` (default 7200000 = 2h, hard per-phase cap; on timeout the watchdog SIGKILLs the child's whole process tree via the process-table snapshot) and `FRESHELL_TEST_COORDINATOR_PHASE_WATCH_POLL_MS` (default 10000, liveness poll cadence; two consecutive dead polls settle a lost completion).
 ```
 
 Then run the full impacted set: the coordinator unit lane (default config), the new integration file (runtime config), and typecheck.
