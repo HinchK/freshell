@@ -19988,7 +19988,12 @@ mod tests {
         // bearing half of this proof).
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            st.handle_send(send_msg_fenced("ses_q6", "valid at enqueue", epoch, generation)),
+            st.handle_send(send_msg_fenced(
+                "ses_q6",
+                "valid at enqueue",
+                epoch,
+                generation,
+            )),
         )
         .await;
         {
@@ -20128,6 +20133,22 @@ mod tests {
         assert!(
             session_arc.lock().await.pending_sends.is_empty(),
             "the refused entry was discarded; the unfenced entry drained"
+        );
+        // (8) The never-POSTs guarantee holds for the DRAIN'S WHOLE
+        // LIFETIME, not just the refusal instant: the queue is empty (the
+        // drain loop has fully settled) and the continuation entry has
+        // POSTed, so a faulty drain that emits the refusal but falls
+        // through or asynchronously dispatches the stale entry afterward
+        // is caught HERE (focused episode 5 round 1) — the stale prompt
+        // must still be absent, never mutating the newer owner's turn
+        // history.
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async") && r_body_contains(r, "valid at enqueue")),
+            "the refused stale entry must never reach the prompt POST, even after \
+             the drain has fully settled and the continuation entry POSTed"
         );
     }
 
