@@ -29,6 +29,7 @@ import { createTerminalInvalidationHandler } from '@/lib/terminal-invalidation-h
 import { buildReconcileRequest, collectTerminalPaneTargets, foldVerdicts, RECONCILE_RESULT_WAIT_MS, setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
 import { reassertAllOpenPanes } from '@/lib/kill-ack'
 import { foldReadyRuntimeOwners, foldSessionRuntimeOwnerFrame } from '@/lib/fresh-agent-ws'
+import { shouldSkipRuntimeOwnerBroadcastFold } from '@/lib/owner-fence-freeze-seam'
 import { selectOwnerFence, selectPaneOwnerDivergence } from '@/store/selectors/runtimeOwner'
 import { PaneReconcileResultSchema, type PaneReconcileRequest, type HostStatsRefreshResponseMessage, type HostStatsSnapshotMessage, type SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import { getShareAction, ensureShareUrlToken, isRemoteAccessEnabledStatus } from '@/lib/share-utils'
@@ -1753,7 +1754,14 @@ export default function App() {
         // fresh-agent catch-all; nothing awaits an answer (reactive fold
         // like freshAgent.turn.complete, protocol version stays put).
         if (msg.type === 'session.runtimeOwner') {
-          foldSessionRuntimeOwnerFrame(dispatch, msg as SessionRuntimeOwnerMessage)
+          // TEST-ONLY SEAM (?__freshellFreezeFence=1, default-off,
+          // inert in production): drop the commit-to-Live owner
+          // broadcasts on the flagged page so the e2e can stage the
+          // missed-broadcast condition — see
+          // src/lib/owner-fence-freeze-seam.ts for the full contract.
+          if (!shouldSkipRuntimeOwnerBroadcastFold(msg as SessionRuntimeOwnerMessage)) {
+            foldSessionRuntimeOwnerFrame(dispatch, msg as SessionRuntimeOwnerMessage)
+          }
         }
 
         // Round-3 F6: the catch-all's lifecycle producers (the cancelled-
