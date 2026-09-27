@@ -12,6 +12,7 @@ Freshell sessions claimed by terminal-lane panes (plain CLI TUI panes, e.g. code
 ### Explicit constraints
 - Work via the the-usual workflow (isolated worktree, committed plan, load-bearing validation, independent Fresh Eyes reviews, red/green/refactor TDD).
 - Full unit-test and e2e coverage of the new behavior; never skip the refactor step.
+- Delta review extension (user-authorized 2026-09-23): the loop runs up to 5 additional rounds (6-10), stopping early on PASSED. The round-5 finding — no browser-level e2e deterministically stages the typed stale-refusal healing and verifies the next attempt heals without a reload — is IN SCOPE to resolve for the pass; a minimal, default-off, test-only seam is acceptable if deterministic staging requires one, provided it simulates a real missed-frame condition, ships disabled, and is unit-tested.
 - Feature branch in `.worktrees/` created from `origin/main`; never commit behavior changes to `main`; no PR creation without explicit user approval (preparing, committing, and pushing the branch is fine; stop before `gh pr create`).
 - Broadcast frames carry the transition's own committed (epoch, generation) pair, never a re-observed current generation (the established r32 F2 discipline).
 - TypeScript uses NodeNext/ESM: relative imports must include `.js` extensions.
