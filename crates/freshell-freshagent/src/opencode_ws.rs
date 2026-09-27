@@ -4228,6 +4228,18 @@ impl FreshOpencodeState {
                     session_id = %real_id,
                     queued_depth = queued_depth,
                     "fresh_agent_interrupt_abort_failed_queue_deferred");
+                // Delta-review round 8 (extension 2), Major: the deferral
+                // ITSELF arms the recovery watcher. Arming only from an
+                // arriving idle event left the compact's sole terminal
+                // idle LOST in the supported SSE reconnect/lag window
+                // undiscovered: no observe, no watcher, no polling, every
+                // drain blocked — the accepted message stranded until a
+                // kill dropped it. The watcher IS the settlement detector
+                // for a deferred queue: it polls the daemon's live
+                // status until the turn settles (or the 600s compact-time
+                // class elapses) and delivers without needing any SSE
+                // event at all.
+                Self::arm_orphan_idle_recovery(self, &real_id);
             }
         }
     }
@@ -6941,9 +6953,13 @@ impl FreshOpencodeState {
         };
         let Some(session_arc) = session_arc else {
             // No session record (e.g. raced a teardown): the frame is
-            // stateless commentary, broadcast as before.
-            this.fresh_agent
-                .broadcast(&event_frame(real_id, snapshot_event(session_id, "idle")));
+            // stateless commentary — but ONLY for an actual idle event;
+            // the recovery watcher's context must not emit stale frames
+            // for a torn-down session (round 8, Minor).
+            if observed_idle {
+                this.fresh_agent
+                    .broadcast(&event_frame(real_id, snapshot_event(session_id, "idle")));
+            }
             return IdleVerdict::NotTrusted;
         };
         let session = session_arc.lock().await;
@@ -7065,6 +7081,17 @@ impl FreshOpencodeState {
                     tracing::warn!(target: "freshell_freshagent::opencode",
                         session_id = %real_id,
                         "fresh_agent_interrupt_orphan_recovery_exhausted");
+                    return;
+                }
+                // Delta-review round 8 (extension 2), Minor: kill/handoff
+                // can REMOVE the session — the watcher must stop (the
+                // old loop kept polling + broadcasting stale idle frames
+                // every 250ms for up to ten minutes).
+                let still_tracked = {
+                    let guard = this.sessions.lock().await;
+                    guard.contains_key(&real_id)
+                };
+                if !still_tracked {
                     return;
                 }
                 match Self::conclude_idle_observation(&this, &real_id, &real_id, false).await {
@@ -19716,6 +19743,145 @@ mod tests {
             "the watcher recovered the missed terminal idle — no strand"
         );
         assert!(session.pending_sends.is_empty());
+    }
+
+    /// Delta-review round 8 (extension 2), Major: the deferral ITSELF
+    /// arms the recovery watcher — arming only from an arriving idle
+    /// event left the compact's sole terminal idle LOST in the supported
+    /// SSE reconnect/lag window undiscovered: no observe, no watcher,
+    /// no polling, every drain blocked. Here NO idle event ever arrives;
+    /// the deferral's own watcher polls the daemon and delivers.
+    #[tokio::test]
+    async fn a_failed_abort_deferral_arms_the_recovery_watcher_by_itself() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q33", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q33")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q33", "needs no idle event at all")),
+        )
+        .await;
+
+        // The abort FAILS (answered 500) and settles — the deferral
+        // WARNs and arms the recovery watcher. NO idle observation is
+        // ever made: the compact's sole terminal idle is LOST to the
+        // supported reconnect/lag window.
+        http.arm_abort_fail();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q33".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers (abort 500)");
+        let session_arc = st.sessions.lock().await.get("ses_q33").cloned().unwrap();
+        assert!(
+            session_arc
+                .lock()
+                .await
+                .orphaned_daemon_turn
+                .load(Ordering::SeqCst),
+            "the deferral holds the queue"
+        );
+
+        // The deferral-armed watcher polls the daemon's live status: the
+        // compact's seeded busy budget drains, the daemon settles, and
+        // the queue delivers — with NO idle event ever observed.
+        await_prompt_posted(&http, "needs no idle event at all").await;
+        let session_arc = st.sessions.lock().await.get("ses_q33").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(
+            !session.orphaned_daemon_turn.load(Ordering::SeqCst),
+            "the deferral-armed watcher recovered the lost terminal idle"
+        );
+        assert!(session.pending_sends.is_empty());
+    }
+
+    /// Delta-review round 8 (extension 2), Minor: the recovery watcher
+    /// STOPS when kill (or handoff) removes the session — the old loop
+    /// kept polling + broadcasting stale idle frames every 250ms for up
+    /// to ten minutes, and a quickly resumed pane using the same durable
+    /// id received those obsolete frames.
+    #[tokio::test]
+    async fn the_recovery_watcher_stops_when_the_session_is_killed() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q34", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q34")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q34", "parked when the pane dies")),
+        )
+        .await;
+
+        // The abort FAILS and settles — the deferral arms the watcher.
+        http.arm_abort_fail();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q34".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers (abort 500)");
+
+        // KILL the session — the watcher must stop; no stale idle frames
+        // may reach a later pane reusing this durable id.
+        st.sessions.lock().await.remove("ses_q34");
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q34".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await;
+        // Let several watcher ticks pass.
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        let frames = drain_frames(&mut rx);
+        assert!(
+            !frames.iter().any(|f| {
+                is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                    && f["sessionId"] == "ses_q34"
+            }),
+            "a killed session's watcher must not broadcast stale idle frames"
+        );
     }
 
     /// Same rig with SummarizeOutcome::Answered500 + the gate (fixture

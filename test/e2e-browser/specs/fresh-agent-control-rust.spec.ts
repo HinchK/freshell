@@ -2532,6 +2532,28 @@ test.describe('fresh-agent control surfaces — opencode lane (rust)', () => {
             .some((m) => m.requestId === 'e2e-queued-during-compact'))
         .toBe(true)
 
+      // SYNC 1.5 (delta-review round 8, extension 2, Minor): the frame
+      // leaving the browser proves nothing about the SERVER - under
+      // cloud scheduling the server's handling could lag past the fixed
+      // dwell below, the gate would release first, and the send could
+      // take the ordinary direct path while the test still passed. The
+      // requestId-correlated freshAgent.send.accepted ack proves the
+      // server PROCESSED the send while the compact was still parked
+      // (the negative hold below proves the compact was parked at the
+      // same moment) - together they pin the queued path, not just an
+      // eventually-delivered message.
+      await expect
+        .poll(async () =>
+          ((await lane.harness.getReceivedWsMessages()) as Array<{
+            type?: string
+            requestId?: string
+          }>).some(
+            (m) =>
+              m.type === 'freshAgent.send.accepted' &&
+              m.requestId === 'e2e-queued-during-compact',
+          ))
+        .toBe(true)
+
       // SYNC 2 + the NEGATIVE HOLD: the compact is provably STILL parked —
       // the knob holds back the summarize response AND its idle emission,
       // so while the gate is held the audit can contain NO

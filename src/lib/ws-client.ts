@@ -543,6 +543,9 @@ export class WsClient {
           return
         }
         this.handleIncomingMessage(msg)
+        // Test harness: record every received frame (the queue e2e syncs
+        // on the requestId-correlated freshAgent.send.accepted ack).
+        window.__FRESHELL_TEST_HARNESS__?.recordReceivedWsMessage?.(msg)
         if (msg.type === 'ready') {
           finishResolve()
           return
