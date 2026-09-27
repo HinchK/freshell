@@ -44,7 +44,7 @@ The two freshell-sessions directory_index WAL-move tests landed by PR #819 (open
 **Files:**
 - Create: nothing
 - Modify: `crates/freshell-sessions/src/directory_index.rs` (pub `DirectToken` struct declared near the `SessionSource` trait ~:150; trait method signature at :195; new `stat_token_parts` helper next to `file_mtime_ms` at :917; `OpencodeSource::direct_change_token` at :775-785; `DirectEntry.token` type at :1958-1961; test fake's constant token at :5531; tests module: two new regression tests inserted between `opencode_wal_move_relists_without_rewalking_unchanged_sessions` and `opencode_content_identical_relist_does_not_bump_generation`)
-- Modify: `crates/freshell-server/src/resolve.rs:961` (test fake's constant token adapts to the new type — compile-only)
+- Modify: `crates/freshell-server/src/resolve.rs:961` and `:1014` (BOTH test fakes' constant/changing tokens adapt to the new type — compile-only)
 
 **Interfaces:**
 - Consumes: `SessionSource` trait (:150-215); `CountingWrapper` test fixture (:2694-2760, `direct_list_calls: Arc<AtomicUsize>` — delegates the token, signature-only impact); `test_index_with_ttl(Vec<Arc<dyn SessionSource>>, Duration)` (:2628); `opencode_data_home_with_sessions`, `set_opencode_session_model`, `OPENCODE_TEST_MODEL` (existing test helpers); `wait_until(Duration, impl FnMut() -> bool) -> bool` (:2589).
@@ -310,9 +310,11 @@ fn stat_token_parts(path: &Path) -> Option<(i64, u64)> {
 
 3e. Change `DirectEntry`'s field type (:1958-1961) to `token: DirectToken` and adapt its doc comment's "keyed by change-token" prose (no semantic change). The unchanged gate at :2049 (`e.token == token`) is unchanged.
 
-3f. Adapt the two constant-token test fakes to the new type (compile-only):
+3f. Adapt the constant/changing-token test fakes to the new type (compile-only):
 - `crates/freshell-sessions/src/directory_index.rs:5531`: `fn direct_change_token(&self) -> Option<DirectToken> { Some(DirectToken { mtime_ns: 42, size: 0 }) }` (keep its "CONSTANT token" comment).
-- `crates/freshell-server/src/resolve.rs:961`: `fn direct_change_token(&self) -> Option<DirectToken> { Some(DirectToken { mtime_ns: 1, size: 0 }) }` (with `DirectToken` imported from `freshell_sessions::directory_index` alongside the existing imports at resolve.rs:134).
+- `crates/freshell-server/src/resolve.rs:961` (the `FixtureSource` inside the `tests` module): `fn direct_change_token(&self) -> Option<DirectToken> { Some(DirectToken { mtime_ns: 1, size: 0 }) }`.
+- `crates/freshell-server/src/resolve.rs:1014` (the `FailingDirectSource` inside the same `tests` module — its token CHANGES every call by design; preserve that: `Some(DirectToken { mtime_ns: self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst), size: 0 })`).
+- In `crates/freshell-server/src/resolve.rs`, extend the `tests` module's existing import (at :944-946, `use freshell_sessions::directory_index::{FileStat, IndexedSession, SessionIndex, SessionSource};`) with `DirectToken`. The unqualified uses live inside this `tests` module — do NOT add the import to the parent module's :134 import list.
 
 Nothing else changes: the trait's other implementors are the `CountingWrapper` (delegates — signature-only) and these fakes; `PersistState` persists no tokens (in-memory only, no ms/ns mixing concern); the amplifier's `file_mtime_ms` (amplifier.rs:241) is display parity (`getActivityMtimeMs`, ms by contract) and is NOT touched; the `file_mtime_ms` helper itself stays (the file-based stat cache and the wal tests' witness step still use it).
 
