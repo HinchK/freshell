@@ -11,10 +11,110 @@ import {
 } from '../lib/package-manager.js'
 
 import type { UpstreamPhase } from './coordinator-command-matrix.js'
+import { descendantPids, readProcessSnapshot } from './process-tree.js'
 
 const ACTIVE_ENV_KEY = 'FRESHELL_TEST_COORDINATOR_ACTIVE'
 const FAKE_UPSTREAM_ENV_KEY = 'FRESHELL_TEST_COORDINATOR_FAKE_UPSTREAM'
 const REPO_ROOT_ENV_KEY = 'FRESHELL_TEST_COORDINATOR_REPO_ROOT'
+const PHASE_TIMEOUT_ENV_KEY = 'FRESHELL_TEST_COORDINATOR_PHASE_TIMEOUT_MS'
+const PHASE_WATCH_POLL_ENV_KEY = 'FRESHELL_TEST_COORDINATOR_PHASE_WATCH_POLL_MS'
+const DEFAULT_PHASE_TIMEOUT_MS = 2 * 60 * 60 * 1000
+const DEFAULT_PHASE_WATCH_POLL_MS = 10_000
+
+export const PHASE_WATCHDOG_EXIT_CODE = 125
+
+export type PhaseWatchdogReason = 'phase_timeout' | 'child_vanished'
+
+export interface SpawnAndWaitOptions {
+  livenessProbe?: (pid: number | undefined) => boolean | undefined
+}
+
+function parsePositiveIntEnv(envVars: NodeJS.ProcessEnv, key: string, fallback: number): number {
+  // Numeric separators ('7_200_000') are not parseInt digits; strip them so a
+  // value copied from the documented default keeps its magnitude.
+  const parsed = Number.parseInt((envVars[key] ?? '').replaceAll('_', ''), 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
+
+export function evaluatePhaseWatchdogTick(input: {
+  childAlive: boolean | undefined
+  consecutiveDeadTicks: number
+  elapsedMs: number
+  timeoutMs: number
+}): PhaseWatchdogReason | undefined {
+  if (input.childAlive === false && input.consecutiveDeadTicks >= 2) {
+    return 'child_vanished'
+  }
+  if (input.elapsedMs >= input.timeoutMs) {
+    return 'phase_timeout'
+  }
+  return undefined
+}
+
+function isChildAlive(pid: number | undefined): boolean | undefined {
+  if (pid === undefined) {
+    return undefined
+  }
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+// Kill the phase child AND its descendants: the phase child of a broad run is
+// usually a package-manager wrapper around the real workload, so killing
+// only the direct child would release the gate while the workload keeps
+// running. The snapshot walk is the repo's existing process-tree primitive.
+function killProcessTree(pid: number | undefined): void {
+  if (pid === undefined) {
+    return
+  }
+  try {
+    const snapshot = readProcessSnapshot()
+    const victims = [pid, ...descendantPids(pid, snapshot)]
+    for (const victim of victims) {
+      try {
+        process.kill(victim, 'SIGKILL')
+      } catch {
+        // already dead
+      }
+    }
+    return
+  } catch (error) {
+    // Degraded cleanup: without a process-table snapshot only the direct
+    // child is reachable. Never silent — the event names what happened so a
+    // surviving-workload overlap can be classified instead of re-guessed.
+    console.error(JSON.stringify({
+      severity: 'warn',
+      event: 'phase_watchdog_tree_kill_degraded',
+      timestamp: new Date().toISOString(),
+      pid,
+      error: (error as Error).message,
+    }))
+    try {
+      process.kill(pid, 'SIGKILL')
+    } catch {
+      // already dead
+    }
+  }
+}
+
+function emitPhaseWatchdogEvent(reason: PhaseWatchdogReason, fields: {
+  pid: number | undefined
+  elapsedMs: number
+  pollMs: number
+  timeoutMs: number
+}): void {
+  console.error(JSON.stringify({
+    severity: reason === 'phase_timeout' ? 'warn' : 'error',
+    event: 'phase_watchdog_settled',
+    timestamp: new Date().toISOString(),
+    reason,
+    ...fields,
+  }))
+}
 
 const managerByRepoRoot = new Map<string, PackageManagerKind>()
 
@@ -131,32 +231,84 @@ async function runRealPhase(phase: UpstreamPhase, envVars: NodeJS.ProcessEnv): P
   return spawnAndWait(spawnSpec.command, spawnSpec.args, envVars, spawnSpec.viaShell === true)
 }
 
-function spawnAndWait(
+export function spawnAndWait(
   command: string,
   args: string[],
   envVars: NodeJS.ProcessEnv,
   viaShell: boolean,
+  options: SpawnAndWaitOptions = {},
 ): Promise<number> {
+  const pollMs = parsePositiveIntEnv(envVars, PHASE_WATCH_POLL_ENV_KEY, DEFAULT_PHASE_WATCH_POLL_MS)
+  const timeoutMs = parsePositiveIntEnv(envVars, PHASE_TIMEOUT_ENV_KEY, DEFAULT_PHASE_TIMEOUT_MS)
+  const isAlive = options.livenessProbe ?? isChildAlive
+
   return new Promise((resolve, reject) => {
+    const startedAtMs = Date.now()
     const child = spawn(command, args, {
       stdio: 'inherit',
       env: envVars,
       ...(viaShell ? { shell: true } : {}),
     })
 
-    child.once('error', (error) => reject(error))
+    let settled = false
+    let consecutiveDeadTicks = 0
+
+    const watchdog = setInterval(() => {
+      const childAlive = isAlive(child.pid)
+      consecutiveDeadTicks = childAlive === false ? consecutiveDeadTicks + 1 : 0
+      const reason = evaluatePhaseWatchdogTick({
+        childAlive,
+        consecutiveDeadTicks,
+        elapsedMs: Date.now() - startedAtMs,
+        timeoutMs,
+      })
+
+      if (reason === undefined) {
+        return
+      }
+
+      // The child hung (or its completion signal was lost with the process
+      // gone): fail the phase instead of awaiting forever. On timeout the
+      // whole spawned tree dies so no workload outlives the failed run.
+      emitPhaseWatchdogEvent(reason, {
+        pid: child.pid,
+        elapsedMs: Date.now() - startedAtMs,
+        pollMs,
+        timeoutMs,
+      })
+      if (reason === 'phase_timeout') {
+        killProcessTree(child.pid)
+      }
+      // In the lost-completion class the native exit callback never arrives,
+      // so the ChildProcess handle keeps an event-loop reference forever and
+      // a process that only assigns process.exitCode (like the coordinator's
+      // main entry) never terminates. Drop the reference so the loop drains.
+      child.unref()
+      finish({ kind: 'code', code: PHASE_WATCHDOG_EXIT_CODE })
+    }, pollMs)
+
+    function finish(outcome: { kind: 'code'; code: number } | { kind: 'error'; error: Error }): void {
+      if (settled) return
+      settled = true
+      clearInterval(watchdog)
+      if (outcome.kind === 'error') {
+        reject(outcome.error)
+        return
+      }
+      resolve(outcome.code)
+    }
+
+    child.once('error', (error) => finish({ kind: 'error', error }))
     child.once('exit', (code, signal) => {
       if (typeof code === 'number') {
-        resolve(code)
+        finish({ kind: 'code', code })
         return
       }
-
       if (signal) {
-        resolve(128 + (osConstants.signals[signal as keyof typeof osConstants.signals] ?? 1))
+        finish({ kind: 'code', code: 128 + (osConstants.signals[signal as keyof typeof osConstants.signals] ?? 1) })
         return
       }
-
-      resolve(1)
+      finish({ kind: 'code', code: 1 })
     })
   })
 }

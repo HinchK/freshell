@@ -9,9 +9,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import type { UpstreamPhase } from '../../../../scripts/testing/coordinator-command-matrix.js'
 import {
+  PHASE_WATCHDOG_EXIT_CODE,
   assertNoCoordinatorRecursion,
+  evaluatePhaseWatchdogTick,
   resolveVitestCommand,
   runUpstreamPhase,
+  spawnAndWait,
 } from '../../../../scripts/testing/coordinator-upstream.js'
 
 const __filename = fileURLToPath(import.meta.url)
@@ -41,6 +44,8 @@ afterEach(async () => {
 interface FakeEnvOptions {
   repoRoot?: string
   npmExecpath?: string
+  phaseWatchPollMs?: string
+  phaseTimeoutMs?: string
 }
 
 function fakeEnv(behavior: Record<string, unknown> = {}, options: FakeEnvOptions = {}): NodeJS.ProcessEnv {
@@ -51,6 +56,8 @@ function fakeEnv(behavior: Record<string, unknown> = {}, options: FakeEnvOptions
     FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
     FRESHELL_TEST_COORDINATOR_REPO_ROOT: options.repoRoot ?? REPO_ROOT,
     npm_execpath: options.npmExecpath ?? fakePnpmEntry,
+    ...(options.phaseWatchPollMs ? { FRESHELL_TEST_COORDINATOR_PHASE_WATCH_POLL_MS: options.phaseWatchPollMs } : {}),
+    ...(options.phaseTimeoutMs ? { FRESHELL_TEST_COORDINATOR_PHASE_TIMEOUT_MS: options.phaseTimeoutMs } : {}),
   }
 }
 
@@ -169,4 +176,109 @@ describe('coordinator-upstream', () => {
       args: [fakeNpmEntry, 'run', 'test:balanced', '--', '--reporter=dot'],
     })
   })
+})
+
+describe('phase watchdog', () => {
+  it('requires two consecutive dead ticks before declaring the child vanished', () => {
+    const base = { childAlive: false as const, elapsedMs: 500, timeoutMs: 10_000 }
+    expect(evaluatePhaseWatchdogTick({ ...base, consecutiveDeadTicks: 1 })).toBeUndefined()
+    expect(evaluatePhaseWatchdogTick({ ...base, consecutiveDeadTicks: 2 })).toBe('child_vanished')
+  })
+
+  it('ignores liveness it cannot determine', () => {
+    expect(evaluatePhaseWatchdogTick({ childAlive: undefined, consecutiveDeadTicks: 5, elapsedMs: 500, timeoutMs: 10_000 })).toBeUndefined()
+  })
+
+  it('declares a phase timeout once elapsed time reaches the bound while the child lives', () => {
+    expect(evaluatePhaseWatchdogTick({ childAlive: true, consecutiveDeadTicks: 0, elapsedMs: 9_999, timeoutMs: 10_000 })).toBeUndefined()
+    expect(evaluatePhaseWatchdogTick({ childAlive: true, consecutiveDeadTicks: 0, elapsedMs: 10_000, timeoutMs: 10_000 })).toBe('phase_timeout')
+  })
+
+  it('fails a hanging phase child with the watchdog exit code once the phase timeout elapses', async () => {
+    ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true // the watchdog settle event logs to stderr
+    const exitCode = await runUpstreamPhase({
+      runner: 'npm',
+      script: 'test:balanced',
+      args: [],
+    }, fakeEnv({
+      'npm:test:balanced': { holdMs: 30_000 },
+    }, {
+      // injected through envVars so the watchdog knobs are test-visible:
+      phaseWatchPollMs: '50',
+      phaseTimeoutMs: '300',
+    }))
+
+    expect(exitCode).toBe(PHASE_WATCHDOG_EXIT_CODE)
+  }, 15_000)
+
+  it('settles through the child_vanished branch when the liveness probe reports the child gone', async () => {
+    ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true // the watchdog settle event logs to stderr
+    const probeCalls: Array<number | undefined> = []
+    const exitCode = await spawnAndWait(
+      process.execPath,
+      [FIXTURE_PATH, JSON.stringify({ selector: 'probe-test' })],
+      fakeEnv({
+        default: { holdMs: 30_000 },
+      }, {
+        phaseWatchPollMs: '25',
+        // A large timeout proves the settle can only come from the vanish branch.
+        phaseTimeoutMs: '30_000',
+      }),
+      false,
+      {
+        livenessProbe: (pid) => {
+          probeCalls.push(pid)
+          return false
+        },
+      },
+    )
+
+    expect(exitCode).toBe(PHASE_WATCHDOG_EXIT_CODE)
+    // The probe was consulted with the real child pid on at least the two
+    // consecutive dead ticks the grace requires.
+    expect(probeCalls.length).toBeGreaterThanOrEqual(2)
+    expect(probeCalls.every((pid) => typeof pid === 'number' && pid > 0)).toBe(true)
+
+    // The probe lied about a child that is really alive: clean it up via the
+    // pid the probe observed so no 30s orphan lingers in the test run.
+    const realPid = probeCalls[0] as number
+    try {
+      process.kill(realPid, 'SIGKILL')
+    } catch {
+      // already exited
+    }
+  }, 15_000)
+
+  it('stays inert when the phase child exits on its own before any bound', async () => {
+    const exitCode = await runUpstreamPhase({
+      runner: 'npm',
+      script: 'typecheck',
+      args: [],
+    }, fakeEnv({
+      'npm:typecheck': { exitCode: 23 },
+    }, {
+      phaseWatchPollMs: '50',
+      phaseTimeoutMs: '300',
+    }))
+
+    expect(exitCode).toBe(23)
+  }, 15_000)
+
+  it('does not mask signal-exit codes when the watchdog is armed', async () => {
+    const exitCode = await runUpstreamPhase({
+      runner: 'npm',
+      script: 'typecheck',
+      args: [],
+    }, fakeEnv({
+      'npm:typecheck': { signal: 'SIGTERM' },
+    }, {
+      phaseWatchPollMs: '50',
+      phaseTimeoutMs: '300',
+    }))
+
+    const expectedExitCode = process.platform === 'win32'
+      ? 1
+      : 128 + osConstants.signals.SIGTERM
+    expect(exitCode).toBe(expectedExitCode)
+  }, 15_000)
 })
