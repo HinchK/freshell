@@ -19921,18 +19921,34 @@ mod tests {
         await_prompt_posted(&http, "drains past the failure").await;
     }
 
-    /// Task 5: the drain-time fence re-validation. A queued send whose
-    /// CAPTURED observed pair went stale (the session moved to a newer
-    /// ownership generation while it sat behind the compact) is refused
-    /// TYPED at drain time — the lane's op guard validates the pair
-    /// atomically and answers the guard's stale message — and the refusal
-    /// is REQUEST-CORRELATED: a top-level `error` frame carrying the
+    /// Task 5: the drain-time fence re-validation. The send is enqueued
+    /// with a CURRENTLY VALID observed pair (the old shape seeded an
+    /// already-stale generation, which an enqueue-only validation would
+    /// have refused identically — vacuous for the drain-time guarantee —
+    /// delta-review round 9, extension 2). Ownership then ADVANCES while
+    /// the entry still sits QUEUED: the test holds the session's
+    /// per-session mutex across the compact's settle, so the drain — the
+    /// drain-time revalidation itself — parks on the mutex BEFORE it
+    /// validates the captured pair, and the stop + re-grant (the handoff
+    /// class: stop the Live record with the CURRENT pair, then commit a
+    /// NEW Live at the next generation — generations are monotonic per
+    /// key) lands in exactly the window the drain-time revalidation
+    /// exists to close: after the fence's capture, before its atomic
+    /// validation. The registry's transition APIs structurally answer
+    /// BlockedHandoff under an armed attach window, so the transition
+    /// must land after the compact's own guard released at its dispatch
+    /// boundary — the post-settle revalidation slot, where a real
+    /// lifecycle move races the queued drain. The enqueued send is
+    /// PROVEN accepted with no early refusal (the revalidation is at
+    /// DRAIN time, not enqueue), and the drain-time refusal is TYPED and
+    /// REQUEST-CORRELATED: a top-level `error` frame carrying the
     /// send's requestId (the send_error idiom — the wire `error.code` is
     /// always INTERNAL_ERROR, the typed code rides in the message),
     /// never an uncorrelated session-scoped broadcast. The refused entry
-    /// never POSTs, is discarded (never retried), and the queue CONTINUES
-    /// with the next entry: a current-observed send queued behind the
-    /// stale one still drains and POSTs.
+    /// never POSTs, is discarded (never retried), and the queue
+    /// CONTINUES: an unfenced send queued behind it drains and POSTs
+    /// (the direct send path's parse-only tolerance — the queue is never
+    /// stricter than the path it re-enters).
     #[tokio::test]
     async fn a_stale_queued_fence_refuses_typed_at_drain_and_the_queue_continues() {
         // Same gated rig, plus a coordinator registry seeded Live{FreshAgent}
@@ -19965,34 +19981,130 @@ mod tests {
         .expect("compact registers (fenced)");
         await_summarize_posted(&http).await;
 
-        // A STALE-observed send (generation behind the Live record) and a
-        // CURRENT-observed send both queue during the compact.
+        // (1) A CURRENTLY VALID observed pair: the send is ACCEPTED into
+        // the queue while the compact is parked — no early refusal (an
+        // enqueue-only validation would be indistinguishable from the
+        // drain-time one, so the acceptance-while-parked is the load-
+        // bearing half of this proof).
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            st.handle_send(send_msg_fenced(
-                "ses_q6",
-                "stale one",
-                epoch,
-                generation.map(|g| g.saturating_sub(1)),
-            )),
+            st.handle_send(send_msg_fenced("ses_q6", "valid at enqueue", epoch, generation)),
         )
         .await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg_fenced("ses_q6", "current one", epoch, generation)),
-        )
-        .await;
+        {
+            let session_arc = st.sessions.lock().await.get("ses_q6").cloned().unwrap();
+            assert_eq!(
+                session_arc.lock().await.pending_sends.len(),
+                1,
+                "the valid-at-enqueue send is queued behind the parked compact"
+            );
+        }
+        let early = drain_frames(&mut rx);
+        assert!(
+            !early
+                .iter()
+                .any(|f| f["type"] == "error" && f["requestId"] == "req-valid at enqueue"),
+            "no refusal before the drain — the revalidation happens at DRAIN time: {early:?}"
+        );
 
+        // (2) An UNFENCED send queues behind it — the queue-continues
+        // probe (the direct send path's parse-only tolerance; the queue
+        // is never stricter than the path it re-enters).
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q6", "unfenced one")),
+        )
+        .await;
+        {
+            let session_arc = st.sessions.lock().await.get("ses_q6").cloned().unwrap();
+            assert_eq!(
+                session_arc.lock().await.pending_sends.len(),
+                2,
+                "the queue holds the fenced and the unfenced entries"
+            );
+        }
+
+        // (3) THE PARK: hold the session's per-session mutex across the
+        // settle. Every drain (the enqueue-triggered ones and the
+        // compact's settle-tail one) parks ON the mutex before it can
+        // reach the captured pair's validation — an async park, so the
+        // runtime, the compact's own settle bookkeeping, and the test
+        // itself all keep making progress.
+        let session_arc = st.sessions.lock().await.get("ses_q6").cloned().unwrap();
+        let session_guard = session_arc.lock().await;
         summarize_gate.notify_waiters();
 
-        // (1) The stale entry is refused REQUEST-CORRELATED: a top-level
-        // `error` frame carrying its requestId. The wire `error.code` is
-        // always INTERNAL_ERROR (the send_error idiom); the typed code
-        // rides in the MESSAGE — assert the requestId and the guard's
-        // stale wording (STALE_OP_GUARD_MESSAGE) in the message, never a
-        // wire code.
+        // (4) THE STALE WINDOW: the entry still sits QUEUED, and
+        // ownership ADVANCES under it — the Live record (stoppable with
+        // the CURRENT pair the send also observed) is stopped to Vacant
+        // and a NEW start-commit grants Live at a newer generation (the
+        // handoff class — generations are monotonic per key). The
+        // compact's op guard releases at its dispatch boundary — a
+        // ≤5ms witness-watch the drive task runs on its own scheduling —
+        // so the stop uses the registry's OWN retryable-refusal
+        // discipline: `BlockedHandoff` is the typed "retry after the
+        // attach completes" answer, and the bounded retry loop IS the
+        // wait (the grant proves the window freed; each 5ms sleep also
+        // yields the runtime so the drive task's watcher can run and
+        // drop the guard). No drain has armed an attach guard (they are
+        // all parked on the mutex), so once the compact's guard is down
+        // the transition window is free — deterministic.
+        let stop_gen = {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match registry.begin_stop(
+                    PROVIDER,
+                    "ses_q6",
+                    "op-q6-advance",
+                    &freshell_ownership::StopClaim {
+                        expected_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                        expected_runtime: None,
+                        observed: freshell_ownership::ObservedFence {
+                            epoch: registry.boot_epoch(),
+                            generation: generation
+                                .expect("the seeded Live pair carries a generation"),
+                        },
+                    },
+                    "test",
+                    freshell_ownership::now_epoch_ms(),
+                ) {
+                    freshell_ownership::StopOutcome::Granted { generation } => break generation,
+                    freshell_ownership::StopOutcome::BlockedHandoff { .. } => {
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "the current-pair stop never granted — the compact's \
+                             guard never released its attach window"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                    other => panic!("the current-pair stop must begin: {other:?}"),
+                }
+            }
+        };
+        assert_eq!(
+            registry.commit_stop(PROVIDER, "ses_q6", "op-q6-advance", stop_gen),
+            freshell_ownership::CommitOutcome::Committed
+        );
+        seed_live_fresh_owner(&registry, "ses_q6");
+        let still_no_early = drain_frames(&mut rx);
+        assert!(
+            !still_no_early
+                .iter()
+                .any(|f| f["type"] == "error" && f["requestId"] == "req-valid at enqueue"),
+            "the advancement alone refuses nothing — the queue holds the entry: {still_no_early:?}"
+        );
+
+        // (5) Release the mutex: the settle completes, the drain runs,
+        // and the captured pair is validated ATOMICALLY — the
+        // advanced-past entry is refused AT DRAIN, TYPED and
+        // REQUEST-CORRELATED: a top-level `error` frame carrying its
+        // requestId. The wire `error.code` is always INTERNAL_ERROR (the
+        // send_error idiom); the typed code rides in the MESSAGE —
+        // assert the requestId and the guard's stale wording
+        // (STALE_OP_GUARD_MESSAGE) in the message, never a wire code.
+        drop(session_guard);
         let frames = frames_until(&mut rx, |f| {
-            f["type"] == "error" && f["requestId"] == "req-stale one"
+            f["type"] == "error" && f["requestId"] == "req-valid at enqueue"
         })
         .await;
         assert!(
@@ -20000,22 +20112,22 @@ mod tests {
                 .to_string()
                 .to_lowercase()
                 .contains("newer ownership generation")),
-            "the stale queued send refuses with the guard's stale-fence message: {frames:?}"
+            "the drain-time stale-fence refusal carries the guard's stale-fence message: {frames:?}"
         );
-        // (2) It never POSTs.
+        // (6) It never POSTs.
         assert!(
             !http
                 .recorded()
                 .iter()
-                .any(|r| r.url.contains("prompt_async") && r_body_contains(r, "stale one")),
+                .any(|r| r.url.contains("prompt_async") && r_body_contains(r, "valid at enqueue")),
             "the refused stale entry must never reach the prompt POST"
         );
-        // (3) The queue CONTINUES: the current entry drains and POSTs.
-        await_prompt_posted(&http, "current one").await;
+        // (7) The queue CONTINUES: the unfenced entry drains and POSTs.
+        await_prompt_posted(&http, "unfenced one").await;
         let session_arc = st.sessions.lock().await.get("ses_q6").cloned().unwrap();
         assert!(
             session_arc.lock().await.pending_sends.is_empty(),
-            "the refused entry was discarded; the current entry drained"
+            "the refused entry was discarded; the unfenced entry drained"
         );
     }
 
