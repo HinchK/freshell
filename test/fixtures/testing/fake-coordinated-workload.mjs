@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { spawn } from 'node:child_process'
 
 const payload = JSON.parse(process.argv[2] ?? '{}')
 const behaviorMap = JSON.parse(process.env.FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR ?? '{}')
@@ -14,9 +15,26 @@ if (captureFile) {
       selector: payload.selector,
       command: payload.command,
       args: payload.args,
+      pid: process.pid,
       active: process.env.FRESHELL_TEST_COORDINATOR_ACTIVE,
     })}\n`,
   )
+}
+
+if (behavior.spawnDescendant) {
+  const descendant = spawn(process.execPath, ['-e', 'setInterval(() => {}, 60000)'], {
+    stdio: 'ignore',
+  })
+  if (captureFile) {
+    await fs.appendFile(
+      captureFile,
+      `${JSON.stringify({
+        selector: payload.selector,
+        role: 'descendant',
+        pid: descendant.pid ?? null,
+      })}\n`,
+    )
+  }
 }
 
 if (behavior.stdout) {

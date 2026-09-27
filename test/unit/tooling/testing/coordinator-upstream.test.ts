@@ -77,6 +77,23 @@ async function readCaptureLines() {
     .map((line) => JSON.parse(line))
 }
 
+async function waitForCapturePid(selector: string, filter?: { role?: string }): Promise<number> {
+  const deadline = Date.now() + 10_000
+  let lastLines = ''
+  while (Date.now() < deadline) {
+    const raw = await fsp.readFile(captureFile, 'utf8').catch(() => '')
+    lastLines = raw
+    const parsed = raw.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    const match = parsed.find((entry) =>
+      entry.selector === selector && (!filter?.role || entry.role === filter.role))
+    if (typeof match?.pid === 'number' && match.pid > 0) {
+      return match.pid
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  throw new Error(`capture pid for ${selector}${filter?.role ? ` (role=${filter.role})` : ''} never appeared; last capture: ${lastLines}`)
+}
+
 describe('coordinator-upstream', () => {
   it('resolves the repo-local vitest entry module under process.execPath', () => {
     const command = resolveVitestCommand(REPO_ROOT)
@@ -281,4 +298,54 @@ describe('phase watchdog', () => {
       : 128 + osConstants.signals.SIGTERM
     expect(exitCode).toBe(expectedExitCode)
   }, 15_000)
+
+  it('settles promptly at the signal-mapped code when the child is killed outside the watchdog', async () => {
+    const exitPromise = runUpstreamPhase({
+      runner: 'npm',
+      script: 'test:balanced',
+      args: [],
+    }, fakeEnv({
+      'npm:test:balanced': { holdMs: 30_000 },
+    }, {
+      phaseWatchPollMs: '50',
+      phaseTimeoutMs: '10_000',
+    }))
+
+    const pid = await waitForCapturePid('npm:test:balanced')
+    expect(pid).toBeGreaterThan(0)
+
+    process.kill(pid, 'SIGKILL')
+
+    const expectedExitCode = process.platform === 'win32'
+      ? 1
+      : 128 + osConstants.signals.SIGKILL
+    await expect(exitPromise).resolves.toBe(expectedExitCode)
+  }, 20_000)
+
+  it('reaps the phase child AND its descendants when the watchdog kills on timeout', async () => {
+    ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true // the watchdog settle event logs to stderr
+    const exitPromise = runUpstreamPhase({
+      runner: 'npm',
+      script: 'test:balanced',
+      args: [],
+    }, fakeEnv({
+      'npm:test:balanced': { holdMs: 30_000, spawnDescendant: true },
+    }, {
+      phaseWatchPollMs: '25',
+      phaseTimeoutMs: '250',
+    }))
+
+    await expect(exitPromise).resolves.toBe(PHASE_WATCHDOG_EXIT_CODE)
+
+    const directPid = await waitForCapturePid('npm:test:balanced')
+    const descendantPid = await waitForCapturePid('npm:test:balanced', { role: 'descendant' })
+    expect(directPid).toBeGreaterThan(0)
+    expect(descendantPid).toBeGreaterThan(0)
+
+    // Both the direct child and its spawned descendant must be gone: the
+    // watchdog killed the whole tree, not just the wrapper.
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    expect(() => process.kill(directPid, 0)).toThrow()
+    expect(() => process.kill(descendantPid, 0)).toThrow()
+  }, 20_000)
 })
