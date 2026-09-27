@@ -576,15 +576,17 @@ describe('TerminalView stuck card (wedge-backstop LB-7 matrix)', () => {
     expect(paneState(store).terminalId).toBe(TID)
   })
 
-  // ── E: advisory guard ──
-  it('restart (arm E): bails with no kill when an opencode durable replacement is already in flight', async () => {
+  // ── E: retention-gap interaction (responsive-terminal-restore WS2) ──
+  it('restart (arm E): a retention gap fires no automatic kill — the explicit restart is the separate user-intent kill', async () => {
     const { store, paneContent } = makeStore({ stuck: { at: 123, terminalId: TID } })
     await renderPane(store, paneContent)
 
-    // Put the pane into the opencode replay-window replacement flow: the
-    // mount attach is a viewport_hydrate (sinceSeq 0), so an unrecoverable
-    // output gap arms pendingDurableReplacementRef and fires the
-    // replacement's OWN (reason-less) kill.
+    // The mount attach is a viewport_hydrate (sinceSeq 0) for an opencode
+    // pane with a durable session — the exact shape that used to arm the
+    // opencode durable-replacement flow and fire its own automatic
+    // reason-less kill. Since #822 (responsive-terminal-restore WS2) that
+    // auto-kill path is removed entirely: a retention gap is honest
+    // state, never a license to kill or replace a healthy process.
     const attach = sentFrames().find((m) => m.type === 'terminal.attach' && m.terminalId === TID)
     expect(attach).toMatchObject({ intent: 'viewport_hydrate', sinceSeq: 0 })
     await act(async () => {
@@ -597,17 +599,35 @@ describe('TerminalView stuck card (wedge-backstop LB-7 matrix)', () => {
         toSeq: 5,
       })
     })
-    const replacementKills = sentKills()
-    expect(replacementKills).toHaveLength(1)
-    expect(replacementKills[0]).not.toHaveProperty('reason')
+    // No replacement flow owns this pane's recovery anymore: the gap alone
+    // must emit NO kill and spawn NO replacement — reintroducing any
+    // automatic kill on a retention gap fails here (the negotiated-lane
+    // retention behavior is pinned by TerminalView.lifecycle).
+    expect(sentKills()).toHaveLength(0)
+    expect(sentFrames().filter((m) => m.type === 'terminal.create')).toHaveLength(0)
+    const afterGap = paneState(store)
+    expect(afterGap.status).toBe('running')
+    expect(afterGap.terminalId).toBe(TID)
+    expect(afterGap.pendingReconcile).toBeUndefined()
 
-    // The stuck card's restart must NOT add a second, reason-carrying kill:
-    // the replacement flow already owns this pane's recovery.
+    // The user's explicit restart is the separate user-intent kill ("Any
+    // explicit restart action remains separate user intent"): with no
+    // in-flight replacement to defer to, it proceeds and fires exactly ONE
+    // resumable stuck-recovery kill, carrying the observed fence pair
+    // (the gap did not disturb the fence source).
     await clickRestart()
-    expect(sentKills()).toHaveLength(1)
-    expect(sentKills().filter((m) => m.reason === 'stuck-recovery')).toHaveLength(0)
+    const kills = sentKills()
+    expect(kills).toHaveLength(1)
+    expect(kills[0]).toMatchObject({
+      type: 'terminal.kill',
+      terminalId: TID,
+      reason: 'stuck-recovery',
+      observedEpoch: FENCE_EPOCH,
+      observedGeneration: FENCE_GENERATION,
+    })
 
-    // The pane is untouched by the bail — the replacement flow drives it.
+    // Pre-ack the pane is untouched (the await-first discipline — the
+    // A/B/B' arms pin the full post-ack reset).
     const content = paneState(store)
     expect(content.status).toBe('running')
     expect(content.pendingReconcile).toBeUndefined()
