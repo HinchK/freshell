@@ -155,6 +155,29 @@ pub struct FileStat {
     pub size: u64,
 }
 
+/// The change token a direct-listed source's cheap per-sweep check yields:
+/// nanosecond mtime plus size. BOTH dimensions are load-bearing —
+///
+/// * `mtime_ns`: a millisecond-truncated mtime could not see a WAL append
+///   that landed in the same wall-clock millisecond as the cached token
+///   (the 2026-09-27 CI flake), deferring the re-list a full TTL window.
+///   `i64` ns-since-epoch holds until year 2262.
+/// * `size`: the kernel assigns inode mtimes from a coarse clock
+///   refreshed once per scheduling tick, and multigrain promotion only
+///   applies to a previously-queried inode — a freshly created WAL is
+///   never promoted — so a same-tick WAL creation can carry an IDENTICAL
+///   nanosecond mtime to the db's cached token. Size is assignment-clock
+///   immune: any real WAL append or creation changes a size.
+///
+/// Pinned by the two same-tick regression tests
+/// (`opencode_wal_move_within_the_same_millisecond_still_relists`,
+/// `opencode_wal_growth_with_an_unchanged_max_mtime_still_relists`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DirectToken {
+    pub mtime_ns: i64,
+    pub size: u64,
+}
+
 /// A provider's session enumeration source (claude/codex/opencode). Batch B
 /// ships [`ClaudeSource`] only; codex/opencode are additive `SessionSource`
 /// impls for Batch C — [`SessionIndex`] composes any number of sources
@@ -184,15 +207,16 @@ pub trait SessionSource: Send + Sync {
     /// session) can't fit the per-file `discover`/`parse` cache — there's no
     /// stable per-session path to key a [`FileEntry`] by. Instead, a
     /// direct-listed source returns `Some(token)` here: a cheap-to-compute
-    /// value (e.g. a file mtime) that changes if-and-only-if the underlying
-    /// data might have changed. [`SessionIndex`] calls this every sweep and
-    /// only calls [`Self::direct_list`] (the expensive query) when the token
-    /// differs from the one cached from the last successful listing.
+    /// [`DirectToken`] (nanosecond mtime + size) that changes if-and-only-if
+    /// the underlying data might have changed. [`SessionIndex`] calls this
+    /// every sweep and only calls [`Self::direct_list`] (the expensive
+    /// query) when the token differs from the one cached from the last
+    /// successful listing.
     ///
     /// `None` (the default) means "this is a file-based source" —
     /// `discover`/`parse` are used instead, and this method/`direct_list` are
     /// never called.
-    fn direct_change_token(&self) -> Option<i64> {
+    fn direct_change_token(&self) -> Option<DirectToken> {
         None
     }
 
@@ -772,16 +796,21 @@ impl SessionSource for OpencodeSource {
         Some("opencode")
     }
 
-    fn direct_change_token(&self) -> Option<i64> {
+    fn direct_change_token(&self) -> Option<DirectToken> {
         // The WAL wrinkle is load-bearing: sqlite in WAL mode (opencode's
         // default) can satisfy a write by appending to `opencode.db-wal`
         // ALONE, leaving `opencode.db`'s own mtime unchanged until the next
-        // checkpoint. Taking the max of both files' mtimes (0 for whichever
-        // doesn't exist) means a WAL-only write still changes the token.
+        // checkpoint. Watching BOTH files — max of the mtimes, sum of the
+        // sizes, missing file as (0, 0) — means a WAL-only write still
+        // changes the token. Both TOKEN dimensions are load-bearing too:
+        // see [`DirectToken`] (ms truncation + coarse clock assignment).
         let [db, wal] = self.provider.watched_database_paths();
-        let db_mtime = file_mtime_ms(&db).unwrap_or(0);
-        let wal_mtime = file_mtime_ms(&wal).unwrap_or(0);
-        Some(db_mtime.max(wal_mtime))
+        let (db_mtime, db_size) = stat_token_parts(&db).unwrap_or((0, 0));
+        let (wal_mtime, wal_size) = stat_token_parts(&wal).unwrap_or((0, 0));
+        Some(DirectToken {
+            mtime_ns: db_mtime.max(wal_mtime),
+            size: db_size + wal_size,
+        })
     }
 
     fn direct_list(&self) -> Result<Vec<IndexedSession>, String> {
@@ -911,11 +940,19 @@ fn opencode_token_usage(
     })
 }
 
-/// `fs::metadata(path).modified()` in milliseconds, `None` on any stat
-/// failure (including "doesn't exist") — used by [`OpencodeSource`]'s change
-/// token, which treats a missing file as mtime `0`.
-fn file_mtime_ms(path: &Path) -> Option<i64> {
-    stat_file(path).map(|s| s.mtime_ms)
+/// `fs::metadata(path)` into the two change-token dimensions — nanosecond
+/// mtime and size — in ONE stat call, `None` on any stat failure
+/// (including "doesn't exist"). Used by [`OpencodeSource`]'s change
+/// token, which treats a missing file as (mtime 0, size 0).
+fn stat_token_parts(path: &Path) -> Option<(i64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    Some((mtime_ns, meta.len()))
 }
 
 /// The injected-clock parameter [`OpencodeProvider::list_sessions`] wants
@@ -1953,10 +1990,11 @@ fn has_dirty_parts(
 
 /// One cached direct-listed source's last successful listing, keyed by
 /// source index in [`SessionIndex::direct_cache`]. Mirrors [`FileEntry`]'s
-/// role for file-based sources, but keyed by change-token instead of
-/// `(mtime, size)`, and holding a full `Vec` of sessions instead of one.
+/// role for file-based sources, but keyed by the source's change token
+/// ([`DirectToken`]) instead of a per-file `(mtime, size)` pair, and holding
+/// a full `Vec` of sessions instead of one.
 struct DirectEntry {
-    token: i64,
+    token: DirectToken,
     items: Vec<IndexedSession>,
 }
 
@@ -2760,7 +2798,7 @@ pub(crate) mod tests {
             self.inner.parse(path)
         }
 
-        fn direct_change_token(&self) -> Option<i64> {
+        fn direct_change_token(&self) -> Option<DirectToken> {
             // NOT counted: this is the cheap per-sweep check, analogous to
             // `discover()` for file-based sources -- the gating guard is
             // `direct_list_calls`, the expensive query.
@@ -4397,6 +4435,164 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&data_home).ok();
     }
 
+    /// The same-millisecond regression pin (the 2026-09-27 CI flake): a WAL
+    /// append that lands inside the SAME wall-clock millisecond as the
+    /// cached change token is a real write (fast sqlite commits do this on
+    /// fast hardware — the GitHub-runner reds), and the re-list must still
+    /// fire. Reproduced deterministically by pinning both files' mtimes to
+    /// KNOWN offsets inside one ms window, so no ms boundary can intervene:
+    /// db at +100µs, wal (written after the cold sweep) at +600µs. A
+    /// millisecond-truncated token floors both to the same ms and misses
+    /// the move; the nanosecond mtime dimension sees the +500µs.
+    #[tokio::test]
+    async fn opencode_wal_move_within_the_same_millisecond_still_relists() {
+        let data_home = opencode_data_home_with_sessions(
+            "opencode-same-ms-wal",
+            &[("ses_a", "/repo/a", "Session A", 1000, 5000)],
+        );
+        set_opencode_session_model(&data_home, "ses_a", OPENCODE_TEST_MODEL);
+        // A seed-time WAL (if the fixture ever leaves one) must not own the
+        // cached token — remove it so the cold sweep caches the DB's stat.
+        let _ = std::fs::remove_file(data_home.join("opencode.db-wal"));
+
+        // Pin the db's mtime to a KNOWN offset inside its ms window.
+        let db = data_home.join("opencode.db");
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let window_base_ns = (now_ns / 1_000_000) * 1_000_000;
+        let db_t = std::time::UNIX_EPOCH + Duration::from_nanos((window_base_ns + 100_000) as u64);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&db)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(db_t))
+            .unwrap();
+        // Readback canary: a filesystem that cannot hold the pinned
+        // precision self-identifies HERE with a clear message, instead of
+        // producing a misleading token failure later.
+        assert_eq!(
+            std::fs::metadata(&db).unwrap().modified().unwrap(),
+            db_t,
+            "the filesystem must hold sub-millisecond mtime precision for this pin"
+        );
+
+        let source =
+            std::sync::Arc::new(CountingWrapper::new(OpencodeSource::new(data_home.clone())));
+        let direct_list_calls = Arc::clone(&source.direct_list_calls);
+        let index = test_index_with_ttl(vec![source.clone()], Duration::from_millis(10));
+
+        // Cold snapshot: inline sweep caches the token from the db's pinned stat.
+        let snap = index.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(direct_list_calls.load(Ordering::SeqCst), 1);
+
+        // The WAL move: a real write, whose mtime lands +500µs after the
+        // db's — inside the same millisecond window.
+        let wal = data_home.join("opencode.db-wal");
+        std::fs::write(&wal, b"wal-bytes-changed").unwrap();
+        let wal_t = std::time::UNIX_EPOCH + Duration::from_nanos((window_base_ns + 600_000) as u64);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(wal_t))
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&wal).unwrap().modified().unwrap(),
+            wal_t,
+            "the filesystem must hold sub-millisecond mtime precision for this pin"
+        );
+
+        tokio::time::sleep(Duration::from_millis(30)).await; // past the 10ms test TTL, deterministically stale
+        let _ = index.snapshot().await; // stale-while-revalidate detaches the re-list
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                direct_list_calls.load(Ordering::SeqCst) >= 2
+            })
+            .await,
+            "a sub-millisecond WAL move must still trigger the re-list"
+        );
+
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+
+    /// The coarse-clock regression pin (plan-review round 2): the kernel
+    /// assigns inode mtimes from a clock refreshed once per scheduling
+    /// tick, and multigrain promotion only applies to a previously-queried
+    /// inode — a freshly created WAL is never promoted — so a same-tick
+    /// WAL creation can carry an IDENTICAL nanosecond mtime to the db's
+    /// cached token. A mtime-only token (ms OR ns) then reports the source
+    /// unchanged forever. Pin that world deterministically: the wal's
+    /// mtime is set EXACTLY equal to the db's (the cached max), and only
+    /// its SIZE differs — the re-list must still fire.
+    #[tokio::test]
+    async fn opencode_wal_growth_with_an_unchanged_max_mtime_still_relists() {
+        let data_home = opencode_data_home_with_sessions(
+            "opencode-same-ns-wal",
+            &[("ses_a", "/repo/a", "Session A", 1000, 5000)],
+        );
+        set_opencode_session_model(&data_home, "ses_a", OPENCODE_TEST_MODEL);
+        let _ = std::fs::remove_file(data_home.join("opencode.db-wal"));
+
+        let db = data_home.join("opencode.db");
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let window_base_ns = (now_ns / 1_000_000) * 1_000_000;
+        let db_t = std::time::UNIX_EPOCH + Duration::from_nanos((window_base_ns + 100_000) as u64);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&db)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(db_t))
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&db).unwrap().modified().unwrap(),
+            db_t,
+            "the filesystem must hold sub-millisecond mtime precision for this pin"
+        );
+
+        let source =
+            std::sync::Arc::new(CountingWrapper::new(OpencodeSource::new(data_home.clone())));
+        let direct_list_calls = Arc::clone(&source.direct_list_calls);
+        let index = test_index_with_ttl(vec![source.clone()], Duration::from_millis(10));
+
+        let snap = index.snapshot().await; // cold: token = (db_t ns, db size)
+        assert_eq!(snap.len(), 1);
+        assert_eq!(direct_list_calls.load(Ordering::SeqCst), 1);
+
+        // The same-tick WAL creation: mtime pinned EXACTLY equal to the
+        // cached max; the size dimension is the only witness.
+        let wal = data_home.join("opencode.db-wal");
+        std::fs::write(&wal, b"wal-bytes-changed").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(db_t))
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&wal).unwrap().modified().unwrap(),
+            db_t,
+            "the filesystem must hold the pinned mtime exactly for this pin"
+        );
+
+        tokio::time::sleep(Duration::from_millis(30)).await; // past the 10ms test TTL, deterministically stale
+        let _ = index.snapshot().await; // stale-while-revalidate detaches the re-list
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                direct_list_calls.load(Ordering::SeqCst) >= 2
+            })
+            .await,
+            "a WAL growth with an unchanged max mtime must still trigger the re-list"
+        );
+
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+
     /// Direct-arm twin of the file-backed content-identical rule
     /// (`content_identical_rewrite_reparses_without_bumping_generation`):
     /// a WAL-move re-list whose items are byte-identical to the cached
@@ -5528,8 +5724,11 @@ pub(crate) mod tests {
                 Some("opencode")
             }
             // CONSTANT token: the underlying mtimes never move in this test.
-            fn direct_change_token(&self) -> Option<i64> {
-                Some(42)
+            fn direct_change_token(&self) -> Option<DirectToken> {
+                Some(DirectToken {
+                    mtime_ns: 42,
+                    size: 0,
+                })
             }
             fn direct_list(&self) -> Result<Vec<IndexedSession>, String> {
                 if self.0.load(std::sync::atomic::Ordering::SeqCst) {

@@ -942,7 +942,7 @@ mod tests {
     use tower::ServiceExt;
 
     use freshell_sessions::directory_index::{
-        FileStat, IndexedSession, SessionIndex, SessionSource,
+        DirectToken, FileStat, IndexedSession, SessionIndex, SessionSource,
     };
 
     const CLAUDE_ID: &str = "ed2afda6-a340-443e-ba60-024a1b3554b4";
@@ -958,8 +958,11 @@ mod tests {
         fn parse(&self, _path: &std::path::Path) -> Option<IndexedSession> {
             None
         }
-        fn direct_change_token(&self) -> Option<i64> {
-            Some(1)
+        fn direct_change_token(&self) -> Option<DirectToken> {
+            Some(DirectToken {
+                mtime_ns: 1,
+                size: 0,
+            })
         }
         fn direct_list(&self) -> Result<Vec<IndexedSession>, String> {
             Ok(self.0.clone())
@@ -1011,11 +1014,13 @@ mod tests {
         fn provider_name(&self) -> Option<&'static str> {
             Some("opencode")
         }
-        fn direct_change_token(&self) -> Option<i64> {
-            Some(
-                self.counter
+        fn direct_change_token(&self) -> Option<DirectToken> {
+            Some(DirectToken {
+                mtime_ns: self
+                    .counter
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
-            )
+                size: 0,
+            })
         }
         fn direct_list(&self) -> Result<Vec<IndexedSession>, String> {
             if self.broken.load(std::sync::atomic::Ordering::SeqCst) {
