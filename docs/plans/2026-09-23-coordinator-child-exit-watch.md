@@ -32,7 +32,8 @@
 - Structured events go to stderr as JSONL matching the existing `scripts/testing/run-rust-tests.ts` idiom: `{ severity, event, timestamp, ...fields }` with a stable snake_case event name.
 - Preserve existing coordinator behavior exactly where this plan does not change it: numeric exit-code passthrough, `128 + signal` mapping, spawn `error` → promise rejection (exit 1 at the run level), holder release via `clearHolderIfRunIdMatches` in the `finally` of `runCoordinatedCommand`.
 - Exit-code semantics: 124 remains queue-wait timeout; 125 is the new watchdog-settled phase failure. A child that itself exits 125 is disambiguated by the `phase_watchdog_settled` JSONL event's `reason` field.
-- Threat model: honest mistakes by cooperating agents. On a phase timeout the watchdog kills only the process tree it spawned — the phase child and its descendants, discovered with the existing `process-tree.ts` helpers (`readProcessSnapshot` + `descendantPids`) — and must never signal foreign processes. The `child_vanished` path performs no killing (the child is already gone); descendants it may have left behind are unreachable post-mortem (a snapshot walk cannot start from a dead root pid) and remain a documented residual — the JSONL event carries the dead child's pid for forensics. The timeout kill takes a single snapshot pass; a descendant spawned in the instant between snapshot and kill is the accepted residual race.
+- Threat model: honest mistakes by cooperating agents. On a phase timeout the watchdog kills only the process tree it spawned — the phase child and its descendants, discovered with the existing `process-tree.ts` helpers (`readProcessSnapshot` + `descendantPids`) — and must never signal foreign processes. If the process-table snapshot itself fails, cleanup degrades to killing the direct child only and emits a `phase_watchdog_tree_kill_degraded` JSONL event (never silently). The `child_vanished` path performs no killing (the child is already gone); descendants it may have left behind are unreachable post-mortem (a snapshot walk cannot start from a dead root pid) and remain a documented residual — the JSONL event carries the dead child's pid for forensics. The timeout kill takes a single snapshot pass; a descendant spawned in the instant between snapshot and kill is the accepted residual race.
+- Lost-completion event-loop rule: on any watchdog settle, the ChildProcess handle is `unref()`ed before the phase settles, because the lost-completion failure class leaves the native exit callback undelivered — an unreferenced-free handle would keep the event loop alive forever and a process that only assigns `process.exitCode` (the coordinator's main entry) would never actually terminate, recreating the alive-but-idle incident shape even with the gate released.
 - Comments: brief, load-bearing only, matching existing repo style.
 - Work on the run worktree branch `the-usual/coordinator-child-exit-watch`; PR to main only after explicit user approval. No pushes of behavior changes to main.
 
@@ -113,7 +114,7 @@ describe('phase watchdog', () => {
       process.execPath,
       [FIXTURE_PATH, JSON.stringify({ selector: 'probe-test' })],
       fakeEnv({
-        default: { holdMs: 1_500 },
+        default: { holdMs: 30_000 },
       }, {
         phaseWatchPollMs: '25',
         // A large timeout proves the settle can only come from the vanish branch.
@@ -133,6 +134,15 @@ describe('phase watchdog', () => {
     // consecutive dead ticks the grace requires.
     expect(probeCalls.length).toBeGreaterThanOrEqual(2)
     expect(probeCalls.every((pid) => typeof pid === 'number' && pid > 0)).toBe(true)
+
+    // The probe lied about a child that is really alive: clean it up via the
+    // pid the probe observed so no 30s orphan lingers in the test run.
+    const realPid = probeCalls[0] as number
+    try {
+      process.kill(realPid, 'SIGKILL')
+    } catch {
+      // already exited
+    }
   }, 15_000)
 
   it('stays inert when the phase child exits on its own before any bound', async () => {
@@ -277,8 +287,17 @@ function killProcessTree(pid: number | undefined): void {
       }
     }
     return
-  } catch {
-    // Process-table snapshot unavailable: fall back to the direct child.
+  } catch (error) {
+    // Degraded cleanup: without a process-table snapshot only the direct
+    // child is reachable. Never silent — the event names what happened so a
+    // surviving-workload overlap can be classified instead of re-guessed.
+    console.error(JSON.stringify({
+      severity: 'warn',
+      event: 'phase_watchdog_tree_kill_degraded',
+      timestamp: new Date().toISOString(),
+      pid,
+      error: (error as Error).message,
+    }))
     try {
       process.kill(pid, 'SIGKILL')
     } catch {
@@ -354,6 +373,11 @@ export function spawnAndWait(
       if (reason === 'phase_timeout') {
         killProcessTree(child.pid)
       }
+      // In the lost-completion class the native exit callback never arrives,
+      // so the ChildProcess handle keeps an event-loop reference forever and
+      // a process that only assigns process.exitCode (like the coordinator's
+      // main entry) never terminates. Drop the reference so the loop drains.
+      child.unref()
       finish({ kind: 'code', code: PHASE_WATCHDOG_EXIT_CODE })
     }, pollMs)
 
@@ -587,6 +611,7 @@ git commit -m "test(coordinator): prove dead-child detection and full tree reapi
 
 **Files:**
 - Create: `test/integration/tooling/coordinator-watchdog-replay.test.ts`
+- Create: `test/fixtures/testing/watchdog-process-exit-driver.ts` (process-level lost-completion driver)
 - Modify: `config/vitest/vitest.runtime.config.ts` (add the new file to its explicit include list — the default vitest config excludes `test/integration/tooling/**`)
 - Modify: `AGENTS.md` (Test Coordination section: two lines for the new knobs)
 
@@ -735,10 +760,64 @@ describe('coordinator phase watchdog end to end', () => {
     expect(recorded?.repo.repoRoot).toBe(repo)
     expect(recorded?.repo.worktreePath).toBe(repo)
   })
+
+  it('terminates a whole process whose child completion was lost — no leaked event-loop handle', { timeout: 30_000 }, async () => {
+    // The lost-completion class is not externally fabricable through the real
+    // coordinator CLI (the liveness probe is not injectable across a
+    // process boundary), so this case proves the mechanism at process
+    // level: a driver process settles its phase through the child_vanished
+    // branch against a child that is really still alive, then must
+    // terminate by event-loop drain alone — a leaked ChildProcess handle
+    // (the native exit callback never arriving) would wedge it here.
+    const driverPath = path.resolve(__dirname, '../../fixtures/testing/watchdog-process-exit-driver.ts')
+
+    const result = await run(process.execPath, [tsxCli, driverPath, FIXTURE_PATH], REPO_ROOT, {
+      ...process.env,
+      FRESHELL_TEST_COORDINATOR_PHASE_WATCH_POLL_MS: '25',
+    })
+
+    expect(result.stdout).toContain('DRIVER_DONE')
+    expect(result.code).toBe(0)
+  })
 })
 ```
 
 The red-run shape is deliberate: with `holdMs: 5_000` and no watchdog yet in place, the coordinator at base waits out the child's clean 5s exit and finishes green, so the first case fails fast on `expect(outcome.code).toBe(125)` (expected 0, received green run) without wedging the test runner or leaking a 60-second child. After Tasks 1–2, the watchdog fires at ~400ms — long before the child's own exit — so the same behavior stays a genuine wedge for the watchdog to catch.
+
+Create the driver fixture at `test/fixtures/testing/watchdog-process-exit-driver.ts`:
+
+```typescript
+import process from 'node:process'
+
+import { PHASE_WATCHDOG_EXIT_CODE, spawnAndWait } from '../../../scripts/testing/coordinator-upstream.js'
+
+const fixturePath = process.argv[2]
+
+const exitCode = await spawnAndWait(
+  process.execPath,
+  [fixturePath, JSON.stringify({ selector: 'driver-child' })],
+  {
+    ...process.env,
+    FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({ default: { holdMs: 5_000 } }),
+  },
+  false,
+  // Simulate the lost-completion class: the OS-level liveness answer is
+  // "gone" while the child is really alive, so the native exit callback can
+  // never arrive to close the handle.
+  { livenessProbe: () => false },
+)
+
+if (exitCode !== PHASE_WATCHDOG_EXIT_CODE) {
+  console.error(`driver expected ${PHASE_WATCHDOG_EXIT_CODE}, got ${exitCode}`)
+  process.exit(1)
+}
+
+console.log('DRIVER_DONE')
+
+// No explicit process.exit: with the settled child's handle unreferenced,
+// the event loop drains and this process terminates on its own. A leaked
+// ChildProcess handle would keep it alive past any bound.
+```
 
 Before finalizing the file, the implementer must verify against the real source and adjust (these are load-bearing details, not trivia):
 - `tryListen`'s exact export name and result union (architecture report cites `coordinator-endpoint.ts:80-110`).
@@ -754,11 +833,13 @@ Also update `config/vitest/vitest.runtime.config.ts` — its include list is an 
     ],
 ```
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [ ] **Step 2: Run the test and verify the harness is honest (non-vacuous check)**
+
+Tasks 1–2 are already implemented when this task runs, so the e2e cases are expected to pass on their first run — they prove the Tasks 1–2 mechanisms end to end, and the lost-completion driver case proves the `unref()` event-loop rule at process level. Guard against a vacuous harness with a deliberate inversion: temporarily change the first case's `expect(outcome.code).toBe(125)` to `toBe(0)`, run the file, and confirm that case FAILS; restore the assertion and proceed.
 
 Run: `pnpm run test:vitest run test/integration/tooling/coordinator-watchdog-replay.test.ts --config config/vitest/vitest.runtime.config.ts`
 
-Expected: FAIL — at base the coordinator has no watchdog, so the wedge case's child exits cleanly after its 5s hold and the coordinator finishes green; the case fails fast on `expect(outcome.code).toBe(125)` (received 0), and the remaining assertions fail on the missing `phase_watchdog_settled` event. No test-runner wedge and no long-lived leaked children.
+Expected: the inverted assertion FAILS while the case runs (proving the wedge case observes real behavior); after restoring, all cases PASS, including `DRIVER_DONE` from the process-level lost-completion driver.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -791,7 +872,7 @@ Expected: PASS.
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add test/integration/tooling/coordinator-watchdog-replay.test.ts config/vitest/vitest.runtime.config.ts AGENTS.md
+git add test/integration/tooling/coordinator-watchdog-replay.test.ts test/fixtures/testing/watchdog-process-exit-driver.ts config/vitest/vitest.runtime.config.ts AGENTS.md
 git commit -m "test(coordinator): e2e incident replay proves the watchdog fails fast and frees the gate"
 ```
 
