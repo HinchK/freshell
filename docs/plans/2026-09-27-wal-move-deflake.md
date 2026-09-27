@@ -143,7 +143,7 @@ Run: `cargo test -p freshell-sessions --lib opencode_wal_move_within_the_same_mi
 
 Expected: FAIL after ~5s with `a sub-millisecond WAL move must still trigger the re-list` — the intended missing behavior, not a setup accident: the ms-truncated token (`file_mtime_ms`) floors both the cached db mtime (+100µs offset) and the wal mtime (+600µs offset) to the same millisecond, `refresh_snapshot`'s unchanged gate compares the tokens equal, and `direct_list` never runs (the counter stays 1 for the full 5s settle budget — the exact CI signature). If the test instead fails fast with a stat/set_times error or a `snap.len()`/readback assertion, STOP: that is a fixture/OS accident, not the intended red.
 
-Witness the intended failure before proceeding (the red alone cannot distinguish unchanged-gate suppression from a detached sweep that never ran — F-04): temporarily add `eprintln!("witness db_ms={} wal_ms={} db_ns={:?} wal_ns={:?}", file_mtime_ms(&db), file_mtime_ms(&wal), std::fs::metadata(&db).unwrap().modified(), std::fs::metadata(&wal).unwrap().modified());` as the first line inside the `wait_until` closure (or run once before it), rerun, and confirm the two ms values are EQUAL while the ns values differ by exactly 500_000 — the collision, witnessed. Remove the `eprintln!` before continuing (it must not be committed).
+Witness the intended failure before proceeding (the red alone cannot distinguish unchanged-gate suppression from a detached sweep that never ran — F-04): temporarily add `eprintln!("witness db_ms={:?} wal_ms={:?} db_ns={:?} wal_ns={:?}", file_mtime_ms(&db), file_mtime_ms(&wal), std::fs::metadata(&db).unwrap().modified(), std::fs::metadata(&wal).unwrap().modified());` as the first line inside the `wait_until` closure (or run once before it), rerun, and confirm the two ms values are EQUAL while the ns values differ by exactly 500_000 — the collision, witnessed. Remove the `eprintln!` before continuing (it must not be committed).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -231,12 +231,18 @@ Run (three invocations — cargo takes ONE positional filter each):
 
 Then the flake certification (house idiom: repeated runs, CI-like 2-core pin; the pre-fix evidence was 10/10 green locally so the certification must be strictly stronger than a single pass):
 
-5. Ten repeated 2-core-pinned runs of each of the three same-ms-relevant tests:
+5. Ten repeated 2-core-pinned runs of each of the three same-ms-relevant tests, failing closed on any failure (the certification substitutes for pre-PR CI proof, so its command status must be authoritative):
    ```bash
+   set -o pipefail; ok=1
    for t in opencode_wal_move_within_the_same_millisecond_still_relists opencode_wal_move_relists_without_rewalking_unchanged_sessions opencode_content_identical_relist_does_not_bump_generation; do
-     for i in $(seq 1 10); do taskset -c 0,1 cargo test -p freshell-sessions --lib "$t" > /tmp/wal-deflake-cert-$t-$i.log 2>&1 || { echo "FAIL $t run $i"; break 2; }; done; echo "10/10 $t"; done
+     for i in $(seq 1 10); do
+       taskset -c 0,1 cargo test -p freshell-sessions --lib "$t" > /tmp/wal-deflake-cert-$t-$i.log 2>&1 || { echo "FAIL $t run $i"; ok=0; break 2; }
+     done
+     echo "10/10 $t"
+   done
+   [ "$ok" = 1 ]
    ```
-   Expected: `10/10` for each of the three tests, zero failures.
+   Expected: `10/10` for each of the three tests, zero failures, and the command exits 0; any test failure prints its line and the command exits 1.
 6. One full 2-core-pinned crate pass: `taskset -c 0,1 cargo test -p freshell-sessions --lib` — Expected: PASS.
 
 - [ ] **Step 7: Run the broad gate**
