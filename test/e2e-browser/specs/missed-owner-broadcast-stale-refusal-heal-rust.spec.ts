@@ -18,6 +18,21 @@
  * A's pane (a terminalId new to the pane, the resumed marker, an input
  * round-trip) with NO page reload on either device.
  *
+ * THE LOAD-BEARING WIRE DIFFERENTIAL (focused episode 2): both claims are
+ * asserted on their OWN outbound wire frames (the page's framesent
+ * capture) — the refused recovery-create's terminal.create frame carried
+ * exactly the STALE click-time pair, and the healing attach's
+ * terminal.attach frame carries exactly the refusal's CURRENT pair
+ * (observedEpoch/observedGeneration — the client→server fence field
+ * names). The server's attach path still accepts an UNFENCED attach by
+ * substituting a freshly observed server-side pair
+ * (crates/freshell-ws/src/terminal.rs's adopt_fence None arm), so absence
+ * of terminal_attach_refused rows alone proves nothing: a client
+ * regression that omits both observed fields would attach through that
+ * legacy fallback with zero refusal logs. The outbound-pair assertions
+ * close exactly that hole — neither an omitted-field regression nor a
+ * still-stale pair can satisfy them; only the actual refusal-fold heals.
+ *
  * WHY THE SEAM (Path B; the Path A offline window is unstageable): every
  * (re)connect resets and re-folds the server's authoritative
  * runtimeOwners ready-replay (src/lib/fresh-agent-ws.ts
@@ -228,19 +243,26 @@ async function newDeviceContext(browser: Browser): Promise<BrowserContext> {
  * Open one device's page against the owned server and wait for the harness.
  * `freezeFence` arms the default-off test-only seam on THIS page load only
  * (the missed-owner-broadcast condition); `receivedFrames` (optional)
- * captures the page's inbound WS frames for wire-level assertions.
+ * captures the page's inbound WS frames and `sentFrames` (optional) its
+ * OUTBOUND frames (full JSON payloads, nothing stripped) for wire-level
+ * assertions on the claims the client itself sends.
  */
 async function openDevicePage(
   context: BrowserContext,
   info: E2eServerInfo,
-  opts?: { freezeFence?: boolean; receivedFrames?: Array<Record<string, any>> },
+  opts?: {
+    freezeFence?: boolean
+    receivedFrames?: Array<Record<string, any>>
+    sentFrames?: Array<Record<string, any>>
+  },
 ): Promise<{ page: Page; harness: TestHarness }> {
   const page = await context.newPage()
-  if (opts?.receivedFrames) {
+  if (opts?.receivedFrames || opts?.sentFrames) {
     const ownedWsOrigin = info.baseUrl.replace(/^http/, 'ws')
     page.on('websocket', (socket) => {
       if (!socket.url().startsWith(ownedWsOrigin)) return
       socket.on('framereceived', ({ payload }) => {
+        if (!opts.receivedFrames) return
         try {
           const frame = JSON.parse(String(payload))
           if (frame && typeof frame === 'object' && !Array.isArray(frame)) {
@@ -248,6 +270,17 @@ async function openDevicePage(
           }
         } catch {
           // Ignore protocol frames that are not JSON.
+        }
+      })
+      socket.on('framesent', ({ payload }) => {
+        if (!opts.sentFrames) return
+        try {
+          const frame = JSON.parse(String(payload))
+          if (frame && typeof frame === 'object' && !Array.isArray(frame)) {
+            opts.sentFrames.push(frame as Record<string, any>)
+          }
+        } catch {
+          // Ignore protocol frames that are not JSON (binary, ping/pong).
         }
       })
     })
@@ -318,9 +351,13 @@ test.describe('Missed owner broadcast: typed stale-refusal heal (rust only)', ()
       // A loads WITH the seam flag (it must miss the reopen's commit
       // broadcast); B loads clean (its own kill + reopen behave normally).
       const aFrames: Array<Record<string, any>> = []
+      // A's OUTBOUND frames — the wire-level record of the two claims this
+      // spec pins: the refused recovery-create and the healing attach.
+      const aSentFrames: Array<Record<string, any>> = []
       const deviceA = await openDevicePage(deviceACtx, info, {
         freezeFence: true,
         receivedFrames: aFrames,
+        sentFrames: aSentFrames,
       })
       const deviceB = await openDevicePage(deviceBCtx, info)
       expect(await deviceA.page.evaluate(() => localStorage.getItem('freshell.device-id.v2')))
@@ -463,6 +500,21 @@ test.describe('Missed owner broadcast: typed stale-refusal heal (rust only)', ()
       //    observed pair and the server REFUSES it typed — the
       //    coordinator's own telemetry proves the refusal AND the
       //    staleness (observed_generation < generation, same epoch).
+      //    The click-time fence snapshot + the outbound-frames watermark
+      //    arm the wire-level differential: the recovery create's own
+      //    outbound frame must carry exactly this snapshot's pair (the
+      //    pre-reopen observed values), and everything A sends from here
+      //    on is the healing window (create → reconcile → attach).
+      const aFenceAtClick = await deviceA.page.evaluate(
+        (sessionId: string) =>
+          (window as any).__FRESHELL_TEST_HARNESS__?.getState?.()?.freshAgent?.runtimeOwners?.[sessionId] ?? null,
+        `codex:${CODEX_SESSION_ID}`,
+      )
+      expect(
+        aFenceAtClick,
+        "A's pane fence at click time (the stale vacant-record pair the recovery create must carry)",
+      ).not.toBe(null)
+      const aSentAtClick = aSentFrames.length
       await reopenButton.click()
       // The wire create's coordinator claim mints operation ids as
       // `term-create-<requestId>` (crates/freshell-ws/src/terminal.rs's
@@ -481,6 +533,46 @@ test.describe('Missed owner broadcast: typed stale-refusal heal (rust only)', ()
       expect(refusalRow.failure_reason).toBe('STALE_GENERATION')
       expect(refusalRow.observed_epoch).toBe(refusalRow.epoch)
       expect(refusalRow.observed_generation).toBeLessThan(refusalRow.generation)
+
+      // 6b. THE REFUSED CLAIM'S OWN OUTBOUND WIRE FRAME — the recovery
+      //     create's terminal.create carried exactly the STALE pair that
+      //     was sitting in A's fence at click time, i.e. exactly the
+      //     observed_* pair the server's refusal row records receiving:
+      //     the claim was FENCED, and fenced STALE. The createRequestId is
+      //     preserved across the recovery reset (resetPaneForReconcileCreate
+      //     never re-mints it), so the post-click slice isolates the
+      //     recovery create from A's original step-1 create. A client
+      //     regression that drops the observed fields fails here
+      //     (undefined ≠ the stale pair) instead of slipping through.
+      const refusedCreateClaims = aSentFrames
+        .slice(aSentAtClick)
+        .filter((f) => f.type === 'terminal.create' && f.requestId === aCreateRequestId)
+      expect(
+        refusedCreateClaims.length,
+        "A's post-click outbound terminal.create claims for its own createRequestId (the recovery create)",
+      ).toBeGreaterThan(0)
+      for (const claim of refusedCreateClaims) {
+        expect(
+          claim.observedEpoch,
+          "the refused create claim carries A's click-time fence epoch",
+        ).toBe(aFenceAtClick.epoch)
+        expect(
+          claim.observedGeneration,
+          "the refused create claim carries A's click-time fence generation",
+        ).toBe(aFenceAtClick.generation)
+        expect(
+          claim.observedEpoch,
+          'the refused create claim carries the epoch the server recorded as observed_epoch',
+        ).toBe(refusalRow.observed_epoch)
+        expect(
+          claim.observedGeneration,
+          'the refused create claim carries the generation the server recorded as observed_generation',
+        ).toBe(refusalRow.observed_generation)
+        expect(
+          claim.observedGeneration,
+          "the refused claim's pair is genuinely STALE (older than the refusal's current generation)",
+        ).toBeLessThan(refusalRow.generation)
+      }
 
       // 7. THE FOLD, observed directly in the browser: the refusal's
       //    CURRENT pair entered A's runtimeOwners fence (merge-only — the
@@ -511,9 +603,37 @@ test.describe('Missed owner broadcast: typed stale-refusal heal (rust only)', ()
       //    refused create is handed to the single-pane reconcile whose
       //    Attach verdict points A's pane at B's live terminal; the wire
       //    attach re-reads the fence at send time and carries the FRESH
-      //    (folded) pair — a stale pair would have been refused by the
-      //    attach's atomic adopt (the fold's behavioral proof: zero
-      //    terminal_attach_refused rows for this session, ever).
+      //    (folded) pair. THE LOAD-BEARING ASSERTION (focused episode 2):
+      //    the healing attach's OWN outbound wire frame must carry
+      //    observedEpoch/observedGeneration == the refusal's CURRENT pair.
+      //    The Rust attach path still accepts an UNFENCED attach by
+      //    substituting a freshly observed server-side pair, so zero
+      //    terminal_attach_refused rows alone would prove nothing — a
+      //    client regression that omits both observed fields (or never
+      //    folds the fresh pair) fails HERE, not at the server telemetry.
+      const healingAttach: Record<string, any> = await expect
+        .poll(
+          async () =>
+            aSentFrames
+              .slice(aSentAtClick)
+              .find((f) => f.type === 'terminal.attach' && f.terminalId === secondTerminalId) ?? null,
+          { timeout: 30_000, message: "A's healing attach onto B's live terminal never went out" },
+        )
+        .not.toBeNull()
+        .then(
+          () =>
+            aSentFrames
+              .slice(aSentAtClick)
+              .find((f) => f.type === 'terminal.attach' && f.terminalId === secondTerminalId)!,
+        )
+      expect(
+        healingAttach.observedEpoch,
+        "the healing attach is FENCED — an omitted observedEpoch would fall through the server's unfenced-attach fallback (focused episode 2)",
+      ).toBe(refusalRow.epoch)
+      expect(
+        healingAttach.observedGeneration,
+        "the healing attach carries the refusal's freshly folded generation — not A's stale click-time pair",
+      ).toBe(refusalRow.generation)
       await expect
         .poll(async () => (await aPane())?.content?.terminalId ?? null, { timeout: 30_000 })
         .toBe(secondTerminalId)
@@ -526,7 +646,7 @@ test.describe('Missed owner broadcast: typed stale-refusal heal (rust only)', ()
             row?.session_id === CODEX_SESSION_ID
             && String(row?.msg ?? '').includes('terminal_attach_refused'),
         ),
-        'the post-refusal attach armed at the freshly folded pair — a stale pair would have been refused (terminal_attach_refused)',
+        'server-side corroboration of the wire-level pair assertion above: the healing attach was never refused (a stale pair would have logged terminal_attach_refused)',
       ).toHaveLength(0)
       // The convergence attached A's pane onto B's terminal — A's pane
       // streams T2's buffer, which already carries the resumed marker
