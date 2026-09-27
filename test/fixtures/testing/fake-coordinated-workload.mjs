@@ -22,7 +22,10 @@ if (captureFile) {
 }
 
 if (behavior.spawnDescendant) {
-  const descendant = spawn(process.execPath, ['-e', 'setInterval(() => {}, 60000)'], {
+  // Bounded lease: the descendant self-terminates so an orphan can never
+  // outlive a failed test run; 30s is far beyond the watchdog's kill window,
+  // so the tree-reap coverage still exercises a live descendant.
+  const descendant = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 30000)'], {
     stdio: 'ignore',
   })
   if (captureFile) {
