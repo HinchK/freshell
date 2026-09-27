@@ -21,7 +21,7 @@
 
 **Goal:** A dispatched phase child that dies, hangs, or whose completion event is lost fails the coordinated run promptly (exit 125, JSONL evidence, gate released) instead of wedging the repo-wide test gate for hours.
 
-**Architecture:** Harden the single choke point every phase flows through — `spawnAndWait` in `scripts/testing/coordinator-upstream.ts` — with a poll-driven watchdog: every dispatched child gets a liveness/timeout watcher that settles the phase promise if the child is provably gone without an observed completion (the 2026-09-22 machine-suspend class) or has exceeded a bounded phase timeout (the alive-but-hung class). Failure plumbing is unchanged: a watchdog settle is just a nonzero phase exit code, which the existing `runPhases` → `runCoordinatedCommand` catch/finally path already records and releases the gate with. The kata's optional holder-reclaim is deliberately out of scope (see Out of Scope).
+**Architecture:** Harden the single choke point every phase flows through — `spawnAndWait` in `scripts/testing/coordinator-upstream.ts` — with a poll-driven watchdog: every dispatched child gets a liveness/timeout watcher that settles the phase promise when the phase exceeds a bounded timeout (the guaranteed wall-clock bound for every wedge class — an alive-but-hung child, or a child the parent can no longer observe at all) or when the child is provably gone without an observed completion (the prompt path for the 2026-09-22 machine-suspend class, where the child process was fully absent; a lingering unreaped zombie would instead be caught by the timeout bound). Failure plumbing is unchanged: a watchdog settle is just a nonzero phase exit code, which the existing `runPhases` → `runCoordinatedCommand` catch/finally path already records and releases the gate with. The kata's optional holder-reclaim is deliberately out of scope (see Out of Scope).
 
 **Tech Stack:** TypeScript (NodeNext/ESM), Node `child_process.spawn`, Vitest with real short-lived child processes via the existing `FRESHELL_TEST_COORDINATOR_FAKE_UPSTREAM` fixture seam.
 
@@ -478,11 +478,14 @@ git commit -m "test(coordinator): prove dead-child detection and timeout reaping
 
 **Files:**
 - Create: `test/integration/tooling/coordinator-watchdog-replay.test.ts`
+- Modify: `config/vitest/vitest.runtime.config.ts` (add the new file to its explicit include list — the default vitest config excludes `test/integration/tooling/**`)
 - Modify: `AGENTS.md` (Test Coordination section: two lines for the new knobs)
 
 **Interfaces:**
-- Consumes: Task 1–2 watchdog (env knobs), the fixture seam, `tsx` CLI (`require.resolve('tsx/cli')` — precedent `test/unit/config/sanitize-test-env.test.ts:10`), `buildCoordinatorEndpoint` + `tryListen` from `scripts/testing/coordinator-endpoint.js`, `getCoordinatorStoreDir` from `scripts/testing/coordinator-store.js`, `readHolder` from `scripts/testing/coordinator-store.js`.
+- Consumes: Task 1–2 watchdog (env knobs), the fixture seam, `tsx` CLI (`require.resolve('tsx/cli')` — precedent `test/unit/config/sanitize-test-env.test.ts:10`), `buildCoordinatorEndpoint` + `tryListen` from `scripts/testing/coordinator-endpoint.js`, `getCoordinatorStoreDir` + `readHolder` from `scripts/testing/coordinator-store.js`.
 - Produces: the incident-replay proof (coordinator child fails fast, releases gate, records the failure) and the agent-facing documentation of the knobs.
+
+**Isolation contract (load-bearing, validated):** the spawned coordinator resolves its git repo context from `INIT_CWD` or `PWD` before ever consulting `process.cwd()` (`scripts/testing/repo-context.ts` `resolveInvocationCwd`, consumed by `resolveRepoInvocationCwd` in `test-coordinator.ts`). The child env therefore MUST set both `INIT_CWD` and `PWD` to the temp repo, or the e2e would bind to the real repo's shared coordinator gate and store. The run-record binding assertion below proves the isolation held.
 
 - [ ] **Step 1: Write the failing e2e test**
 
@@ -517,9 +520,9 @@ afterAll(async () => {
   await fsp.rm(tempRoot, { recursive: true, force: true })
 })
 
-function run(command: string, args: string[], cwd: string): Promise<{ code: number; stdout: string; stderr: string }> {
+function run(command: string, args: string[], cwd: string, env?: NodeJS.ProcessEnv): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd })
+    const child = spawn(command, args, { cwd, ...(env ? { env } : {}) })
     let stdout = ''
     let stderr = ''
     child.stdout.on('data', (chunk) => { stdout += String(chunk) })
@@ -554,6 +557,11 @@ interface CoordinatorOutcome {
 async function runCoordinatorIn(repo: string, commonDir: string, behavior: Record<string, unknown>): Promise<CoordinatorOutcome> {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
+    // Repo-context isolation: the coordinator resolves its git context from
+    // INIT_CWD/PWD before process.cwd(), so both must point at the temp repo
+    // or the e2e would bind to the real repo's shared gate and store.
+    INIT_CWD: repo,
+    PWD: repo,
     FRESHELL_TEST_COORDINATOR_FAKE_UPSTREAM: FIXTURE_PATH,
     FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify(behavior),
     FRESHELL_TEST_COORDINATOR_REPO_ROOT: REPO_ROOT,
@@ -563,7 +571,7 @@ async function runCoordinatorIn(repo: string, commonDir: string, behavior: Recor
   }
   delete env.FRESHELL_TEST_COORDINATOR_ACTIVE
 
-  const result = await run(process.execPath, [tsxCli, COORDINATOR_PATH, 'run', 'test'], repo)
+  const result = await run(process.execPath, [tsxCli, COORDINATOR_PATH, 'run', 'test'], repo, env)
   return { ...result, storeDir: getCoordinatorStoreDir(commonDir) }
 }
 
@@ -608,9 +616,15 @@ describe('coordinator phase watchdog end to end', () => {
     const outcome = await runCoordinatorIn(repo, commonDir, WEDGE_BEHAVIOR)
 
     expect(outcome.code).toBe(125)
-    const raw = await fsp.readFile(path.join(outcome.storeDir, 'latest-runs.json'), 'utf8')
-    const parsed = JSON.parse(raw) as { byKey: Record<string, { exitCode: number }> }
-    expect(Object.values(parsed.byKey).some((entry) => entry.exitCode === 125)).toBe(true)
+    const raw = await fsp.readFile(path.join(outcome.storeDir, 'command-runs.json'), 'utf8')
+    const parsed = JSON.parse(raw) as {
+      byKey: Record<string, { exitCode: number; repo: { repoRoot: string; worktreePath: string } }>
+    }
+    const recorded = Object.values(parsed.byKey).find((entry) => entry.exitCode === 125)
+    // Binding proof: the failure was recorded against the temp repo, not the
+    // real shared store — the isolation contract held end to end.
+    expect(recorded?.repo.repoRoot).toBe(repo)
+    expect(recorded?.repo.worktreePath).toBe(repo)
   })
 })
 ```
@@ -619,12 +633,21 @@ The red-run shape is deliberate: with `holdMs: 5_000` and no watchdog yet in pla
 
 Before finalizing the file, the implementer must verify against the real source and adjust (these are load-bearing details, not trivia):
 - `tryListen`'s exact export name and result union (architecture report cites `coordinator-endpoint.ts:80-110`).
-- `readHolder`'s exact signature/return type (it exists in `coordinator-store.ts` near `writeHolder`).
-- `latest-runs.json` filename — read the constant in `coordinator-store.ts` and use that exact name (do not invent one).
+- `readHolder`'s exact signature and return type (it exists in `coordinator-store.ts` near `writeHolder`).
+- The run-results file is `command-runs.json` (constant `COMMAND_RUNS_FILE`, `coordinator-store.ts:23`) with a `byKey` record map embedding the full run record — the binding assertion reads `repo.repoRoot`/`repo.worktreePath` from that record.
+
+Also update `config/vitest/vitest.runtime.config.ts` — its include list is an explicit file array (`test/integration/tooling/source-runtime-rust.test.ts` today) and the default vitest config excludes `test/integration/tooling/**`; add the new file so it actually runs in the runtime lane:
+
+```typescript
+    include: [
+      'test/integration/tooling/source-runtime-rust.test.ts',
+      'test/integration/tooling/coordinator-watchdog-replay.test.ts',
+    ],
+```
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `pnpm run test:vitest run test/integration/tooling/coordinator-watchdog-replay.test.ts --config config/vitest/vitest.config.ts`
+Run: `pnpm run test:vitest run test/integration/tooling/coordinator-watchdog-replay.test.ts --config config/vitest/vitest.runtime.config.ts`
 
 Expected: FAIL — at base the coordinator has no watchdog, so the wedge case's child exits cleanly after its 5s hold and the coordinator finishes green; the case fails fast on `expect(outcome.code).toBe(125)` (received 0), and the remaining assertions fail on the missing `phase_watchdog_settled` event. No test-runner wedge and no long-lived leaked children.
 
@@ -634,7 +657,7 @@ There is no new production code in this task if Tasks 1–2 are complete: the co
 
 - [ ] **Step 4: Run the focused test**
 
-Run: `pnpm run test:vitest run test/integration/tooling/coordinator-watchdog-replay.test.ts --config config/vitest/vitest.config.ts`
+Run: `pnpm run test:vitest run test/integration/tooling/coordinator-watchdog-replay.test.ts --config config/vitest/vitest.runtime.config.ts`
 
 Expected: PASS (all three cases).
 
@@ -650,16 +673,16 @@ Add the agent-facing knob documentation to `AGENTS.md` in the Test Coordination 
 - Phase-child watchdog: a dispatched phase child that wedges or whose completion signal is lost fails the run with exit 125 (JSONL `phase_watchdog_settled` on stderr) and releases the gate instead of holding it indefinitely. Knobs: `FRESHELL_TEST_COORDINATOR_PHASE_TIMEOUT_MS` (default 7200000 = 2h, hard per-phase cap; a hung child is SIGKILLed) and `FRESHELL_TEST_COORDINATOR_PHASE_WATCH_POLL_MS` (default 10000, liveness poll cadence; two consecutive dead polls settle a lost completion).
 ```
 
-Then run the full impacted set: the coordinator lane plus the new integration file.
+Then run the full impacted set: the coordinator unit lane (default config), the new integration file (runtime config), and typecheck.
 
-Run: `pnpm run test:vitest run test/unit/tooling/testing test/unit/scripts test/integration/tooling/coordinator-watchdog-replay.test.ts --config config/vitest/vitest.config.ts && pnpm run typecheck`
+Run: `pnpm run test:vitest run test/unit/tooling/testing test/unit/scripts --config config/vitest/vitest.config.ts && pnpm run test:vitest run test/integration/tooling/coordinator-watchdog-replay.test.ts --config config/vitest/vitest.runtime.config.ts && pnpm run typecheck`
 
 Expected: PASS.
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add test/integration/tooling/coordinator-watchdog-replay.test.ts AGENTS.md
+git add test/integration/tooling/coordinator-watchdog-replay.test.ts config/vitest/vitest.runtime.config.ts AGENTS.md
 git commit -m "test(coordinator): e2e incident replay proves the watchdog fails fast and frees the gate"
 ```
 
