@@ -123,7 +123,7 @@ describe('harness-06 fake kilroy runtime', () => {
     expect(types.indexOf('sdk.assistant')).toBeLessThan(types.indexOf('sdk.turn.complete'))
   })
 
-  it('failure knob yields result(error) and NO turn.complete edge', async () => {
+  it('failure knob yields result(error) AND the unified turn.complete edge (needs-attention)', async () => {
     const { rt } = await make({ FAKE_KILROY_FAIL_RESULT: '1' })
     rt.send({ type: 'create', requestId: 'r-1', cwd: '/tmp' })
     const created = (await rt.nextEvent('created')) as { sessionId: string }
@@ -132,11 +132,22 @@ describe('harness-06 fake kilroy runtime', () => {
     rt.send({ type: 'send', sessionId: created.sessionId, text: 'fail me' })
     const result = (await rt.nextEvent('sdk.result')) as { result: string }
     expect(result.result).not.toBe('success')
+    const complete = (await rt.nextEvent('sdk.turn.complete')) as { at: number }
+    expect(Number.isFinite(complete.at)).toBe(true)
+    expect((complete as { sessionId?: string }).sessionId).toBe(created.sessionId)
     await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
-    expect(rt.events().some((e) => (e as { type: string }).type === 'sdk.turn.complete')).toBe(false)
+    // Stream order mirrors the real sidecar: result -> edge -> idle. An error
+    // turn end rings the SAME unified attention edge a success would — the
+    // old success-only guard is gone (the fake now imports the REAL gate).
+    const types = rt.events().map((e) => (e as { type: string }).type)
+    expect(types.indexOf('sdk.turn.complete')).toBeGreaterThan(types.indexOf('sdk.result'))
+    expect(
+      rt.events().filter((e) => (e as { type: string }).type === 'sdk.turn.complete'),
+      'exactly one edge for the errored turn',
+    ).toHaveLength(1)
   })
 
-  it('interrupt surfaces sdk.exit (like an aborted SDK query) with NO completion', async () => {
+  it('interrupt on a HELD in-flight turn settles ok:true; the armed gate consumes the synthesized interrupted result — never an sdk.exit', async () => {
     const { rt } = await make({ FAKE_KILROY_HOLD_TURN: '1' })
     rt.send({ type: 'create', requestId: 'r-1', cwd: '/tmp' })
     const created = (await rt.nextEvent('created')) as { sessionId: string }
@@ -146,12 +157,79 @@ describe('harness-06 fake kilroy runtime', () => {
     await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'running')
 
     rt.send({ type: 'interrupt', sessionId: created.sessionId })
-    const exit = (await rt.nextEvent('sdk.exit')) as { sessionId: string }
-    expect(exit.sessionId).toBe(created.sessionId)
-    expect(rt.events().some((e) => (e as { type: string }).type === 'sdk.turn.complete')).toBe(false)
+    const settle = (await rt.nextEvent('sdk.interrupt_settled')) as { ok: boolean }
+    expect(settle.ok).toBe(true)
+    const result = (await rt.nextEvent('sdk.result')) as { result: string }
+    expect(result.result).toBe('error_during_execution')
+    await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
+
+    // TOTAL silence for the user-initiated interrupt: no attention edge on
+    // the wire — the armed gate consumed the interrupted turn's own result —
+    // and NEVER an sdk.exit (interrupt ends the TURN, not the session; the
+    // old fake's aborted-stream sdk.exit + session-drop was the stale
+    // pre-unification mirror).
+    expect(
+      rt.events().some((e) => (e as { type: string }).type === 'sdk.turn.complete'),
+      'a user-initiated interrupt rings no attention edge',
+    ).toBe(false)
+    expect(
+      rt.events().some((e) => (e as { type: string }).type === 'sdk.exit'),
+      'interrupt must never end the session',
+    ).toBe(false)
   })
 
-  it('crash knob kills the process mid-turn with NO completion edge', async () => {
+  it('interrupt during a scripted approval defers to the turn: forced non-success result, gate-consumed edge, and the NEXT turn rings', async () => {
+    const { rt } = await make({ FAKE_KILROY_APPROVAL: '1', FAKE_KILROY_APPROVAL_DELAY_MS: '1000' })
+    rt.send({ type: 'create', requestId: 'r-1', cwd: '/tmp' })
+    const created = (await rt.nextEvent('created')) as { sessionId: string }
+    await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
+
+    rt.send({ type: 'send', sessionId: created.sessionId, text: 'interrupt me mid-approval' })
+    await rt.nextEvent('sdk.turn.waiting')
+    // The turn is provably in flight (inside the approval await) — interrupt.
+    rt.send({ type: 'interrupt', sessionId: created.sessionId })
+    const settle = (await rt.nextEvent('sdk.interrupt_settled')) as { ok: boolean }
+    expect(settle.ok).toBe(true)
+    // The in-flight scripted completion lands with the forced non-success
+    // subtype; its ring is consumed by the armed gate.
+    const result = (await rt.nextEvent('sdk.result')) as { result: string }
+    expect(result.result).toBe('error_during_execution')
+    await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
+    expect(
+      rt.events().some((e) => (e as { type: string }).type === 'sdk.turn.complete'),
+      'the interrupted turn stays silent (the gate consumed its result)',
+    ).toBe(false)
+
+    // No stray mark survived the consumed interrupt: the NEXT turn on the
+    // same live session rings again (the accepted-interrupt mark is
+    // single-use by construction).
+    rt.send({ type: 'send', sessionId: created.sessionId, text: 'next unrelated turn' })
+    const complete = (await rt.nextEvent('sdk.turn.complete')) as { at: number }
+    expect(Number.isFinite(complete.at)).toBe(true)
+    await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
+    expect(
+      rt.events().filter((e) => (e as { type: string }).type === 'sdk.turn.complete'),
+      'exactly one edge — the next turn rings; the interrupt never did',
+    ).toHaveLength(1)
+  })
+
+  it('an interrupt with NOTHING in flight settles ok:true and arms nothing — the next turn still rings (task-004 F-I1 parity)', async () => {
+    const { rt } = await make()
+    rt.send({ type: 'create', requestId: 'r-1', cwd: '/tmp' })
+    const created = (await rt.nextEvent('created')) as { sessionId: string }
+    await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
+
+    rt.send({ type: 'interrupt', sessionId: created.sessionId })
+    const settle = (await rt.nextEvent('sdk.interrupt_settled')) as { ok: boolean }
+    expect(settle.ok).toBe(true)
+    await rt.nextEvent('sdk.status', (e) => (e as { status?: string }).status === 'idle')
+
+    rt.send({ type: 'send', sessionId: created.sessionId, text: 'next unrelated turn' })
+    const complete = (await rt.nextEvent('sdk.turn.complete')) as { at: number }
+    expect(Number.isFinite(complete.at)).toBe(true)
+  })
+
+  it('crash knob kills the process mid-turn with NO completion edge (the Rust death synthesis rings, not the fake)', async () => {
     const { rt } = await make({ FAKE_KILROY_CRASH_ON_SEND: '1' })
     rt.send({ type: 'create', requestId: 'r-1', cwd: '/tmp' })
     const created = (await rt.nextEvent('created')) as { sessionId: string }
@@ -162,6 +240,9 @@ describe('harness-06 fake kilroy runtime', () => {
       rt.proc.once('exit', (c) => resolve(c))
     })
     expect(code).toBe(3)
+    // A real crash screams no protocol frame — the fake must NOT mint an
+    // edge here or a real crash would double-ring (sidecar edge + the Rust
+    // unrequested-death synthesis). The RUST side rings for process death.
     expect(rt.events().some((e) => (e as { type: string }).type === 'sdk.turn.complete')).toBe(false)
   })
 

@@ -5,7 +5,15 @@ import { Provider } from 'react-redux'
 import tabsReducer, { setActiveTab } from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
-import turnCompletionReducer, { recordTurnComplete, clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
+import turnCompletionReducer, {
+  recordTurnComplete,
+  recordTerminalIdle,
+  clearTabAttention,
+  clearPaneAttention,
+} from '@/store/turnCompletionSlice'
+import { turnCompletionReceiptMiddleware } from '@/store/turnCompletionReceipt'
+import { paneSelectionMiddleware } from '@/lib/pane-focus-ownership'
+import { handleUiCommand } from '@/lib/ui-commands'
 import { useTurnCompletionNotifications } from '@/hooks/useTurnCompletionNotifications'
 import type { Tab, AttentionDismiss } from '@/store/types'
 
@@ -13,6 +21,10 @@ const playSound = vi.hoisted(() => vi.fn())
 
 vi.mock('@/hooks/useNotificationSound', () => ({
   useNotificationSound: () => ({ play: playSound }),
+}))
+
+vi.mock('@/lib/ui-screenshot', () => ({
+  captureUiScreenshot: vi.fn(),
 }))
 
 function TestComponent() {
@@ -50,6 +62,12 @@ function createStore(activeTabId = 'tab-1', attentionDismiss: AttentionDismiss =
       settings: settingsReducer,
       turnCompletion: turnCompletionReducer,
     },
+    // The app store clears watched-completion marks on tab (re)activation via
+    // this middleware — the watched-clear cases dispatch selection actions the
+    // same way the app does. DR5-3: the receipt-time watched stamp rides the
+    // same middleware chain the app store uses.
+    middleware: (getDefault) =>
+      getDefault().concat(paneSelectionMiddleware as never, turnCompletionReceiptMiddleware as never),
     preloadedState: {
       tabs: {
         tabs,
@@ -86,9 +104,11 @@ function createStore(activeTabId = 'tab-1', attentionDismiss: AttentionDismiss =
       turnCompletion: {
         seq: 0,
         lastAtByTerminalId: {},
+        lastIdleAtByTerminalId: {},
         pendingEvents: [],
         attentionByTab: {},
         attentionByPane: {},
+        watchedCompletionByTab: {},
       },
     },
   })
@@ -128,277 +148,540 @@ describe('useTurnCompletionNotifications', () => {
     }
   })
 
-  it('plays bell and marks attention when a background tab completes while focused', async () => {
-    const store = createStore('tab-1')
+  describe('fresh-agent partition (recordTurnComplete)', () => {
+    // ── DR5-3 (delta round 5): the receipt-time witness stamp ──────────────
+    //
+    // The watched classification must follow the witness state at
+    // EVENT-RECEIPT (the dispatch that queues the event), never the state at
+    // the passive effect's drain: a focus or active-tab change between the
+    // two must never re-classify an ending that already happened.
 
-    render(
-      <Provider store={store}>
-        <TestComponent />
-      </Provider>
-    )
+    it('a watched ending stays watched when focus/active-tab change before the drain (DR5-3)', async () => {
+      const store = createStore('tab-1')
 
-    act(() => {
-      store.dispatch(recordTurnComplete({ tabId: 'tab-2', paneId: 'pane-2', terminalId: 'term-2', at: 100 }))
-    })
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
 
-    await waitFor(() => {
-      expect(playSound).toHaveBeenCalledTimes(1)
-    })
-    expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
-    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
-  })
-
-  it('marks pane attention alongside tab attention on completion', async () => {
-    const store = createStore('tab-1')
-
-    render(
-      <Provider store={store}>
-        <TestComponent />
-      </Provider>
-    )
-
-    act(() => {
-      store.dispatch(recordTurnComplete({ tabId: 'tab-2', paneId: 'pane-2', terminalId: 'term-2', at: 100 }))
-    })
-
-    await waitFor(() => {
-      expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
-    })
-
-    expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
-    expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBe(true)
-  })
-
-  it('marks attention but does not play bell when the active tab completes while focused', async () => {
-    const store = createStore('tab-1', 'type')
-
-    render(
-      <Provider store={store}>
-        <TestComponent />
-      </Provider>
-    )
-
-    act(() => {
+      // RECEIPT: window focused + tab-1 active → watched=true stamped at
+      // dispatch time.
       store.dispatch(recordTurnComplete({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 'term-1', at: 100 }))
+
+      // The witness state changes BEFORE the effect drains: the window
+      // blurs and the user switches to another tab.
+      act(() => {
+        hasFocus = false
+        store.dispatch(setActiveTab('tab-2'))
+      })
+
+      await waitFor(() => {
+        expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+      })
+
+      // The treatment follows the RECEIPT-time witness state: the watched
+      // mark (tab strip only), no attention flags, no sound.
+      expect(store.getState().turnCompletion.watchedCompletionByTab['tab-1']).toBe(true)
+      expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBeUndefined()
+      expect(store.getState().turnCompletion.attentionByPane['pane-1']).toBeUndefined()
+      expect(playSound).not.toHaveBeenCalled()
     })
 
-    await waitFor(() => {
-      expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
-    })
-
-    expect(playSound).not.toHaveBeenCalled()
-    // Attention is always marked — in 'type' mode, cleared by typing
-    expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBe(true)
-  })
-
-  it('plays bell and marks attention when active tab completes while window is unfocused', async () => {
-    hasFocus = false
-    const store = createStore('tab-1')
-
-    render(
-      <Provider store={store}>
-        <TestComponent />
-      </Provider>
-    )
-
-    act(() => {
-      store.dispatch(recordTurnComplete({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 'term-1', at: 100 }))
-    })
-
-    await waitFor(() => {
-      expect(playSound).toHaveBeenCalledTimes(1)
-    })
-    expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBe(true)
-    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
-  })
-
-  it('does not drop completion when focus state transitions before blur listener updates (type mode)', async () => {
-    const store = createStore('tab-1', 'type')
-
-    render(
-      <Provider store={store}>
-        <TestComponent />
-      </Provider>
-    )
-
-    act(() => {
+    it('an unwitnessed ending stays unwitnessed when focus returns before the drain (DR5-3)', async () => {
+      // The inverse misclassification: receipt while UNFOCUSED (watched=
+      // false), focus returns before the drain — the ending was NOT
+      // witnessed and must still ring.
       hasFocus = false
-      store.dispatch(recordTurnComplete({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 'term-1', at: 100 }))
-    })
+      const store = createStore('tab-2')
 
-    await waitFor(() => {
-      expect(playSound).toHaveBeenCalledTimes(1)
-    })
-    expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBe(true)
-    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
-  })
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
 
-  it('marks attention on all tabs in burst completions', async () => {
-    const store = createStore('tab-1', 'type')
-
-    render(
-      <Provider store={store}>
-        <TestComponent />
-      </Provider>
-    )
-
-    act(() => {
-      store.dispatch(recordTurnComplete({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 'term-1', at: 100 }))
-      store.dispatch(recordTurnComplete({ tabId: 'tab-2', paneId: 'pane-2', terminalId: 'term-2', at: 200 }))
-    })
-
-    await waitFor(() => {
-      expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
-    })
-
-    // Sound plays once (for the background tab-2; active tab-1 skips sound)
-    expect(playSound).toHaveBeenCalledTimes(1)
-    // In 'type' mode, attention is marked on ALL tabs — cleared by typing only
-    expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBe(true)
-    expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
-  })
-
-  it('attention persists in type mode after switching tabs', async () => {
-    hasFocus = false
-    const store = createStore('tab-1', 'type')
-
-    render(
-      <Provider store={store}>
-        <TestComponent />
-      </Provider>
-    )
-
-    act(() => {
+      // RECEIPT: window unfocused → watched=false, even though tab-2 is
+      // active.
       store.dispatch(recordTurnComplete({ tabId: 'tab-2', paneId: 'pane-2', terminalId: 'term-2', at: 100 }))
-    })
 
-    await waitFor(() => {
+      // The witness state changes BEFORE the drain: the window regains
+      // focus.
+      act(() => {
+        hasFocus = true
+        window.dispatchEvent(new Event('focus'))
+      })
+
+      await waitFor(() => {
+        expect(playSound).toHaveBeenCalledTimes(1)
+      })
       expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
+      expect(store.getState().turnCompletion.watchedCompletionByTab['tab-2']).toBeUndefined()
     })
 
-    // Regain focus — in 'type' mode, attention should persist (only typing clears it)
-    act(() => {
-      hasFocus = true
-      window.dispatchEvent(new Event('focus'))
-    })
+    it('a terminal watched ending suppresses only the sound by the receipt-time stamp (DR5-3)', async () => {
+      const store = createStore('tab-1')
 
-    await waitFor(() => {
-      expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
-    })
-  })
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
 
-  it('click mode: attention persists on active tab until user switches away and back', async () => {
-    const store = createStore('tab-1', 'click')
+      // RECEIPT: focused + tab-1 active → the terminal idle edge is
+      // watched at receipt.
+      store.dispatch(recordTerminalIdle({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 't-1', at: 1_000, reason: 'grace' }))
 
-    render(
-      <Provider store={store}>
-        <TestComponent />
-      </Provider>
-    )
+      // The witness state changes BEFORE the drain.
+      act(() => {
+        hasFocus = false
+        store.dispatch(setActiveTab('tab-2'))
+      })
 
-    // Completion on active tab while focused — attention should persist (no auto-clear)
-    act(() => {
-      store.dispatch(recordTurnComplete({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 'term-1', at: 100 }))
-    })
+      await waitFor(() => {
+        expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+      })
 
-    await waitFor(() => {
-      expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
-    })
-    expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBe(true)
-    expect(store.getState().turnCompletion.attentionByPane['pane-1']).toBe(true)
-  })
-
-  it('click mode: attention persists through window blur/focus cycle without tab switch', async () => {
-    hasFocus = false
-    const store = createStore('tab-2', 'click')
-
-    render(
-      <Provider store={store}>
-        <TestComponent />
-      </Provider>
-    )
-
-    act(() => {
-      store.dispatch(recordTurnComplete({ tabId: 'tab-2', paneId: 'pane-2', terminalId: 'term-2', at: 100 }))
-    })
-
-    await waitFor(() => {
-      expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
-    })
-
-    // Regain focus without switching tabs — attention should persist
-    act(() => {
-      hasFocus = true
-      window.dispatchEvent(new Event('focus'))
-    })
-
-    // Give React a chance to flush effects
-    await waitFor(() => {
-      expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
-    })
-    expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBe(true)
-  })
-
-  it('click mode: clearTabAttention/clearPaneAttention actions clear attention state', async () => {
-    const store = createStore('tab-1', 'click')
-
-    render(
-      <Provider store={store}>
-        <TestComponent />
-      </Provider>
-    )
-
-    // Completion arrives on the active tab
-    act(() => {
-      store.dispatch(recordTurnComplete({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 'term-1', at: 100 }))
-    })
-
-    await waitFor(() => {
+      // Terminal partition, receipt-time-stamped: attention marks always;
+      // the sound is suppressed by the RECEIPT-time watched bit.
       expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBe(true)
+      expect(store.getState().turnCompletion.attentionByPane['pane-1']).toBe(true)
+      expect(playSound).not.toHaveBeenCalled()
     })
 
-    // Simulate clicking the already-active tab (dispatches setActiveTab with same value)
-    // This triggers the TabBar's onClick which should clear attention directly
-    act(() => {
-      store.dispatch(clearTabAttention({ tabId: 'tab-1' }))
-      store.dispatch(clearPaneAttention({ paneId: 'pane-1' }))
+    it('background completion: marks tab+pane attention and rings once', async () => {
+      const store = createStore('tab-1')
+
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
+
+      act(() => {
+        store.dispatch(recordTurnComplete({ tabId: 'tab-2', paneId: 'pane-2', terminalId: 'term-2', at: 100 }))
+      })
+
+      await waitFor(() => {
+        expect(playSound).toHaveBeenCalledTimes(1)
+      })
+      expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
+      expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
     })
 
-    expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBeUndefined()
-    expect(store.getState().turnCompletion.attentionByPane['pane-1']).toBeUndefined()
+    it('background completion marks pane attention alongside tab attention', async () => {
+      const store = createStore('tab-1')
+
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
+
+      act(() => {
+        store.dispatch(recordTurnComplete({ tabId: 'tab-2', paneId: 'pane-2', terminalId: 'term-2', at: 100 }))
+      })
+
+      await waitFor(() => {
+        expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+      })
+
+      expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
+      expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBe(true)
+    })
+
+    it('watched completion (focused window + active tab): marks ONLY the tab strip, no sound', async () => {
+      const store = createStore('tab-1')
+
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
+
+      act(() => {
+        store.dispatch(recordTurnComplete({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 'term-1', at: 100 }))
+      })
+
+      await waitFor(() => {
+        expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+      })
+
+      // The watched mark replaces the attention marks — attentionByTab also
+      // drives the sidebar row highlight, which must stay dark for a watched
+      // ending (and never light sibling sessions of a split tab).
+      expect(store.getState().turnCompletion.watchedCompletionByTab['tab-1']).toBe(true)
+      expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBeUndefined()
+      expect(store.getState().turnCompletion.attentionByPane['pane-1']).toBeUndefined()
+      expect(playSound).not.toHaveBeenCalled()
+    })
+
+    it('active-tab completion rings when the window is unfocused', async () => {
+      hasFocus = false
+      const store = createStore('tab-1')
+
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
+
+      act(() => {
+        store.dispatch(recordTurnComplete({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 'term-1', at: 100 }))
+      })
+
+      await waitFor(() => {
+        expect(playSound).toHaveBeenCalledTimes(1)
+      })
+      expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBe(true)
+      expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+    })
+
+    it('does not drop completion when focus state transitions before blur listener updates (type mode)', async () => {
+      const store = createStore('tab-1', 'type')
+
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
+
+      act(() => {
+        hasFocus = false
+        store.dispatch(recordTurnComplete({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 'term-1', at: 100 }))
+      })
+
+      await waitFor(() => {
+        expect(playSound).toHaveBeenCalledTimes(1)
+      })
+      expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBe(true)
+      expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+    })
+
+    it('mixed burst: the watched-tab event is silent, exactly one ring for the background event', async () => {
+      const store = createStore('tab-1', 'type')
+
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
+
+      act(() => {
+        store.dispatch(recordTurnComplete({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 'term-1', at: 100 }))
+        store.dispatch(recordTurnComplete({ tabId: 'tab-2', paneId: 'pane-2', terminalId: 'term-2', at: 200 }))
+      })
+
+      await waitFor(() => {
+        expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+      })
+
+      // Only the background event rings (the watched one is silent).
+      expect(playSound).toHaveBeenCalledTimes(1)
+      expect(store.getState().turnCompletion.watchedCompletionByTab['tab-1']).toBe(true)
+      expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBeUndefined()
+      expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
+      expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBe(true)
+    })
+
+    it('double-background burst rings once per event (two plays)', async () => {
+      const store = createStore('tab-1')
+
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
+
+      act(() => {
+        store.dispatch(recordTurnComplete({ tabId: 'tab-2', paneId: 'pane-2', terminalId: 'term-2', at: 100 }))
+        store.dispatch(recordTurnComplete({ tabId: 'tab-2', paneId: 'pane-3', terminalId: 'term-3', at: 200 }))
+      })
+
+      await waitFor(() => {
+        expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+      })
+
+      // Every unwitnessed fresh-agent event rings — no batch coalescing.
+      expect(playSound).toHaveBeenCalledTimes(2)
+      expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBe(true)
+      expect(store.getState().turnCompletion.attentionByPane['pane-3']).toBe(true)
+    })
+
+    it('watched mark clears when the user navigates away and back', async () => {
+      const store = createStore('tab-1', 'click')
+
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
+
+      act(() => {
+        store.dispatch(recordTurnComplete({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 'term-1', at: 100 }))
+      })
+
+      await waitFor(() => {
+        expect(store.getState().turnCompletion.watchedCompletionByTab['tab-1']).toBe(true)
+      })
+
+      // Navigate away — the mark survives the away leg alone.
+      act(() => {
+        store.dispatch(setActiveTab('tab-2'))
+      })
+      expect(store.getState().turnCompletion.watchedCompletionByTab['tab-1']).toBe(true)
+
+      // Come back — re-activation clears the watched mark.
+      act(() => {
+        store.dispatch(setActiveTab('tab-1'))
+      })
+      expect(store.getState().turnCompletion.watchedCompletionByTab['tab-1']).toBeUndefined()
+    })
+
+    it('watched mark survives a same-target re-click of the already-active tab', async () => {
+      const store = createStore('tab-1', 'click')
+
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
+
+      act(() => {
+        store.dispatch(recordTurnComplete({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 'term-1', at: 100 }))
+      })
+
+      await waitFor(() => {
+        expect(store.getState().turnCompletion.watchedCompletionByTab['tab-1']).toBe(true)
+      })
+
+      // Re-clicking the tab that is already active is not an away-and-back
+      // round trip — the mark clears only after the user navigates away
+      // and back.
+      act(() => {
+        store.dispatch(setActiveTab('tab-1'))
+      })
+      expect(store.getState().turnCompletion.watchedCompletionByTab['tab-1']).toBe(true)
+    })
+
+    it('watched mark survives an agent tab.select ui.command targeting the marked (already-active) tab', async () => {
+      const store = createStore('tab-1', 'click')
+
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
+
+      act(() => {
+        store.dispatch(recordTurnComplete({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 'term-1', at: 100 }))
+      })
+
+      await waitFor(() => {
+        expect(store.getState().turnCompletion.watchedCompletionByTab['tab-1']).toBe(true)
+      })
+
+      // The server-broadcast agent select-tab re-asserts the current tab —
+      // the user never navigated away, so the mark survives.
+      act(() => {
+        handleUiCommand({ type: 'ui.command', command: 'tab.select', payload: { id: 'tab-1' } }, store.dispatch)
+      })
+      expect(store.getState().turnCompletion.watchedCompletionByTab['tab-1']).toBe(true)
+    })
+
+    it('attention persists in type mode after switching tabs', async () => {
+      hasFocus = false
+      const store = createStore('tab-1', 'type')
+
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
+
+      act(() => {
+        store.dispatch(recordTurnComplete({ tabId: 'tab-2', paneId: 'pane-2', terminalId: 'term-2', at: 100 }))
+      })
+
+      await waitFor(() => {
+        expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
+      })
+
+      // Regain focus — in 'type' mode, attention should persist (only typing clears it)
+      act(() => {
+        hasFocus = true
+        window.dispatchEvent(new Event('focus'))
+      })
+
+      await waitFor(() => {
+        expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
+      })
+    })
+
+    it('clearTabAttention/clearPaneAttention actions clear attention state', async () => {
+      hasFocus = false
+      const store = createStore('tab-1', 'click')
+
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
+
+      // Unwitnessed completion on the active tab (window unfocused) — full attention.
+      act(() => {
+        store.dispatch(recordTurnComplete({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 'term-1', at: 100 }))
+      })
+
+      await waitFor(() => {
+        expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBe(true)
+      })
+
+      act(() => {
+        store.dispatch(clearTabAttention({ tabId: 'tab-1' }))
+        store.dispatch(clearPaneAttention({ paneId: 'pane-1' }))
+      })
+
+      expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBeUndefined()
+      expect(store.getState().turnCompletion.attentionByPane['pane-1']).toBeUndefined()
+    })
+
+    it('click mode: attention persists through window blur/focus cycle without tab switch', async () => {
+      hasFocus = false
+      const store = createStore('tab-2', 'click')
+
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
+
+      act(() => {
+        store.dispatch(recordTurnComplete({ tabId: 'tab-2', paneId: 'pane-2', terminalId: 'term-2', at: 100 }))
+      })
+
+      await waitFor(() => {
+        expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
+      })
+
+      // Regain focus without switching tabs — attention should persist
+      act(() => {
+        hasFocus = true
+        window.dispatchEvent(new Event('focus'))
+      })
+
+      // Give React a chance to flush effects
+      await waitFor(() => {
+        expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
+      })
+      expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBe(true)
+    })
+
+    it('click mode: switching to a tab with attention clears both tab and pane attention', async () => {
+      const store = createStore('tab-1', 'click')
+
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
+
+      // Background split tab completes on the NON-active pane (pane-3) as well as pane-2.
+      act(() => {
+        store.dispatch(recordTurnComplete({ tabId: 'tab-2', paneId: 'pane-2', terminalId: 'term-2', at: 100 }))
+        store.dispatch(recordTurnComplete({ tabId: 'tab-2', paneId: 'pane-3', terminalId: 'term-3', at: 100 }))
+      })
+
+      await waitFor(() => {
+        expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
+      })
+      expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBe(true)
+      expect(store.getState().turnCompletion.attentionByPane['pane-3']).toBe(true)
+
+      // Simulate switching to tab-2 (as TabBar click would)
+      act(() => {
+        store.dispatch(setActiveTab('tab-2'))
+      })
+
+      await waitFor(() => {
+        expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBeUndefined()
+      })
+      // BOTH panes clear on switch-in — not just the active one (Fresh-Eyes round 3).
+      expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBeUndefined()
+      expect(store.getState().turnCompletion.attentionByPane['pane-3']).toBeUndefined()
+    })
   })
 
-  it('click mode: switching to a tab with attention clears both tab and pane attention', async () => {
-    const store = createStore('tab-1', 'click')
+  describe('terminal partition (recordTerminalIdle) — today\'s behavior, unchanged', () => {
+    it('watched idle edge: marks tab+pane attention always, sound suppressed', async () => {
+      const store = createStore('tab-1', 'click')
 
-    render(
-      <Provider store={store}>
-        <TestComponent />
-      </Provider>
-    )
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
 
-    // Background split tab completes on the NON-active pane (pane-3) as well as pane-2.
-    act(() => {
-      store.dispatch(recordTurnComplete({ tabId: 'tab-2', paneId: 'pane-2', terminalId: 'term-2', at: 100 }))
-      store.dispatch(recordTurnComplete({ tabId: 'tab-2', paneId: 'pane-3', terminalId: 'term-3', at: 100 }))
+      act(() => {
+        store.dispatch(recordTerminalIdle({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 't-1', at: 1_000, reason: 'grace' }))
+      })
+
+      await waitFor(() => {
+        expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+      })
+
+      // Watched TERMINAL endings still mark attentionByTab+attentionByPane.
+      expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBe(true)
+      expect(store.getState().turnCompletion.attentionByPane['pane-1']).toBe(true)
+      expect(store.getState().turnCompletion.watchedCompletionByTab['tab-1']).toBeUndefined()
+      expect(playSound).not.toHaveBeenCalled()
     })
 
-    await waitFor(() => {
+    it('background idle edge: marks attention and rings', async () => {
+      const store = createStore('tab-1')
+
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
+
+      act(() => {
+        store.dispatch(recordTerminalIdle({ tabId: 'tab-2', paneId: 'pane-2', terminalId: 't-2', at: 1_000, reason: 'grace' }))
+      })
+
+      await waitFor(() => {
+        expect(playSound).toHaveBeenCalledTimes(1)
+      })
+      expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
+      expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBe(true)
+      expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+    })
+
+    it('terminal burst keeps ONE coalesced play per batch (watched event still marks attention)', async () => {
+      const store = createStore('tab-1')
+
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
+
+      act(() => {
+        store.dispatch(recordTerminalIdle({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 't-1', at: 1_000, reason: 'grace' }))
+        store.dispatch(recordTerminalIdle({ tabId: 'tab-2', paneId: 'pane-2', terminalId: 't-2', at: 2_000, reason: 'grace' }))
+      })
+
+      await waitFor(() => {
+        expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+      })
+
+      // The whole terminal batch coalesces into exactly ONE play() call.
+      expect(playSound).toHaveBeenCalledTimes(1)
+      // The watched terminal ending still marks tab+pane attention.
+      expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBe(true)
+      expect(store.getState().turnCompletion.attentionByPane['pane-1']).toBe(true)
       expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
     })
-    expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBe(true)
-    expect(store.getState().turnCompletion.attentionByPane['pane-3']).toBe(true)
-
-    // Simulate switching to tab-2 (as TabBar click would)
-    act(() => {
-      store.dispatch(setActiveTab('tab-2'))
-    })
-
-    await waitFor(() => {
-      expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBeUndefined()
-    })
-    // BOTH panes clear on switch-in — not just the active one (Fresh-Eyes round 3).
-    expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBeUndefined()
-    expect(store.getState().turnCompletion.attentionByPane['pane-3']).toBeUndefined()
   })
 })

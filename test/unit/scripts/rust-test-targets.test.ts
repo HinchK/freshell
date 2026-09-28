@@ -10,19 +10,7 @@ import {
   planToInvocation,
   type WorkspaceGraph,
 } from '../../../scripts/hooks/rust-test-targets.js'
-
-// The real tsx executable that the pre-push routing fixture stubs in. The
-// derivation must survive a checkout with NO git metadata: the Cloud Run
-// vitest image copies the source tree without `.git` (.dockerignore), so
-// the git common-dir probe fails there. A relative fallback path is not
-// merely wrong — the fixture stub `exec`s this path from the fixture repo,
-// so a relative path re-execs the stub itself in an infinite loop and
-// silently hangs the shard until the 30-minute job timeout.
-function owningTsxPath(gitCommonDirStdout: string, testDir: string): string {
-  const gitRoot = gitCommonDirStdout.trim().replace(/\/\.git$/, '')
-  const root = gitRoot || path.resolve(testDir, '..', '..', '..')
-  return path.resolve(root, 'node_modules', '.bin', 'tsx')
-}
+import { resolveOwningTsx } from '@test/helpers/tsx-stub-resolution'
 
 // Workspace fixture mirroring the real dependency directions:
 // server -> {ws, terminal, sessions, freshagent, protocol}
@@ -45,27 +33,14 @@ const graph: WorkspaceGraph = {
     'freshell-ws': ['freshell-protocol'],
     'freshell-terminal': [],
     'freshell-sessions': [],
-    'freshell-protocol': [],
-    'freshell-tauri': ['freshell-server'],
-  },
+     'freshell-protocol': [],
+     'freshell-tauri': ['freshell-server'],
+   },
 }
 
-describe('owningTsxPath', () => {
-  it('uses the git common dir root when git metadata is available', () => {
-    expect(owningTsxPath('/repo/.git\n', '/repo/test/unit/scripts')).toBe(
-      '/repo/node_modules/.bin/tsx',
-    )
-  })
-
-  it('falls back to the checkout root containing the test file when git metadata is absent (the cloud vitest image ships no .git)', () => {
-    expect(owningTsxPath('', '/app/test/unit/scripts')).toBe('/app/node_modules/.bin/tsx')
-  })
-
-  it('never returns a relative path (a relative tsx stub self-exec-loops in the fixture)', () => {
-    expect(path.isAbsolute(owningTsxPath('', '/app/test/unit/scripts'))).toBe(true)
-    expect(path.isAbsolute(owningTsxPath('/repo/.git\n', '/repo/test/unit/scripts'))).toBe(true)
-  })
-})
+// (The owningTsxPath unit block from the pnpm-era base was removed with the
+// helper in this merge: this branch's resolveOwningTsx supersedes it, and
+// its behavior is pinned in test/unit/scripts/tsx-stub-resolution.test.ts.)
 
 describe('computeRustTestPlan', () => {
   it('skips when nothing changed', () => {
@@ -246,14 +221,15 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
   // then exercise the hook's full chain regardless of the worktree's
   // install state (the hook passes the real rust-test-targets.ts path as
   // the script argument, so the stub only supplies the runtime).
-  const realTsx = (() => {
-    const commonDir = spawnSync(
-      'git',
-      ['rev-parse', '--path-format=absolute', '--git-common-dir'],
-      { cwd: import.meta.dirname, encoding: 'utf8', timeout: 15_000 },
-    )
-    return owningTsxPath(commonDir.stdout ?? '', import.meta.dirname)
-  })()
+  // The stub MUST embed an ABSOLUTE tsx path: the cloud test image ships
+  // no .git metadata, so plain git common-dir resolution yields a relative
+  // path there — and a relative stub exec's ITSELF inside the fixture repo
+  // in an infinite /bin/sh exec loop that freezes the worker (spawnSync
+  // blocks the event loop, so no vitest timeout ever fires). resolveOwningTsx
+  // falls back to a package.json walk-up in gitless checkouts, so the stub
+  // path is absolute in every environment (see
+  // test/unit/scripts/tsx-stub-resolution.test.ts).
+  const realTsx = resolveOwningTsx(import.meta.dirname)
 
   let fixtureRoot: string
   let baseSha: string
@@ -267,8 +243,13 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
   let npmrcSha: string
 
   function git(args: string[], opts: { cwd: string; stdin?: string } = { cwd: '' }): string {
-    const res = spawnSync('git', args, { cwd: opts.cwd, encoding: 'utf8', timeout: 30_000 })
-    if (res.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${res.stderr}`)
+    const res = spawnSync('git', args, { cwd: opts.cwd, encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' })
+    if (res.status !== 0 || res.error) {
+      const detail = res.error
+        ? `${res.error.message}${res.error.code === 'ETIMEDOUT' ? ' (timed out after 10s)' : ''}`
+        : res.stderr
+      throw new Error(`git ${args.join(' ')} failed: ${detail}`)
+    }
     return (res.stdout ?? '').trim()
   }
 
@@ -377,11 +358,20 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
       env: { ...process.env, ...extraEnv, FRESHELL_PREPUSH_DEBUG: '1' },
       encoding: 'utf8',
       cwd: fixtureRoot,
-      // A wedged hook child (the pre-fix tsx stub loop) must fail the test in
-      // bounded time, not hang the shard until the 30-minute job timeout.
+      // A hung hook (e.g. a stub exec-loop) blocks the event loop, so no
+      // vitest timeout can fire — this spawn timeout is the ONLY guard.
+      // Generous for real hook debug-mode runs; ETIMEDOUT surfaces below.
       timeout: 120_000,
+      killSignal: 'SIGKILL',
     })
-    return { status: res.status ?? -1, stderr: res.stderr ?? '' }
+    let stderr = res.stderr ?? ''
+    if (res.error) {
+      const timedOut = res.error.code === 'ETIMEDOUT'
+      stderr += `\nrunHook spawn failed: ${res.error.message}${
+        timedOut ? ' — hook invocation timed out after 120s (hook or tsx stub hung?)' : ''
+      }`
+    }
+    return { status: res.status ?? -1, stderr }
   }
 
   it('skips all checks for a docs-only range', () => {

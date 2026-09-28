@@ -14,6 +14,7 @@ const wsMocks = vi.hoisted(() => ({
   connect: vi.fn(() => Promise.resolve()),
   onMessage: vi.fn(() => vi.fn()),
   onReconnect: vi.fn(() => vi.fn()),
+  serverCapabilities: {} as Record<string, true | undefined>,
 }))
 
 const runtimeMocks = vi.hoisted(() => ({
@@ -78,6 +79,7 @@ vi.mock('@/lib/ws-client', () => ({
     onMessage: wsMocks.onMessage,
     onReconnect: wsMocks.onReconnect,
     connect: wsMocks.connect,
+    getServerCapabilities: () => wsMocks.serverCapabilities,
   })),
 }))
 
@@ -208,6 +210,7 @@ describe('TerminalView hidden-pane rebind (F8)', () => {
     vi.clearAllMocks()
     runtimeMocks.instances.length = 0
     hydrationMocks.registered.length = 0
+    wsMocks.serverCapabilities = {}
   })
 
   afterEach(() => {
@@ -215,7 +218,9 @@ describe('TerminalView hidden-pane rebind (F8)', () => {
   })
 
   it('terminal.created while HIDDEN registers for background hydration and attaches when triggered', () => {
-    // Pane starts in status 'creating' with no terminalId, hidden.
+    // Old-server fallback (no terminalLifetimeClaimV1 echo): today's exact
+    // behavior — the hydration queue's grant drives the hidden keepalive
+    // attach.
     renderTerminalView({
       paneContent: { ...baseTerminalContent, terminalId: undefined, status: 'creating', createRequestId: 'req-1' },
       hidden: true,
@@ -242,6 +247,7 @@ describe('TerminalView hidden-pane rebind (F8)', () => {
   })
 
   it('reveal after background rebind performs only surface hydration (no second attach when live)', () => {
+    // Old-server fallback shape (no claim echo).
     const { rerender } = renderTerminalView({
       paneContent: { ...baseTerminalContent, terminalId: undefined, status: 'creating', createRequestId: 'req-2' },
       hidden: true,
@@ -272,6 +278,7 @@ describe('TerminalView hidden-pane rebind (F8)', () => {
   })
 
   it('reconnect while hidden re-registers with queueIfStarted (the pump cannot wait for reveal)', () => {
+    // Old-server fallback shape (no claim echo).
     const { store } = renderTerminalView({
       paneContent: { ...baseTerminalContent, terminalId: 'term-3', status: 'running', createRequestId: 'req-3' },
       hidden: true,
@@ -314,5 +321,148 @@ describe('TerminalView hidden-pane rebind (F8)', () => {
       sinceSeq: 0,
       priority: 'background',
     })
+  })
+})
+
+describe('TerminalView hidden-pane lifetime claims (negotiated terminalLifetimeClaimV1)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    runtimeMocks.instances.length = 0
+    hydrationMocks.registered.length = 0
+    wsMocks.serverCapabilities = { terminalInterestV1: true, terminalLifetimeClaimV1: true }
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  it('terminal.created while HIDDEN sends NO attach and registers for NO hydration (claims only)', () => {
+    renderTerminalView({
+      paneContent: { ...baseTerminalContent, terminalId: undefined, status: 'creating', createRequestId: 'req-n1' },
+      hidden: true,
+    })
+    expect(sentFrames('terminal.create').length).toBeGreaterThanOrEqual(1)
+    deliverWsMessage({ type: 'terminal.created', requestId: 'req-n1', terminalId: 'term-n1', createdAt: Date.now() })
+
+    // Claims replace hydration: the pane registers with NO queue and sends
+    // NO attach and NO detach — the claim rides the interest snapshot.
+    expect(hydrationMocks.queue.register).not.toHaveBeenCalled()
+    expect(hydrationMocks.queue.onHydrationComplete).not.toHaveBeenCalled()
+    expect(sentFrames('terminal.attach')).toHaveLength(0)
+    expect(sentFrames('terminal.detach')).toHaveLength(0)
+  })
+
+  it('reveal after created-hidden attaches exactly once via fresh hydrate (no zero budget)', () => {
+    const { rerender, store } = renderTerminalView({
+      paneContent: { ...baseTerminalContent, terminalId: undefined, status: 'creating', createRequestId: 'req-n2' },
+      hidden: true,
+    })
+    deliverWsMessage({ type: 'terminal.created', requestId: 'req-n2', terminalId: 'term-n2', createdAt: Date.now() })
+    // Fold the created terminalId into the layout (mirrors production).
+    act(() => {
+      store.dispatch(updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: { ...baseTerminalContent, terminalId: 'term-n2', status: 'running', createRequestId: 'req-n2' },
+      }))
+    })
+    expect(sentFrames('terminal.attach')).toHaveLength(0)
+
+    wsMocks.send.mockClear()
+    rerender({
+      paneContent: { ...baseTerminalContent, terminalId: 'term-n2', status: 'running', createRequestId: 'req-n2' },
+      hidden: false,
+    })
+
+    // ONE fresh hydrate on reveal — no hidden attach ever preceded it.
+    const attaches = sentFrames('terminal.attach')
+    expect(attaches).toHaveLength(1)
+    expect(attaches[0]).toMatchObject({
+      terminalId: 'term-n2',
+      intent: 'viewport_hydrate',
+      sinceSeq: 0,
+    })
+    // No nominal zero-budget trick anywhere (zero is not wire-representable);
+    // the fresh hydrate carries today's real page-sized budget.
+    expect(attaches[0].maxReplayBytes).toBeGreaterThan(0)
+    // The attach is a foreground reveal, not a hidden keepalive.
+    expect(attaches[0].priority).toBe('foreground')
+  })
+
+  it('reconnect while HIDDEN (negotiated): no re-register, no attach; reveal attaches once', () => {
+    const { rerender, store } = renderTerminalView({
+      paneContent: { ...baseTerminalContent, terminalId: 'term-n3', status: 'running', createRequestId: 'req-n3' },
+      hidden: true,
+    })
+    expect(hydrationMocks.queue.register).not.toHaveBeenCalled()
+    expect(sentFrames('terminal.attach')).toHaveLength(0)
+
+    const reconnect = wsMocks.onReconnect.mock.calls.at(-1)?.[0]
+    expect(reconnect).toBeTypeOf('function')
+    act(() => { reconnect() })
+
+    // Negotiated: the claim (already in the interest snapshot) is the
+    // lifetime holder — no queue dance, no attach.
+    expect(hydrationMocks.queue.register).not.toHaveBeenCalled()
+    expect(hydrationMocks.queue.onHydrationComplete).not.toHaveBeenCalled()
+    expect(sentFrames('terminal.attach')).toHaveLength(0)
+
+    // Fold the terminalId into the layout (mirrors production) so the #534
+    // attach gate admits the reveal attach.
+    act(() => {
+      store.dispatch(updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: { ...baseTerminalContent, terminalId: 'term-n3', status: 'running', createRequestId: 'req-n3' },
+      }))
+    })
+    // Reveal attaches exactly once (fresh hydrate — no usable checkpoint on
+    // a never-attached surface).
+    wsMocks.send.mockClear()
+    rerender({
+      paneContent: { ...baseTerminalContent, terminalId: 'term-n3', status: 'running', createRequestId: 'req-n3' },
+      hidden: false,
+    })
+    const attaches = sentFrames('terminal.attach')
+    expect(attaches).toHaveLength(1)
+    expect(attaches[0]).toMatchObject({ terminalId: 'term-n3', intent: 'viewport_hydrate' })
+  })
+
+  it('status still flows to a HIDDEN claimed pane without attaching', () => {
+    const { store } = renderTerminalView({
+      paneContent: { ...baseTerminalContent, terminalId: 'term-n4', status: 'creating', createRequestId: 'req-n4' },
+      hidden: true,
+    })
+    deliverWsMessage({ type: 'terminal.created', requestId: 'req-n4', terminalId: 'term-n4', createdAt: Date.now() })
+    // Server broadcast status reaches the hidden pane's message handler and
+    // folds into pane content — no attach is involved.
+    deliverWsMessage({ type: 'terminal.status', terminalId: 'term-n4', status: 'running', attempt: undefined, maxAttempts: undefined, exitCode: undefined })
+    const content = store.getState().panes.layouts['tab-1']?.content as { status?: string }
+    expect(content.status).toBe('running')
+    expect(sentFrames('terminal.attach')).toHaveLength(0)
+  })
+
+  it('a stale fallback registration is inert after renegotiation (no hidden attach on grant)', () => {
+    // Downgrade-to-upgrade transition: the pane mounted on the OLD server
+    // (no claim echo) and registered for background hydration; the queue
+    // then grants the slot only after the connection re-negotiated with
+    // claims. A late grant must NOT attach a hidden pane under the
+    // negotiated regime.
+    wsMocks.serverCapabilities = {}
+    renderTerminalView({
+      paneContent: { ...baseTerminalContent, terminalId: 'term-n5', status: 'running', createRequestId: 'req-n5' },
+      hidden: true,
+    })
+    const entry = hydrationMocks.registered.at(-1)
+    expect(entry).toBeDefined()
+
+    // The server is upgraded and the connection re-negotiates with claims.
+    wsMocks.serverCapabilities = { terminalInterestV1: true, terminalLifetimeClaimV1: true }
+    wsMocks.send.mockClear()
+    act(() => { entry!.trigger() })
+
+    expect(sentFrames('terminal.attach')).toHaveLength(0)
+    // The stale registration is dropped, not left in the queue.
+    expect(hydrationMocks.queue.unregister).toHaveBeenCalledWith('pane-1')
   })
 })

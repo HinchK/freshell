@@ -108,6 +108,13 @@ import {
   type TerminalGeometryAuthority,
 } from '@/lib/terminal-surface-checkpoint'
 import {
+  beginRecoveryAttempt,
+  createTerminalRecoveryAccounting,
+  recordRecoveryProgress,
+  resetRecoveryAccounting,
+  type TerminalRecoveryAccounting,
+} from '@/lib/terminal-recovery-accounting'
+import {
   resolveRevealAttachPlan,
   type DeferredAttachReason,
   type TerminalAttachPriority,
@@ -126,6 +133,14 @@ import {
   type AttachSeqState,
   type OutputBatchAcceptedSegment,
 } from '@/lib/terminal-attach-seq-state'
+import {
+  beginPacedReplayConsumption,
+  pacedReplayConsumeThrough,
+  pacedReplayMarkReceived,
+  pacedReplayNextCredit,
+  pacedReplayOnReady,
+  type PacedReplayConsumptionState,
+} from '@/lib/paced-replay-consumption'
 import { useMobile } from '@/hooks/useMobile'
 import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 import { useKeyboardInset } from '@/hooks/useKeyboardInset'
@@ -224,7 +239,11 @@ const TOUCH_SCROLL_PIXELS_PER_LINE = 18
 const LIGHT_THEME_MIN_CONTRAST_RATIO = 4.5
 const DEFAULT_MIN_CONTRAST_RATIO = 1
 const MAX_LAST_SENT_VIEWPORT_CACHE_ENTRIES = 200
-const TRUNCATED_REPLAY_BYTES = 128 * 1024
+// One replay page (responsive-terminal-restore Workstream 1): the legacy
+// maxReplayBytes truncation budget and the paced replayPageBytes request are
+// deliberately the same 128 KiB — the paced path pages what the legacy path
+// truncated.
+const REPLAY_PAGE_BYTES = 128 * 1024
 const INPUT_BLOCKED_NOTICE_THROTTLE_MS = 2000
 const TERMINAL_OUTPUT_BATCH_BARRIER_REASONS = new Set([
   'control',
@@ -281,10 +300,18 @@ const xtermLogger: ILogger = {
   },
 }
 
-function viewportHydrateReplayOptions(content?: TerminalPaneContent | null): { maxReplayBytes: number } | undefined {
+function viewportHydrateReplayOptions(
+  content?: TerminalPaneContent | null,
+  pacedReplay?: boolean,
+): { maxReplayBytes: number } | { replayPageBytes: number } | undefined {
+  if (pacedReplay) {
+    // Negotiated: page-sized replay delivery on every hydrate, no byte-budget
+    // truncation (the paced path pages the whole retained window).
+    return { replayPageBytes: REPLAY_PAGE_BYTES }
+  }
   return content?.mode === 'opencode'
     ? undefined
-    : { maxReplayBytes: TRUNCATED_REPLAY_BYTES }
+    : { maxReplayBytes: REPLAY_PAGE_BYTES }
 }
 
 function buildSessionAssociationContentUpdates(
@@ -371,6 +398,14 @@ type StartupProbeReplayDiscardState = {
 type TerminalOutputSubmission = {
   submittedWrite: boolean
   submittedBytesEqualInput: boolean
+  /**
+   * M2 (task-4 review): the null-screen-effect pre-parsers fully consumed the
+   * frame — the exact `cleaned === ''` condition computed below. Distinguishes
+   * full pre-parser consumption from an enqueue failure (no write queue,
+   * disposed surface, thrown write): both yield `submittedWrite === false`,
+   * but only the former is genuine consumption.
+   */
+  preParserConsumedAllBytes: boolean
 }
 
 function resolveMinimumContrastRatio(theme?: { isDark?: boolean } | null): number {
@@ -483,19 +518,30 @@ type LaunchAttemptState = {
   attachReady: boolean
 }
 
-type PendingDurableReplacement = {
-  terminalId: string
-  requestId: string
-  reason: 'opencode_replay_window_exceeded'
-}
-
 type AttachTerminalOptions = {
   clearViewportFirst?: boolean
   suppressNextMatchingResize?: boolean
   skipPreAttachFit?: boolean
   maxReplayBytes?: number
+  /** Negotiated paced attaches only (viewportHydrateReplayOptions): the
+   *  page-size request carried instead of maxReplayBytes. */
+  replayPageBytes?: number
   priority?: TerminalAttachPriority
   sinceSeq?: number
+  /** Delivery-loss repair fallback (responsive-terminal-restore WS3):
+   *  attach as a full hydrate WITHOUT clearing the viewport first — the
+   *  surface is replaced only when the hydrate's content actually arrives
+   *  (the deferred content reset). If the repair dies before content, the
+   *  pre-gap surface stays visible. Never on the wire. */
+  deferViewportClearUntilContent?: boolean
+  /**
+   * Internal recovery-accounting hint (never on the wire): the reconcile
+   * episode this attach belongs to (M-1). Every attach of ONE episode
+   * collapses into a single counted recovery attempt — the episode's
+   * deliberate re-attaches (pending-mark re-fire, verdict-fold re-fire)
+   * are pane lifecycle, not recovery cycling.
+   */
+  recoveryAttemptKey?: string
 }
 
 type SentViewport = {
@@ -627,6 +673,22 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   )
   const reconcilePendingSinceRef = useRef<number | undefined>(reconcilePendingSince)
   reconcilePendingSinceRef.current = reconcilePendingSince
+  // Reconcile-episode anchor for the recovery accounting (M-1): the last
+  // reconcile-pending/reconcile-epoch pair this attach effect consumed. A
+  // change in either re-fires the effect for a RECONCILE-DRIVEN attach
+  // (the pending mark or the verdict fold) — deliberate pane lifecycle,
+  // not recovery cycling. The derived per-episode key collapses every
+  // attach of ONE reconcile episode into a single counted attempt.
+  // task-009b: the anchor also records the identity it ran with
+  // (createRequestId + terminalId) so a later re-run can tell a
+  // reconcile-bookkeeping-only re-drive (nothing about the pane changed)
+  // from a fold that must re-attach.
+  const reconcileDriveStateRef = useRef<{
+    pendingSince: number | undefined
+    epoch: number
+    createRequestId: string | undefined
+    terminalId: string | undefined
+  } | null>(null)
   // Branch-5 / reconcile-verdict interaction (design invariant 7): a pane
   // listed in the dead-session adjudication panel is owned by the user's
   // explicit panel decision -- the INVALID_TERMINAL_ID auto-recovery must
@@ -666,6 +728,37 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     && window.__FRESHELL_TEST_HARNESS__?.isTerminalNetworkEffectsSuppressed?.(paneId) === true
   const [isAttaching, setIsAttaching] = useState(false)
   const [truncatedHistoryGap, setTruncatedHistoryGap] = useState<{ fromSeq: number; toSeq: number } | null>(null)
+  // Honest incomplete-history state (responsive-terminal-restore): a
+  // NEGOTIATED retention gap's visible, accessible notice. `headSeq` /
+  // `oldestRetainedSeq` are null when the gap omitted them — absence means
+  // UNKNOWN BOUNDS, never non-negotiation.
+  const [retentionLossNotice, setRetentionLossNotice] = useState<{
+    fromSeq: number
+    toSeq: number
+    headSeq: number | null
+    oldestRetainedSeq: number | null
+  } | null>(null)
+  // Honest delivery-gap state (responsive-terminal-restore, round-5
+  // finding 2): a NEGOTIATED queue_overflow / handoff_boundary_reached
+  // gap's visible, accessible notice — in UI CHROME, never in the xterm
+  // surface. During a checkpoint-based delta repair NOTHING may mutate
+  // the surface before the replayed bytes apply (the pre-fix local
+  // notice shifted the cursor/parser state the checkpoint captured and
+  // corrupted the repaired screen), so the notice rides React state —
+  // which the repair attach's generation change (dropQueuedStaleWrites,
+  // a WRITE-queue concern) cannot discard. Set when the delivery-loss
+  // repair initiates; cleared by the next attach (like the retention
+  // notice) and by a retention-gap resolution (the authoritative
+  // honest-loss state then takes over).
+  const [deliveryGapNotice, setDeliveryGapNotice] = useState<{
+    fromSeq: number
+    toSeq: number
+    reason: string
+  } | null>(null)
+  // Visible, accessible retry state (WS2): automatic re-attach cycling was
+  // stopped by the recovery bound; the surface content below is PRESERVED and
+  // an explicit retry re-arms it.
+  const [recoveryExhausted, setRecoveryExhausted] = useState(false)
   const [backgroundHydrationTriggered, setBackgroundHydrationTriggered] = useState(false)
   const wasCreatedFreshRef = useRef(paneContent.kind === 'terminal' && paneContent.status === 'creating')
   const [pendingLinkUri, setPendingLinkUri] = useState<string | null>(null)
@@ -942,6 +1035,34 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   const terminalIdRef = useRef<string | undefined>(terminalContent?.terminalId)
   const seqStateRef = useRef<AttachSeqState>(createAttachSeqState())
   const parserAppliedSeqRef = useRef(0)
+  // Surface-coverage cursor (responsive-terminal-restore WS1/WS2): the
+  // reconstruction-safe contiguous coverage of the stream on THIS surface —
+  // advanced by applied frames AND fully-consumed null-screen-effect
+  // filtered frames (the same classes the paced consumption frontier uses);
+  // pinned below unknown mutations, lost ranges, and locally-unapplied
+  // ranges (contiguity-gated — never jumps a hole). Monotonic within a
+  // surface generation; resets with the surface (same epoch discipline).
+  // DISTINCT from parserAppliedSeqRef, which never advances across a
+  // filtered or lost range and keeps its strict checkpoint semantics.
+  const surfaceCoverageSeqRef = useRef(0)
+  // Bounded automatic recovery accounting (WS2): consecutive progressless
+  // attach attempts vs the coverage cursor; gates automatic re-attach
+  // cycling and drives the visible retry state. Never kills or replaces.
+  // Round-4 reversal (plan:166): the streak resets ONLY on genuine parser
+  // progress (an ADVANCE of the applied surface) or an explicit user
+  // retry — never on attach.ready/reconnect completions.
+  const recoveryAccountingRef = useRef<TerminalRecoveryAccounting>(createTerminalRecoveryAccounting())
+  // Delivery-loss repair fallback (responsive-terminal-restore WS3): the
+  // attach generation of a full-hydrate repair that must NOT clear the
+  // viewport at attach time — the surface is replaced only when that
+  // generation's first content frame arrives (the deferred content reset:
+  // "the viewport must not be cleared before the new baseline is actually
+  // established by attach content"). Null when no deferred reset is
+  // pending; cleared once fired and re-armed per attach. A
+  // `replay_window_exceeded` gap in THIS generation DISARMS it (the
+  // server just declared the prefix unreconstructible — the pre-gap
+  // screen is the best available surface and must be preserved).
+  const repairContentResetPendingRef = useRef<string | null>(null)
   const surfaceEpochRef = useRef(0)
   const geometryEpochRef = useRef(1)
   const geometryAuthorityRef = useRef<TerminalGeometryAuthority>('single_client')
@@ -953,6 +1074,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     startedAt: number
     timedOut: boolean
     timer: ReturnType<typeof setTimeout> | null
+    /**
+     * Write items COMPLETED since the quarantined attach armed this repair
+     * (any generation — the frozen window's old in-flight writes included:
+     * their bytes were already submitted when they went in flight). Zero at
+     * drain time proves the surface still matches its last checkpoint; any
+     * completion means the checkpoint under-describes the surface and the
+     * repair must rebuild from a full hydrate.
+     */
+    completedWrites: number
   } | null>(null)
   const abandonedAttachRequestIdsRef = useRef(new Set<string>())
   const attachCounterRef = useRef(0)
@@ -1005,7 +1135,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     requestId: string
     terminalId: string
   } | null>(null)
-  const pendingDurableReplacementRef = useRef<PendingDurableReplacement | null>(null)
   // Wedge-backstop (Task 4 review, Minor-1): in-flight lock for the stuck
   // card's shared kill-await path. The card's buttons stay enabled during the
   // bounded KILL_ACK_TIMEOUT_MS wait; without the lock a second click
@@ -1066,6 +1195,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       streamId: getTerminalCheckpointStreamId(),
       serverInstanceId,
       surfaceEpoch: surfaceEpochRef.current,
+      // Surface-instance discriminator (WS2 reload contract): the id of the
+      // exact xterm surface instance this component currently renders on —
+      // mount-stable AND renderer-recreation-stable. Checkpoint loads
+      // validate it and saves carry it, so a remounted pane (same store
+      // key, colliding epoch) can never resume the previous mount's cursor
+      // past the new surface's rendered position.
+      surfaceInstanceId: terminalInstanceIdRef.current,
       cols: normalizeDimension(dimensions?.cols, term?.cols ?? 80),
       rows: normalizeDimension(dimensions?.rows, term?.rows ?? 24),
       geometryEpoch: geometryEpochRef.current,
@@ -1084,15 +1220,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     if (!checkpointInput) {
       return { ok: false as const, reason: 'missing_checkpoint' as const }
     }
+    // Surface-scoped (WS2): sibling panes rendering the same terminal keep
+    // isolated checkpoint stores — this pane can only resume ITS OWN surface's
+    // rendered progress.
     const checkpoint = loadTerminalSurfaceCheckpoint(terminalId, {
       streamId: checkpointInput.streamId,
       serverInstanceId: checkpointInput.serverInstanceId,
-    })
+      surfaceInstanceId: checkpointInput.surfaceInstanceId,
+    }, { paneId: paneIdRef.current })
     return canUseCheckpointForDeltaReplay(checkpoint, checkpointInput)
   }, [buildCheckpointReplayInput])
 
-  const resetParserAppliedSurface = useCallback((seq = 0, opts?: { incrementEpoch?: boolean }) => {
+  const resetParserAppliedSurface = useCallback((seq = 0, opts?: { incrementEpoch?: boolean; surfaceCoverageSeq?: number }) => {
     parserAppliedSeqRef.current = Math.max(0, Math.floor(Number.isFinite(seq) ? seq : 0))
+    // Coverage follows the surface's epoch discipline: a rebuild resets it to
+    // the new baseline position; a local-notice invalidation (which keeps the
+    // applied position and only bumps the epoch) may preserve it — the notice
+    // appends non-stream bytes but never un-accounts stream coverage.
+    surfaceCoverageSeqRef.current = Math.max(0, Math.floor(
+      Number.isFinite(opts?.surfaceCoverageSeq) ? opts!.surfaceCoverageSeq! : seq,
+    ))
     if (opts?.incrementEpoch !== false) {
       surfaceEpochRef.current += 1
     }
@@ -1124,6 +1271,136 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     abandonedAttachRequestIdsRef.current.delete(pending.attachRequestId)
     quarantineRepairRef.current = null
   }, [])
+
+  // Deferred content reset (responsive-terminal-restore WS3, delivery-loss
+  // repair fallback): when a hydrate attach deferred its viewport clear
+  // (`deferViewportClearUntilContent`), the pre-gap surface stays visible
+  // until that generation's first RENDERING frame — replacement content
+  // the sequence validator ACCEPTED and whose write path will write bytes
+  // to xterm — actually establishes the new baseline (round-3 fix: the
+  // clear consumes at the render moment, never on mere envelope arrival —
+  // a rejected duplicate/overlap or a fully filtered frame such as the
+  // OSC52-only case renders nothing and must leave the clear armed).
+  // The consumption runs inside `handleTerminalOutput` immediately before
+  // the triggering frame's write is enqueued, so the surface is always
+  // cleared-then-written; if the enqueue fails (no surface), the caller
+  // re-arms the pending clear because nothing rendered. Two paths retire
+  // the pending clear WITHOUT wiping: the repair dying without content
+  // (nothing is cleared and the pre-gap surface survives), and — the
+  // round-2 disarm — a `replay_window_exceeded` gap in this generation
+  // (the server declared the prefix unreconstructible, so the pre-gap
+  // screen is the best available surface and the existing honest-loss UX
+  // proceeds; see the gap arm).
+  // Round-4 F2: the consumption returns the clear as a THUNK instead of
+  // running it synchronously — the caller hands it to the write queue as
+  // `clearBeforeWrite`, so the clear applies INSIDE the same
+  // generation-guarded queue item as the replacement bytes (atomic
+  // clear-then-write at flush time: a dropped generation drops clear+write
+  // together, a stale generation is refused at apply time, and an
+  // in-flight earlier write completes before the clear runs). The two
+  // no-wipe retirement paths (death without content; the round-2
+  // declared-unreconstructible disarm) are unchanged.
+  const consumeRepairContentReset = useCallback((terminalId: string, attachRequestId?: unknown): (() => void) | null => {
+    if (repairContentResetPendingRef.current !== attachRequestId) return null
+    repairContentResetPendingRef.current = null
+    return () => {
+      try {
+        termRef.current?.clear()
+      } catch {
+        // disposed
+      }
+      clearTerminalCursor(terminalId)
+    }
+  }, [])
+
+  // ── Paced terminal replay consumption (responsive-terminal-restore
+  // Workstream 1, client side) ──
+  // All paced behavior is gated on the CURRENT connection's capability echo;
+  // absent (or a ws client without the accessor) → today's exact wire
+  // behavior everywhere.
+  const isPacedReplayNegotiated = useCallback((): boolean => {
+    const capabilities = typeof ws.getServerCapabilities === 'function'
+      ? ws.getServerCapabilities()
+      : undefined
+    return capabilities?.pacedTerminalReplayV1 === true
+  }, [ws])
+
+  // Hidden-pane lifetime claims (responsive-terminal-restore Workstream 1):
+  // the CURRENT connection's ready echoed `terminalLifetimeClaimV1` — hidden
+  // panes claim their terminals in the interest snapshot instead of attaching.
+  // Both flags must be present: claims ride `terminal.interest` snapshots, so
+  // an interest-capable echo without the claim echo (or vice versa) cannot
+  // deliver claims and must fall back to today's hidden attach. Absent (or a
+  // ws client without the accessor) → today's exact wire behavior everywhere.
+  const isLifetimeClaimNegotiated = useCallback((): boolean => {
+    const capabilities = typeof ws.getServerCapabilities === 'function'
+      ? ws.getServerCapabilities()
+      : undefined
+    return capabilities?.terminalLifetimeClaimV1 === true
+      && capabilities?.terminalInterestV1 === true
+  }, [ws])
+
+  // The consumption frontier for the CURRENT attach generation only — replaced
+  // by the next attach, absent for non-negotiated attaches.
+  const pacedReplayRef = useRef<PacedReplayConsumptionState | null>(null)
+
+  const advancePacedReplayConsumption = useCallback((attachRequestId: string | undefined, seqEnd: number) => {
+    const paced = pacedReplayRef.current
+    if (!paced || !attachRequestId || paced.attachRequestId !== attachRequestId) return
+    const next = pacedReplayConsumeThrough(paced, seqEnd)
+    if (next !== paced) {
+      pacedReplayRef.current = next
+    }
+  }, [])
+
+  const markPacedReplayReceived = useCallback((attachRequestId: string | undefined, seqEnd: number) => {
+    const paced = pacedReplayRef.current
+    if (!paced || !attachRequestId || paced.attachRequestId !== attachRequestId) return
+    const next = pacedReplayMarkReceived(paced, seqEnd)
+    if (next !== paced) {
+      pacedReplayRef.current = next
+    }
+  }, [])
+
+  const flushPacedReplayCredit = useCallback(() => {
+    const paced = pacedReplayRef.current
+    if (!paced) return
+    const activeAttach = currentAttachRef.current
+    if (!activeAttach || activeAttach.requestId !== paced.attachRequestId) return
+    const streamId = activeAttach.streamId
+    if (typeof streamId !== 'string' || streamId.length === 0) return
+    const decision = pacedReplayNextCredit(paced)
+    if (decision.state !== paced) {
+      pacedReplayRef.current = decision.state
+    }
+    if (!decision.credit) return
+    ws.send({
+      type: 'terminal.replay.credit',
+      terminalId: decision.credit.terminalId,
+      streamId,
+      attachRequestId: decision.credit.attachRequestId,
+      consumedSeq: decision.credit.consumedSeq,
+    })
+  }, [ws])
+
+  // A consumption advance with no write of its own (a fully pre-filtered
+  // frame) rides the write queue as a task so the SAME drain-tick coalescing
+  // applies: the credit flushes once per drain, never per frame. Armed for
+  // the current paced attach generation only — non-negotiated panes keep
+  // today's queue traffic byte-identical.
+  const schedulePacedReplayCreditFlush = useCallback((
+    outputSource: TerminalOutputSource,
+    attachRequestId: string | undefined,
+  ) => {
+    const paced = pacedReplayRef.current
+    if (!paced || !attachRequestId || paced.attachRequestId !== attachRequestId) return
+    const queue = writeQueueRef.current
+    if (!queue) {
+      flushPacedReplayCredit()
+      return
+    }
+    queue.enqueueTask(() => {}, { mode: outputSource, generation: attachRequestId })
+  }, [flushPacedReplayCredit])
 
   const recordTerminalPerfAuditEvent = useCallback((event: string, data: Record<string, unknown> = {}) => {
     const payload = Object.fromEntries(Object.entries({
@@ -1158,10 +1435,29 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         return
       }
       if (!pending.queue.hasInFlightWrites()) {
+        // The frozen window closed with the queue drained: NOW repair
+        // (WS2 — never decide while an earlier write can still mutate the
+        // surface). The quarantined attach deferred the applied-surface
+        // reset, so the repair ALWAYS rebuilds from a full hydrate: a
+        // quarantine arms only while a write is in flight, that write's
+        // completion always lands in the completedWrites ledger (the write
+        // wrapper reports every completion, including a disposed-surface
+        // throw), and the drain only happens after in-flight writes
+        // complete — so the window provably mutated the surface and the
+        // pre-quarantine checkpoint under-describes it. The former
+        // completedWrites === 0 resume branch was unreachable in
+        // production shapes and was removed (M-2); the ledger stays in the
+        // audit event as the honest evidence.
         clearQuarantineRepair(attachRequestId)
+        recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantine_repair', {
+          terminalId,
+          attachRequestId,
+          resumable: false,
+          completedWritesDuringQuarantine: pending.completedWrites,
+        })
         attachTerminalRef.current?.(terminalId, 'viewport_hydrate', {
           clearViewportFirst: true,
-          ...viewportHydrateReplayOptions(contentRef.current),
+          ...viewportHydrateReplayOptions(contentRef.current, isPacedReplayNegotiated()),
         })
         return
       }
@@ -1191,9 +1487,88 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       queue,
       startedAt,
       timedOut: false,
+      completedWrites: 0,
       timer: setTimeout(poll, QUARANTINE_REPAIR_POLL_MS),
     }
-  }, [clearQuarantineRepair, recordTerminalPerfAuditEvent])
+  }, [clearQuarantineRepair, isPacedReplayNegotiated, recordTerminalPerfAuditEvent])
+
+  // Persist the current surface checkpoint (applied + coverage) for the given
+  // attach context. Shared by the applied-frame save path and the
+  // coverage-advance save paths (a filtered advance must persist its cursor
+  // too, or a disconnect right after a filtered page resumes from below it).
+  const persistSurfaceCheckpointForAttach = useCallback((
+    terminalId: string | undefined,
+    attach: {
+      requestId: string
+      terminalId: string
+      cols: number
+      rows: number
+      streamId?: string | null
+      surfaceQuarantined?: boolean
+    } | null,
+    parserAppliedSeq: number,
+  ) => {
+    if (!terminalId || !Number.isFinite(parserAppliedSeq)) return
+    if (attach?.surfaceQuarantined === true) return
+    if (!attach || attach.terminalId !== terminalId) return
+    if (typeof attach.streamId !== 'string' || attach.streamId.length === 0) return
+    const checkpointInput = buildCheckpointReplayInput(terminalId, {
+      cols: attach.cols,
+      rows: attach.rows,
+    })
+    if (!checkpointInput) return
+
+    saveTerminalSurfaceCheckpoint({
+      terminalId: checkpointInput.terminalId,
+      streamId: checkpointInput.streamId,
+      serverInstanceId: checkpointInput.serverInstanceId,
+      surfaceEpoch: checkpointInput.surfaceEpoch,
+      surfaceInstanceId: checkpointInput.surfaceInstanceId,
+      attachRequestId: attach.requestId,
+      parserAppliedSeq,
+      surfaceCoverageSeq: surfaceCoverageSeqRef.current,
+      cols: checkpointInput.cols,
+      rows: checkpointInput.rows,
+      geometryEpoch: checkpointInput.geometryEpoch,
+      geometryAuthority: checkpointInput.geometryAuthority,
+      scrollback: checkpointInput.scrollback,
+      xtermVersion: checkpointInput.xtermVersion,
+      // Task 3 cannot yet prove normal vs alternate buffer. Keep checkpoints conservative
+      // until the geometry/buffer authority work supplies this context.
+      bufferType: 'unknown',
+      parserIdle: true,
+    }, { paneId: paneIdRef.current })
+  }, [buildCheckpointReplayInput])
+
+  // Advance the surface-coverage cursor across [seqStart, seqEnd]:
+  // contiguity-gated — only a range that starts exactly at the cursor's next
+  // position extends it, so unknown mutations, lost ranges, and unapplied
+  // ranges can never be jumped past (the cursor pins below them until a
+  // surface reset). Genuine progress here resets the recovery accounting.
+  const advanceSurfaceCoverageForRange = useCallback((seqStart: number, seqEnd: number): boolean => {
+    const coverage = surfaceCoverageSeqRef.current
+    if (seqStart !== coverage + 1 || seqEnd <= coverage) return false
+    surfaceCoverageSeqRef.current = seqEnd
+    const wasExhausted = recoveryAccountingRef.current.exhausted
+    recoveryAccountingRef.current = recordRecoveryProgress(recoveryAccountingRef.current, seqEnd, Date.now())
+    if (wasExhausted && !recoveryAccountingRef.current.exhausted) {
+      setRecoveryExhausted(false)
+    }
+    return true
+  }, [])
+
+  // Coverage advance + checkpoint persist in one step (both advance sites):
+  // the persisted checkpoint must carry the new coverage position, else an
+  // interrupt right after a filtered page would resume from below it.
+  const advanceSurfaceCoverageAndPersist = useCallback((
+    terminalId: string | undefined,
+    attach: Parameters<typeof persistSurfaceCheckpointForAttach>[1],
+    seqStart: number,
+    seqEnd: number,
+  ) => {
+    if (!advanceSurfaceCoverageForRange(seqStart, seqEnd)) return
+    persistSurfaceCheckpointForAttach(terminalId, attach, parserAppliedSeqRef.current)
+  }, [advanceSurfaceCoverageForRange, persistSurfaceCheckpointForAttach])
 
   const markParserAppliedFrame = useCallback((terminalId: string | undefined, seq: number, attachContext?: {
     requestId: string
@@ -1219,38 +1594,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       streamId: attach?.streamId ?? getTerminalCheckpointStreamId(),
       parserAppliedSeq,
       previousParserAppliedSeq,
+      surfaceCoverageSeq: surfaceCoverageSeqRef.current,
       surfaceEpoch: surfaceEpochRef.current,
       surfaceQuarantined,
     })
 
     if (surfaceQuarantined) return
     if (!attach || attach.terminalId !== terminalId) return
-    if (typeof attach.streamId !== 'string' || attach.streamId.length === 0) return
-    const checkpointInput = buildCheckpointReplayInput(terminalId, {
-      cols: attach.cols,
-      rows: attach.rows,
-    })
-    if (!checkpointInput) return
-
-    saveTerminalSurfaceCheckpoint({
-      terminalId: checkpointInput.terminalId,
-      streamId: checkpointInput.streamId,
-      serverInstanceId: checkpointInput.serverInstanceId,
-      surfaceEpoch: checkpointInput.surfaceEpoch,
-      attachRequestId: attach.requestId,
-      parserAppliedSeq,
-      cols: checkpointInput.cols,
-      rows: checkpointInput.rows,
-      geometryEpoch: checkpointInput.geometryEpoch,
-      geometryAuthority: checkpointInput.geometryAuthority,
-      scrollback: checkpointInput.scrollback,
-      xtermVersion: checkpointInput.xtermVersion,
-      // Task 3 cannot yet prove normal vs alternate buffer. Keep checkpoints conservative
-      // until the geometry/buffer authority work supplies this context.
-      bufferType: 'unknown',
-      parserIdle: true,
-    })
-  }, [buildCheckpointReplayInput, getTerminalCheckpointStreamId, recordTerminalPerfAuditEvent])
+    persistSurfaceCheckpointForAttach(terminalId, attach, parserAppliedSeq)
+  }, [getTerminalCheckpointStreamId, persistSurfaceCheckpointForAttach, recordTerminalPerfAuditEvent])
 
   const writeLocalXtermNotice = useCallback((term: Terminal, data: string) => {
     const terminalInstanceId = terminalInstanceIdRef.current
@@ -1263,7 +1615,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       return
     }
     const invalidateAppliedSurface = () => {
-      resetParserAppliedSurface(parserAppliedSeqRef.current)
+      // Keep the applied position (the notice does not unapply stream bytes),
+      // bump the epoch (stream-unpure surface state), and preserve the
+      // coverage cursor — the notice appends non-stream bytes but never
+      // un-accounts stream coverage.
+      resetParserAppliedSurface(parserAppliedSeqRef.current, {
+        surfaceCoverageSeq: surfaceCoverageSeqRef.current,
+      })
     }
     const generation = currentAttachRef.current?.requestId
     const queue = writeQueueRef.current
@@ -1916,11 +2274,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     // above satisfies exhaustive-deps without new warnings.
   }, [mayFocusNow, suppressNetworkEffects, syncGeometryEpochForViewport, ws, tabId])
 
-  const enqueueTerminalWrite = useCallback((data: string, onWritten?: () => void, options?: TerminalWriteQueueOptions): boolean => {
+  const enqueueTerminalWrite = useCallback((
+    data: string,
+    onWritten?: () => void,
+    options?: TerminalWriteQueueOptions,
+    clearBeforeWrite?: () => void,
+  ): boolean => {
     if (!data) return false
     const queue = writeQueueRef.current
     if (queue) {
-      queue.enqueue(data, onWritten, options)
+      queue.enqueue(data, onWritten, clearBeforeWrite ? { ...options, clearBeforeWrite } : options)
       return true
     }
     const term = termRef.current
@@ -1935,6 +2298,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       suppressExternalSideEffects: mode === 'replay',
     })
     try {
+      // No write queue (the direct fallback): the clear runs
+      // synchronously immediately before the direct write — the same
+      // clear-then-write ordering, in one synchronous step.
+      clearBeforeWrite?.()
       term.write(data, () => {
         try {
           onWritten?.()
@@ -2067,19 +2434,52 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     }
 
     const submittedBytesEqualInput = cleaned === raw
+    // THE RENDER MOMENT (responsive-terminal-restore WS3, round-3 fix;
+    // round-4 atomicity): a deferred repair clear consumes ONLY here —
+    // the sequence validator already accepted this frame (the caller
+    // runs the acceptance before submitting), and `cleaned` non-empty
+    // proves the frame's write path WILL write bytes to xterm. The
+    // consumed clear is returned as a THUNK and handed to the write
+    // queue as `clearBeforeWrite` on the SAME generation-guarded item as
+    // the replacement write: the flush applies clear-then-write as ONE
+    // atomic unit — a dropped generation drops clear+write together
+    // (the old surface survives a disconnect/supersede mid-window), a
+    // stale-generation write can never apply after the clear (the
+    // generation is checked at apply time), and an in-flight earlier
+    // write completes BEFORE the clear runs (the queue is serial). A
+    // rejected or fully filtered frame (`cleaned === ''`) never reaches
+    // this point and leaves the clear armed for the next writing frame.
+    // Rejected/filtered frames of a LATER generation than the armed one
+    // no-op the ref check inside, exactly like before.
+    let consumedDeferredClear: (() => void) | null = null
+    if (cleaned && tid) {
+      consumedDeferredClear = consumeRepairContentReset(tid, writeOptions?.generation)
+    }
     const submittedWrite = cleaned
       ? enqueueTerminalWrite(
           cleaned,
           submittedBytesEqualInput ? onParserApplied : undefined,
           writeOptions,
+          consumedDeferredClear ?? undefined,
         )
       : false
+    if (consumedDeferredClear && !submittedWrite) {
+      // Nothing will render (no surface / disposed write): the clear was
+      // consumed for content that never renders — re-arm it. Nothing else
+      // can touch the ref inside this synchronous block, so the re-arm is
+      // exact.
+      repairContentResetPendingRef.current = writeOptions?.generation ?? null
+    }
 
     for (const event of osc.events) {
       handleOsc52Event(event, outputSource, mode)
     }
-    return { submittedWrite, submittedBytesEqualInput: submittedWrite && submittedBytesEqualInput }
-  }, [dispatch, enqueueTerminalWrite, handleOsc52Event, sendInput, tabId])
+    return {
+      submittedWrite,
+      submittedBytesEqualInput: submittedWrite && submittedBytesEqualInput,
+      preParserConsumedAllBytes: cleaned === '',
+    }
+  }, [consumeRepairContentReset, dispatch, enqueueTerminalWrite, handleOsc52Event, sendInput, tabId])
 
   const findNext = useCallback((value: string = searchQuery) => {
     const terminalId = terminalIdRef.current
@@ -2298,8 +2698,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     surfaceFreshRef.current = true
     surfaceFreshMarkerRef.current = null
     surfaceWritesSinceFreshRef.current = 0
+    // A brand-new surface has no covered stream position.
+    surfaceCoverageSeqRef.current = 0
     const writeQueue = createTerminalWriteQueue({
       terminalInstanceId,
+      // One paced-replay credit per drain tick (Workstream 1): the flush is
+      // idempotent (lastSentCreditSeq guard), so non-paced panes and drains
+      // with no frontier movement are no-ops.
+      onDrain: () => {
+        flushPacedReplayCredit()
+      },
       onItemApplied: (item) => {
         surfaceWritesSinceFreshRef.current += 1
         // Coupled clear (plan round-3): the marker-bearing attach's own
@@ -2310,6 +2718,18 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         if (marker && item.mode === 'replay' && item.generation === marker.attachRequestId) {
           surfaceFreshRef.current = false
           surfaceFreshMarkerRef.current = null
+        }
+      },
+      // Surface-mutation ledger for the quarantine repair (WS2): EVERY
+      // completed write during a quarantined attach's frozen window —
+      // including stale-generation completions (their bytes were already
+      // submitted when they went in flight) — proves the surface moved
+      // beyond its last checkpoint, so the repair must rebuild instead of
+      // resuming a checkpoint that under-describes the surface.
+      onWriteCompleted: () => {
+        const pendingQuarantine = quarantineRepairRef.current
+        if (pendingQuarantine) {
+          pendingQuarantine.completedWrites += 1
         }
       },
       write: (data, onWritten) => {
@@ -2490,6 +2910,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         surfaceFreshRef.current = true
         surfaceFreshMarkerRef.current = null
         surfaceWritesSinceFreshRef.current = 0
+        surfaceCoverageSeqRef.current = 0
       },
       scrollToBottom: () => {
         if (!allowCurrentTerminalAction()) return
@@ -2755,13 +3176,24 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       pendingSinceSeq: 0,
       pendingReason: 'initial_hydrate',
     }
+    // Round-4 reversal to plan:166's literal rule: the progressless
+    // streak resets ONLY on genuine parser progress (an ADVANCE of the
+    // applied surface — recorded at the frame-application site through
+    // recordRecoveryProgress) or an explicit user retry
+    // (resetRecoveryAccounting). Receiving attach.ready or another
+    // reconnect — however clean, cursor-confirmed, or gap-free — is NOT
+    // progress and must never reset the accounting: a converged idle
+    // pane's flap cycle exhausts to the visible retry strip exactly
+    // like any other progressless cycle (the empty-window ready path
+    // calling this is the plan's own example). The 81566b88f/40afe39b7
+    // ready-keyed reset contradicted the plan's sentence and is removed.
     const queue = getHydrationQueue()
     if (hiddenRef.current) {
       queue.onHydrationComplete(paneId)
     } else {
       queue.onActiveTabReady(tabId, tabOrderRef.current)
     }
-  }, [paneId, tabId])
+  }, [paneId, tabId, recordTerminalPerfAuditEvent])
 
   const markTerminalOutputRangeLost = useCallback((input: {
     terminalId: string
@@ -2834,6 +3266,18 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       trigger: () => setBgTriggered(true),
     }, options)
   }, [tabId])
+
+  // Hidden-pane lifetime claims (responsive-terminal-restore WS1): a
+  // claim-negotiated hidden pane never holds a background-hydration
+  // registration — a stale OLD-SERVER registration (armed before the
+  // connection re-negotiated with claims) must not attach on a late grant
+  // under the negotiated regime.
+  const unregisterBackgroundHydration = useCallback(() => {
+    if (hydrationRegisteredRef.current) {
+      getHydrationQueue().unregister(paneIdRef.current)
+      hydrationRegisteredRef.current = false
+    }
+  }, [])
 
   const isCurrentAttachMessage = useCallback((msg: {
     type: string
@@ -2926,7 +3370,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       const gapDecision = onOutputGap(previousSeqState, { fromSeq, toSeq })
       const nextSeqState = gapDecision.state
       applySeqState(nextSeqState)
-      resetParserAppliedSurface(parserAppliedSeqRef.current)
+      resetParserAppliedSurface(parserAppliedSeqRef.current, {
+        surfaceCoverageSeq: surfaceCoverageSeqRef.current,
+      })
       recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
         terminalId: msg.terminalId,
         messageType: msg.type,
@@ -2948,7 +3394,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         markAttachComplete()
       }
     } else {
-      resetParserAppliedSurface(parserAppliedSeqRef.current)
+      resetParserAppliedSurface(parserAppliedSeqRef.current, {
+        surfaceCoverageSeq: surfaceCoverageSeqRef.current,
+      })
       recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
         terminalId: msg.terminalId,
         messageType: msg.type,
@@ -3014,6 +3462,35 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       })
       return
     }
+    // Bounded automatic recovery (WS2): consecutive attach/hydrate attempts
+    // without a coverage-cursor advance count against a bounded limit; past
+    // it, automatic cycling STOPS and the visible retry state shows (the
+    // surface content is preserved). Never kills, replaces, or changes
+    // identity. Explicit user paths (pane refresh, the retry control) reset
+    // the accounting before they get here.
+    const recoveryDecision = beginRecoveryAttempt(recoveryAccountingRef.current, {
+      coverageSeq: surfaceCoverageSeqRef.current,
+      now: Date.now(),
+      attemptKey: opts?.recoveryAttemptKey,
+    })
+    recoveryAccountingRef.current = recoveryDecision.state
+    if (!recoveryDecision.allowed) {
+      setRecoveryExhausted(true)
+      log.debug('Terminal restore recovery bound reached; automatic attach declined', {
+        terminalId: tid,
+        paneId: paneIdRef.current,
+        intent,
+        attempts: recoveryDecision.state.attempts,
+        coverageSeq: surfaceCoverageSeqRef.current,
+      })
+      recordTerminalPerfAuditEvent('terminal.restore.recovery_exhausted', {
+        terminalId: tid,
+        intent,
+        attempts: recoveryDecision.state.attempts,
+        coverageSeq: surfaceCoverageSeqRef.current,
+      })
+      return
+    }
     const term = termRef.current
     if (!term) return
     const runtime = runtimeRef.current
@@ -3041,27 +3518,57 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     let effectiveIntent = intent
     let clearViewportFirst = opts?.clearViewportFirst === true
     let fullHydrateFallbackReason: string | null = null
+    // Partial-hydrate exemption (WS2): a fresh-flagged surface that already
+    // CONSUMED content for its marker generation is NOT blank — an interrupted
+    // hydrate. A valid checkpoint lets the same mounted xterm resume the
+    // remainder via transport_reconnect (sinceSeq from the coverage cursor):
+    // no wipe, no surfaceReset re-claim, no mode-preamble re-send. A hydrate
+    // interrupted before ANY consumption (nothing to resume from) keeps the
+    // full-hydrate path below.
+    let partialHydrateSinceSeq: number | null = null
     if (surfaceFreshRef.current) {
-      // A fresh surface has NO usable delta window: any checkpointed sinceSeq
-      // would continue content onto a blank xterm (data hole). Force the full
-      // hydrate. Wipe ONLY when a marker exists — a marker means an EARLIER
-      // claim was abandoned mid-hydration (trap-door), so this surface may
-      // hold partial replay content; a genuinely fresh surface (marker null,
-      // flag just set at construction/user-reset) is blank by construction
-      // and must not pay a spurious term.clear().
-      if (effectiveIntent !== 'viewport_hydrate') {
-        effectiveIntent = 'viewport_hydrate'
-        fullHydrateFallbackReason = 'surface_fresh'
-      }
-      if (surfaceFreshMarkerRef.current !== null || surfaceWritesSinceFreshRef.current > 0) {
-        // Wipe before the forced full replay whenever the surface may hold
-        // content: an abandoned in-flight claim (marker set) or ANY applied
-        // write since the fresh marking (e.g. live output after a user
-        // reset). A genuinely blank fresh surface pays neither.
-        clearViewportFirst = true
+      const partiallyConsumed = surfaceWritesSinceFreshRef.current > 0
+        || surfaceCoverageSeqRef.current > 0
+      partialHydrateSinceSeq = surfaceFreshMarkerRef.current !== null
+        && partiallyConsumed
+        && checkpointDecision.ok
+        && effectiveIntent !== 'viewport_hydrate'
+        ? checkpointDecision.sinceSeq
+        : null
+      if (partialHydrateSinceSeq !== null) {
+        recordTerminalPerfAuditEvent('terminal.restore.partial_hydrate_resume', {
+          terminalId: tid,
+          attachRequestId,
+          requestedIntent: intent,
+          sinceSeq: partialHydrateSinceSeq,
+          coverageSeq: surfaceCoverageSeqRef.current,
+          surfaceWritesSinceFresh: surfaceWritesSinceFreshRef.current,
+        })
+      } else {
+        // A fresh surface has NO usable delta window: any checkpointed sinceSeq
+        // would continue content onto a blank xterm (data hole). Force the full
+        // hydrate. Wipe ONLY when a marker exists — a marker means an EARLIER
+        // claim was abandoned mid-hydration (trap-door), so this surface may
+        // hold partial replay content; a genuinely fresh surface (marker null,
+        // flag just set at construction/user-reset) is blank by construction
+        // and must not pay a spurious term.clear().
+        if (effectiveIntent !== 'viewport_hydrate') {
+          effectiveIntent = 'viewport_hydrate'
+          fullHydrateFallbackReason = 'surface_fresh'
+        }
+        if (surfaceFreshMarkerRef.current !== null || surfaceWritesSinceFreshRef.current > 0) {
+          // Wipe before the forced full replay whenever the surface may hold
+          // content: an abandoned in-flight claim (marker set) or ANY applied
+          // write since the fresh marking (e.g. live output after a user
+          // reset). A genuinely blank fresh surface pays neither.
+          clearViewportFirst = true
+        }
       }
     }
     if (hasInFlightWrites && effectiveIntent !== 'viewport_hydrate') {
+      // In-flight-writes freeze (WS2): never DECIDE (or clear) a surface while
+      // an earlier write can still mutate it — the quarantined attach defers
+      // the checkpoint decision to the bounded drain wait and its repair.
       effectiveIntent = 'viewport_hydrate'
       clearViewportFirst = true
       fullHydrateFallbackReason = 'in_flight_writes'
@@ -3101,21 +3608,34 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
 
     setIsAttaching(true)
     setTruncatedHistoryGap(null)
+    setRetentionLossNotice(null)
+    setDeliveryGapNotice(null)
 
     // Startup probes must not leak across attach generations.
     resetStartupProbeParser()
 
     if (effectiveIntent === 'viewport_hydrate') {
-      resetParserAppliedSurface()
-      if (clearViewportFirst && !surfaceQuarantined) {
-        try {
-          termRef.current?.clear()
-        } catch {
-          // disposed
+      if (!surfaceQuarantined) {
+        // A live hydrate rebuilds the surface from zero — new surface
+        // generation (epoch), zero applied, zero coverage. A QUARANTINED
+        // hydrate defers this reset: the surface is frozen pending the
+        // bounded drain wait, and the repair decides whether to resume the
+        // survived checkpoint or rebuild.
+        resetParserAppliedSurface()
+        if (clearViewportFirst) {
+          try {
+            termRef.current?.clear()
+          } catch {
+            // disposed
+          }
         }
       }
       applySeqState(beginAttach(createAttachSeqState({ lastSeq: 0 })))
     } else {
+      // Delta resume: the surface keeps its rendered content and its
+      // coverage position (≥ the resume baseline by construction — the
+      // baseline came from this surface's own checkpoint); only the seq
+      // state re-bases to the resume position.
       applySeqState(beginAttach(createAttachSeqState({
         lastSeq: deltaSeq,
         parserAppliedSeq: deltaSeq,
@@ -3128,6 +3648,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       pendingSinceSeq: sinceSeq,
       pendingReason: opts?.priority === 'background' ? 'background_catchup' : 'initial_hydrate',
     }
+
+    // Paced replay consumption (Workstream 1): arm the frontier for THIS
+    // generation only on a negotiated connection — the next attach replaces
+    // it; non-negotiated attaches never arm one.
+    const pacedReplayNegotiated = isPacedReplayNegotiated()
+    pacedReplayRef.current = pacedReplayNegotiated
+      ? beginPacedReplayConsumption({ terminalId: tid, attachRequestId, sinceSeq })
+      : null
+
+    // Per-generation deferred content reset (delivery-loss repair
+    // fallback): armed only for the hydrate that asked to defer its
+    // viewport clear until its content establishes the new baseline.
+    repairContentResetPendingRef.current = opts?.deferViewportClearUntilContent === true
+      ? attachRequestId
+      : null
 
     currentAttachRef.current = {
       requestId: attachRequestId,
@@ -3172,12 +3707,18 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       ? { terminalId: tid, cols, rows }
       : null
 
-    // surfaceReset is claimed on the wire whenever the surface is fresh —
-    // independently of the wire intent swap (hidden panes attach as
-    // keepalive_delta yet still need the preamble: background hydration is
-    // exactly where a recreated hidden pane receives its mode bytes).
-    const claimSurfaceReset = surfaceFreshRef.current
-    if (claimSurfaceReset) {
+    // surfaceReset is claimed on the wire whenever the surface is fresh AND
+    // this attach actually rebuilds it — independently of the wire intent
+    // swap (hidden panes attach as keepalive_delta yet still need the
+    // preamble: background hydration is exactly where a recreated hidden
+    // pane receives its mode bytes). A partial-hydrate EXEMPTION resume
+    // re-claims nothing (its preamble was already delivered with the
+    // interrupted attach) but re-targets the coupled marker to THIS
+    // generation so the claim's consumption sites (its replay content
+    // applying, or its attach completing) keep working across the
+    // continuation.
+    const claimSurfaceReset = surfaceFreshRef.current && effectiveIntent === 'viewport_hydrate'
+    if (surfaceFreshRef.current) {
       surfaceFreshMarkerRef.current = { attachRequestId }
     }
     ws.send(buildTerminalAttachMessage({
@@ -3194,7 +3735,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       // fence — terminal.attach participates in the coordinator (a queued
       // cross-device attach is generation-fenced server-side).
       ownerFence: selectPaneOwnerFence(appStore.getState(), contentRef.current ?? {}) ?? undefined,
-      ...(opts?.maxReplayBytes ? { maxReplayBytes: opts.maxReplayBytes } : {}),
+      // Paced replay negotiation (Workstream 1): negotiated attaches —
+      // fresh AND delta, with or without explicit options — request
+      // page-sized delivery and never carry the legacy truncation budget.
+      // Non-negotiated stays byte-identical to today.
+      ...(pacedReplayNegotiated
+        ? { replayPageBytes: opts?.replayPageBytes ?? REPLAY_PAGE_BYTES }
+        : opts?.maxReplayBytes ? { maxReplayBytes: opts.maxReplayBytes } : {}),
       ...(claimSurfaceReset ? { surfaceReset: true } : {}),
     }))
     rememberSentViewport(tid, cols, rows)
@@ -3218,6 +3765,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     clearQuarantineRepair,
     getCheckpointDeltaReplayDecision,
     getTerminalCheckpointStreamId,
+    isPacedReplayNegotiated,
     recordTerminalPerfAuditEvent,
     resetParserAppliedSurface,
     scheduleQuarantineRepair,
@@ -3237,6 +3785,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     if (!paneRefreshTargetMatchesContent(request.target, currentContent)) return false
 
     handledRefreshRequestIdRef.current = request.requestId
+    // An explicit pane refresh is user intent, not automatic recovery cycling:
+    // reset the recovery accounting so the refresh attach is never blocked by
+    // the no-progress bound (and the retry strip, if shown, is re-armed from
+    // the current coverage position).
+    recoveryAccountingRef.current = resetRecoveryAccounting(
+      recoveryAccountingRef.current,
+      surfaceCoverageSeqRef.current,
+      Date.now(),
+    )
+    setRecoveryExhausted(false)
     ws.send({ type: 'terminal.detach', terminalId: tid })
 
     if (hiddenRef.current) {
@@ -3248,23 +3806,50 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         pendingReason: 'explicit_refresh',
       }
       setIsAttaching(false)
-      // F8: the detach was already sent above -- re-arm the attach via the
-      // background hydration queue so a hidden refresh cannot strand the
-      // pane detached until reveal. Same three-step sequence as the
-      // terminal.created site (see its comment for why each line exists).
+      // Lifetime (responsive-terminal-restore WS1): a claim-negotiated hidden
+      // pane does not re-arm the hydration queue — the terminal is claimed in
+      // the interest snapshot, and the deferred intent above re-hydrates at
+      // reveal.
+      if (isLifetimeClaimNegotiated()) return
+      // F8 (old-server fallback): the detach was already sent above -- re-arm
+      // the attach via the background hydration queue so a hidden refresh
+      // cannot strand the pane detached until reveal. Same three-step
+      // sequence as the terminal.created site (see its comment for why each
+      // line exists).
       getHydrationQueue().onHydrationComplete(paneIdRef.current)
       hydrationRegisteredRef.current = false
       registerForBackgroundHydration({ queueIfStarted: true })
     } else {
       attachTerminal(tid, 'viewport_hydrate', {
         clearViewportFirst: true,
-        ...viewportHydrateReplayOptions(currentContent),
+        ...viewportHydrateReplayOptions(currentContent, isPacedReplayNegotiated()),
       })
     }
 
     dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: request.requestId }))
     return true
-  }, [attachTerminal, dispatch, paneId, registerForBackgroundHydration, suppressNetworkEffects, tabId, ws])
+  }, [attachTerminal, dispatch, isLifetimeClaimNegotiated, isPacedReplayNegotiated, paneId, registerForBackgroundHydration, suppressNetworkEffects, tabId, ws])
+
+  // Explicit retry of bounded recovery (WS2): the visible retry state's
+  // control. Resets the accounting and resumes recovery — never a kill, a
+  // replacement, or an identity change; the preserved surface content stays
+  // and the attach resumes from the checkpoint when one is valid.
+  const retryTerminalRestore = useCallback(() => {
+    const tid = terminalIdRef.current
+    recoveryAccountingRef.current = resetRecoveryAccounting(
+      recoveryAccountingRef.current,
+      surfaceCoverageSeqRef.current,
+      Date.now(),
+    )
+    setRecoveryExhausted(false)
+    recordTerminalPerfAuditEvent('terminal.restore.recovery_retry', {
+      terminalId: tid,
+      coverageSeq: surfaceCoverageSeqRef.current,
+    })
+    if (tid) {
+      attachTerminalRef.current?.(tid, 'transport_reconnect')
+    }
+  }, [recordTerminalPerfAuditEvent])
 
   // Apply settings changes
   useEffect(() => {
@@ -3299,10 +3884,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       const deferred = deferredAttachStateRef.current
       if (tid && deferred.mode === 'waiting_for_geometry' && deferred.pendingIntent) {
         // Unregister from background queue — this tab is now being directly hydrated
-        if (hydrationRegisteredRef.current) {
-          getHydrationQueue().unregister(paneId)
-          hydrationRegisteredRef.current = false
-        }
+        unregisterBackgroundHydration()
         getHydrationQueue().onActiveTabChanged(tabId, tabOrderRef.current)
         const checkpointDecision = getCheckpointDeltaReplayDecision(tid)
         const revealPlan = resolveRevealAttachPlan({
@@ -3317,21 +3899,28 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           suppressNextMatchingResize: true,
           skipPreAttachFit: true,
           ...(revealPlan.intent === 'viewport_hydrate'
-            ? viewportHydrateReplayOptions(contentRef.current)
+            ? viewportHydrateReplayOptions(contentRef.current, isPacedReplayNegotiated())
             : undefined),
         })
         return
       }
       requestTerminalLayout({ fit: true, resize: true })
     }
-  }, [hidden, isTerminal, paneId, requestTerminalLayout, tabId, attachTerminal, getCheckpointDeltaReplayDecision])
+  }, [hidden, isTerminal, requestTerminalLayout, tabId, attachTerminal, getCheckpointDeltaReplayDecision, isPacedReplayNegotiated, unregisterBackgroundHydration])
 
-  // Background hydration: triggered by the hydration queue for hidden tabs
+  // Background hydration: triggered by the hydration queue for hidden tabs.
+  // OLD-SERVER FALLBACK ONLY (responsive-terminal-restore WS1): a
+  // claim-negotiated hidden pane never registers, so a grant here means a
+  // stale pre-renegotiation registration — drop it and attach nothing.
   useEffect(() => {
     if (!backgroundHydrationTriggered) return
     setBackgroundHydrationTriggered(false)
     const tid = terminalIdRef.current
     if (!tid || !hiddenRef.current) return
+    if (isLifetimeClaimNegotiated()) {
+      unregisterBackgroundHydration()
+      return
+    }
     const checkpointDecision = getCheckpointDeltaReplayDecision(tid)
     if (checkpointDecision.ok) {
       attachTerminal(tid, 'keepalive_delta', {
@@ -3344,9 +3933,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     attachTerminal(tid, 'viewport_hydrate', {
       clearViewportFirst: true,
       priority: 'background',
-      ...viewportHydrateReplayOptions(contentRef.current),
+      ...viewportHydrateReplayOptions(contentRef.current, isPacedReplayNegotiated()),
     })
-  }, [backgroundHydrationTriggered, attachTerminal, getCheckpointDeltaReplayDecision])
+  }, [backgroundHydrationTriggered, attachTerminal, getCheckpointDeltaReplayDecision, isPacedReplayNegotiated, isLifetimeClaimNegotiated, unregisterBackgroundHydration])
 
   // Create or attach to backend terminal
   useEffect(() => {
@@ -3581,99 +4170,47 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       return true
     }
 
-    const completeDurableReplacement = (pending: PendingDurableReplacement) => {
-      if (pendingDurableReplacementRef.current?.requestId !== pending.requestId) {
-        return
-      }
-      pendingDurableReplacementRef.current = null
-      addTerminalRestoreRequestId(pending.requestId)
-      requestIdRef.current = pending.requestId
-      terminalIdRef.current = undefined
-      launchAttemptRef.current = null
-      reviveAttemptedRef.current = null
-      clearQuarantineRepair()
-      currentAttachRef.current = null
-      deferredAttachStateRef.current = {
-        mode: 'none',
-        pendingIntent: null,
-        pendingSinceSeq: 0,
-        pendingReason: 'initial_hydrate',
-      }
-      setIsAttaching(false)
-      setTruncatedHistoryGap(null)
-      dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
-      applySeqState(createAttachSeqState())
-      updateContent({
-        terminalId: undefined,
-        serverInstanceId: undefined,
-        streamId: undefined,
-        createRequestId: pending.requestId,
-        status: 'creating',
-        restoreError: undefined,
-      })
-      const currentTab = tabRef.current
-      if (currentTab) {
-        dispatch(updateTab({ id: currentTab.id, updates: { status: 'creating' } }))
-      }
-    }
-
-    const beginOpenCodeReplacementAfterExit = (terminalId: string) => {
-      const current = contentRef.current
-      const sessionRef = current?.sessionRef
-      if (
-        current?.mode !== 'opencode'
-        || sessionRef?.provider !== 'opencode'
-        || !sessionRef.sessionId
-      ) {
-        return false
-      }
-
-      const existing = pendingDurableReplacementRef.current
-      if (existing?.terminalId === terminalId) {
-        return true
-      }
-
-      const requestId = nanoid()
-      pendingDurableReplacementRef.current = {
-        terminalId,
-        requestId,
-        reason: 'opencode_replay_window_exceeded',
-      }
-      clearRateLimitRetry()
-      clearQuarantineRepair()
-      currentAttachRef.current = null
-      launchAttemptRef.current = null
-      deferredAttachStateRef.current = {
-        mode: 'none',
-        pendingIntent: null,
-        pendingSinceSeq: 0,
-        pendingReason: 'initial_hydrate',
-      }
-      setIsAttaching(true)
-      setTruncatedHistoryGap(null)
-      dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
-      clearTerminalCursor(terminalId)
-      resetParserAppliedSurface()
-      forgetSentViewport(terminalId)
-      lastSentViewportRef.current = null
-      applySeqState(createAttachSeqState())
-      writeLocalXtermNotice(term, '\r\n[Restarting OpenCode session because the saved terminal replay is no longer available]\r\n')
-      // b8ke ext r20 F2: the replacement kill carries the session's
-      // observed (epoch, generation) pair — a reconnect-queued stale
-      // kill is typed-refused instead of killing a newer owner.
-      sendTerminalKill(
-        terminalId,
-        resolveTerminalKillFence(appStore, {
-          provider: sessionRef?.provider,
-          sessionRef: sessionRef ?? undefined,
-        }),
-      )
-      return true
-    }
-
     async function ensure() {
       clearRateLimitRetry()
       // Connection is owned by App.tsx; messages will queue until ready
+
+      // Reconcile-episode key derivation (M-1), BEFORE any early return so
+      // the anchor updates on EVERY effect run: an attach fired because the
+      // pending window OPENED, because the verdict FOLDED (pending cleared —
+      // epoch bumped for corrective folds, unchanged for the task-009b
+      // no-change folds whose re-drive still fires on the non-negotiated
+      // lane), or because a fold landed without a pending window, carries
+      // the episode's key into the recovery gate. Keyless runs (mount,
+      // transport reconnects, other dep changes) count normally.
+      const reconcileEpoch = terminalContent?.reconcileEpoch ?? 0
+      const previousReconcileDrive = reconcileDriveStateRef.current
+      let reconcileAttemptKey: string | undefined
+      if (previousReconcileDrive) {
+        if (reconcilePendingSince !== undefined && reconcilePendingSince !== previousReconcileDrive.pendingSince) {
+          // A new reconcile pending window opened (setReconcilePendingPanes)
+          // — the episode key is the window's startedAt.
+          reconcileAttemptKey = `pending:${reconcilePendingSince}`
+        } else if (
+          reconcilePendingSince === undefined
+          && previousReconcileDrive.pendingSince !== undefined
+        ) {
+          // The window this run closes (the verdict fold — or its bounded
+          // timeout release) is the SAME episode's closing attach, whether
+          // or not the fold bumped the epoch.
+          reconcileAttemptKey = `pending:${previousReconcileDrive.pendingSince}`
+        } else if (reconcileEpoch !== previousReconcileDrive.epoch) {
+          // A fold without a pending window (the exhaustion reconcile, the
+          // D7 revival / restore-offer fold): each fold is its own
+          // one-count episode.
+          reconcileAttemptKey = `epoch:${reconcileEpoch}`
+        }
+      }
+      reconcileDriveStateRef.current = {
+        pendingSince: reconcilePendingSince,
+        epoch: reconcileEpoch,
+        createRequestId,
+        terminalId: terminalIdRef.current,
+      }
 
       const failLaunch = (message: string, restore: boolean, terminalId?: string) => {
         clearRateLimitRetry()
@@ -3925,6 +4462,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           mode: TerminalPaneContent['mode']
           terminalInstanceId: string
           parserAppliedSeq: number
+          seqStart: number
+          seqEnd: number
           completedAttach: boolean
         }) => {
           const activeAttach = currentAttachRef.current
@@ -3941,6 +4480,25 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           const nextSeqState = markParserAppliedSeq(seqStateRef.current, input.parserAppliedSeq)
           applySeqState(nextSeqState)
           markParserAppliedFrame(tid, nextSeqState.parserAppliedSeq, activeAttach)
+          // Surface-coverage cursor (WS2): an applied frame advances BOTH
+          // cursors — the coverage advance is contiguity-gated against the
+          // coverage cursor itself, so it extends past null-screen-effect
+          // filtered ranges the strict applied position refuses to cross,
+          // but never past a lost/unapplied hole. The advance persists the
+          // checkpoint so the coverage position survives an interrupt even
+          // when the strict applied position did not move (mixed page).
+          advanceSurfaceCoverageAndPersist(
+            tid,
+            activeAttach,
+            input.seqStart,
+            input.seqEnd,
+          )
+          // Paced replay consumption (Workstream 1): the write-queue applied
+          // this frame — the consumption frontier advances independent of the
+          // parser-applied checkpoint's quarantine clamping (the checkpoint
+          // still refuses filtered/lost ranges; the frontier is about
+          // consumption, not surface state).
+          advancePacedReplayConsumption(input.attachRequestId, input.parserAppliedSeq)
           if (input.completedAttach) {
             completeAttachGeneration({
               attachRequestId: input.attachRequestId,
@@ -4052,6 +4610,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
                   mode: input.mode,
                   terminalInstanceId: outputTerminalInstanceId,
                   parserAppliedSeq: input.parserAppliedSeq,
+                  seqStart: input.seqStart,
+                  seqEnd: input.seqEnd,
                   completedAttach: input.completedAttach,
                 })
               : undefined,
@@ -4065,6 +4625,36 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             || !inputBytesEqualSubmission
             || !submission.submittedBytesEqualInput
           ) {
+            // Paced replay consumption (Workstream 1): a frame the
+            // null-screen-effect pre-parsers fully consumed (nothing reached
+            // the queue, no replay-discard mutation) IS consumed — the
+            // frontier advances without any xterm write. M2 (task-4 review):
+            // `preParserConsumedAllBytes` is the exact `cleaned === ''`
+            // condition, so an enqueue failure (no write queue, disposed
+            // surface, thrown write) can NEVER masquerade as consumption —
+            // unconsumed bytes must never be credited. Partial or unknown
+            // mutations keep today's quarantine and forfeit the range's
+            // credit (the server's retention/expiry handling covers it).
+            if (
+              !submission.submittedWrite
+              && inputBytesEqualSubmission
+              && submission.preParserConsumedAllBytes
+            ) {
+              advancePacedReplayConsumption(input.attachRequestId, input.seqEnd)
+              schedulePacedReplayCreditFlush(input.outputSource, input.attachRequestId)
+              // Surface-coverage cursor (WS2): a fully pre-filtered frame
+              // advances ONLY the coverage cursor (the strict applied
+              // position stays pinned below it and keeps the unapplied-range
+              // quarantine above) — and persists it, so a disconnect right
+              // after a filtered page resumes from past it instead of
+              // re-delivering (and re-firing) the filtered bytes.
+              advanceSurfaceCoverageAndPersist(
+                tid,
+                currentAttachRef.current,
+                input.seqStart,
+                input.seqEnd,
+              )
+            }
             applySeqState(markOutputRangeUnapplied(seqStateRef.current, {
               fromSeq: input.seqStart,
               toSeq: input.seqEnd,
@@ -4248,6 +4838,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           }
           if (!outputSource) return
 
+          // Deferred-clear repair hydrate (round-3 fix): the clear now
+          // consumes at the RENDER moment inside `submitAcceptedOutput`'s
+          // write path — never here on envelope arrival. A rejected
+          // duplicate/overlap or a fully filtered frame must not consume
+          // it; the next writing frame clears-then-writes.
           const previousSeqState = seqStateRef.current
           const batchDecision = onOutputBatchSegments(previousSeqState, batchSegments)
           if (!batchDecision.accept) {
@@ -4262,6 +4857,33 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             return
           }
 
+          if (tid && batchDecision.implicitGaps.length > 0) {
+            // Implicit gap (responsive-terminal-restore): the batch jumped
+            // forward across sequences no gap frame declared. The seq state
+            // already folded the hole (known lost range + quarantine, the
+            // applied cursor pinned below it); surface it honestly — the
+            // quarantine is observable, and a local notice names the
+            // exact lost range. Never a silent applied-cursor advance.
+            for (const implicitGap of batchDecision.implicitGaps) {
+              recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
+                terminalId: tid,
+                attachRequestId: msg.attachRequestId,
+                activeAttachRequestId: currentAttachRef.current?.requestId,
+                streamId: msg.streamId,
+                fromSeq: implicitGap.fromSeq,
+                toSeq: implicitGap.toSeq,
+                parserAppliedSeq: parserAppliedSeqRef.current,
+                highestObservedSeq: batchDecision.state.highestObservedSeq,
+                reason: 'implicit_sequence_jump',
+              })
+              writeLocalXtermNotice(
+                term,
+                `\r\n[Output gap ${implicitGap.fromSeq}-${implicitGap.toSeq}: unexplained sequence jump]\r\n`,
+              )
+            }
+            resetParserAppliedSurface(parserAppliedSeqRef.current)
+          }
+
           if (tid && batchDecision.freshReset) {
             clearTerminalCursor(tid)
             resetParserAppliedSurface()
@@ -4271,6 +4893,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           const completedAttachOnBatch = !batchDecision.state.pendingReplay
             && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           applySeqState(batchDecision.state)
+          markPacedReplayReceived(msg.attachRequestId, batchSeqEnd)
 
           const containsBarrier = batchSegments.some((segment) => segment.barrier)
           if (!containsBarrier) {
@@ -4331,6 +4954,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             }
             return
           }
+          // Deferred-clear repair hydrate (round-3 fix): the clear now
+          // consumes at the RENDER moment inside `submitAcceptedOutput`'s
+          // write path — never here on envelope arrival. A rejected
+          // duplicate/overlap or a fully filtered frame must not consume
+          // it; the next writing frame clears-then-writes.
           const previousSeqState = seqStateRef.current
           const frameDecision = onOutputFrame(previousSeqState, {
             seqStart: msg.seqStart,
@@ -4349,6 +4977,31 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             return
           }
 
+          if (tid && frameDecision.implicitGap) {
+            // Implicit gap (responsive-terminal-restore): the frame jumped
+            // forward across sequences no gap frame declared. The seq state
+            // already folded the hole (known lost range + quarantine, the
+            // applied cursor pinned below it); surface it honestly — the
+            // quarantine is observable, and a local notice names the exact
+            // lost range. Never a silent applied-cursor advance.
+            recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
+              terminalId: tid,
+              attachRequestId: msg.attachRequestId,
+              activeAttachRequestId: currentAttachRef.current?.requestId,
+              streamId: msg.streamId,
+              fromSeq: frameDecision.implicitGap.fromSeq,
+              toSeq: frameDecision.implicitGap.toSeq,
+              parserAppliedSeq: parserAppliedSeqRef.current,
+              highestObservedSeq: frameDecision.state.highestObservedSeq,
+              reason: 'implicit_sequence_jump',
+            })
+            writeLocalXtermNotice(
+              term,
+              `\r\n[Output gap ${frameDecision.implicitGap.fromSeq}-${frameDecision.implicitGap.toSeq}: unexplained sequence jump]\r\n`,
+            )
+            resetParserAppliedSurface(parserAppliedSeqRef.current)
+          }
+
           if (tid && frameDecision.freshReset) {
             clearTerminalCursor(tid)
             resetParserAppliedSurface()
@@ -4362,6 +5015,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           const completedAttachOnFrame = !frameDecision.state.pendingReplay
             && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           applySeqState(frameDecision.state)
+          markPacedReplayReceived(msg.attachRequestId, msg.seqEnd)
           submitAcceptedOutput({
             raw: msg.data || '',
             seqStart: msg.seqStart,
@@ -4393,29 +5047,101 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
 
           // Only show "load more" when the server confirms the gap is from
           // byte-budget truncation (recoverable), not ring overflow (data gone).
+          const pacedReplayNegotiated = isPacedReplayNegotiated()
           const isTruncatedReplay = msg.reason === 'replay_budget_exceeded'
             && seqStateRef.current.pendingReplay
-          const isUnrecoverableOpenCodeViewportHydrate = msg.reason === 'replay_window_exceeded'
-            && currentAttachRef.current?.intent === 'viewport_hydrate'
-            && currentAttachRef.current.sinceSeq === 0
-            && contentRef.current?.mode === 'opencode'
-            && contentRef.current.sessionRef?.provider === 'opencode'
-          if (isUnrecoverableOpenCodeViewportHydrate && beginOpenCodeReplacementAfterExit(tid)) {
-            return
-          }
+          // The delivery-loss repair decision (pure — computed from the
+          // pre-gap seq state; the state itself is applied further below).
+          // Hoisted ABOVE the notice branches so the queue_overflow /
+          // handoff_boundary_reached notice can be SUPPRESSED here and
+          // re-emitted UNDER THE REPAIR'S NEW generation below: the repair
+          // attach mints a new generation with dropQueuedStaleWrites, so a
+          // notice enqueued under the OLD generation is discarded before
+          // the animation-frame flush can render it (round-4 F4 — the
+          // honest notice must survive the repair).
+          const gapDecisionForNotice = onOutputGap(seqStateRef.current, {
+            fromSeq: msg.fromSeq,
+            toSeq: msg.toSeq,
+          })
+          const deliveryRepairPending = pacedReplayNegotiated
+            && (msg.reason === 'queue_overflow' || msg.reason === 'handoff_boundary_reached')
+            && gapDecisionForNotice.requiresSurfaceQuarantine
+          // Retention gaps NEVER trigger an automatic OpenCode replacement
+          // (responsive-terminal-restore WS2): the auto-kill path is removed
+          // entirely — a retention gap is honest state, not a license to
+          // kill or replace a healthy process. Any explicit restart remains
+          // separate user intent. Negotiated gaps show the accessible
+          // incomplete-history notice; the legacy path keeps its local gap
+          // notice (old servers never emit this gap shape anyway — the paced
+          // core is its only emitter and it requires negotiation).
 
           if (isTruncatedReplay) {
             setTruncatedHistoryGap({ fromSeq: msg.fromSeq, toSeq: msg.toSeq })
+          } else if (pacedReplayNegotiated && msg.reason === 'replay_window_exceeded') {
+            // Honest incomplete-history state on the paced path: some earlier
+            // output is gone; live output continues. Absent bounds fields
+            // mean UNKNOWN BOUNDS (the terminal may have vanished at gap
+            // emission) — never non-negotiation.
+            const gapHeadSeq = typeof msg.headSeq === 'number' ? msg.headSeq : null
+            const gapOldestRetainedSeq = typeof msg.oldestRetainedSeq === 'number' ? msg.oldestRetainedSeq : null
+            setRetentionLossNotice({
+              fromSeq: msg.fromSeq,
+              toSeq: msg.toSeq,
+              headSeq: gapHeadSeq,
+              oldestRetainedSeq: gapOldestRetainedSeq,
+            })
+            // The retention-loss notice is the AUTHORITATIVE honest state
+            // here — a delivery-gap repair whose fetch resolved to
+            // unrecoverable retention must not leave its (now-stale)
+            // "refetching" chrome claim on screen alongside it.
+            setDeliveryGapNotice(null)
+            recordTerminalPerfAuditEvent('terminal.restore.retention_gap', {
+              terminalId: tid,
+              attachRequestId: msg.attachRequestId,
+              fromSeq: msg.fromSeq,
+              toSeq: msg.toSeq,
+              headSeq: gapHeadSeq,
+              oldestRetainedSeq: gapOldestRetainedSeq,
+            })
+            // Round-2 disarm (the deferred content reset must not survive
+            // a server-declared unreconstructible prefix): when THIS
+            // generation's repair hydrate deferred its viewport clear
+            // (the no-checkpoint fallback), the retention gap declares
+            // the missing prefix CANNOT be rebuilt — the pre-gap screen
+            // is the best available surface, so the pending clear is
+            // DISARMED here, before any suffix frame can consume it and
+            // wipe the screen mid-restore. The honest-loss UX proceeds
+            // and the retained suffix appends onto the preserved
+            // surface.
+            if (
+              typeof msg.attachRequestId === 'string'
+              && repairContentResetPendingRef.current === msg.attachRequestId
+            ) {
+              repairContentResetPendingRef.current = null
+            }
+          } else if (deliveryRepairPending) {
+            // Suppressed here — the negotiated delivery-loss repair owns
+            // the notice (round-5 finding 2): the honest notice rides UI
+            // CHROME below (set after the repair attach fires), never a
+            // local xterm write. The pre-fix immediate write mutated the
+            // surface BETWEEN the checkpoint state and the repair's
+            // replayed bytes — corrupting the repaired screen whenever the
+            // gap straddled an in-flight escape sequence or cursor
+            // position; the legacy non-negotiated lane (the else branch)
+            // keeps its existing immediate-notice behavior.
           } else {
             const reason = msg.reason === 'replay_window_exceeded'
               ? 'reconnect window exceeded'
-              : 'slow link backlog'
+              : msg.reason === 'handoff_boundary_reached'
+                ? 'restore boundary reached'
+                : 'slow link backlog'
             writeLocalXtermNotice(term, `\r\n[Output gap ${msg.fromSeq}-${msg.toSeq}: ${reason}]\r\n`)
           }
           const previousSeqState = seqStateRef.current
           const gapDecision = onOutputGap(previousSeqState, { fromSeq: msg.fromSeq, toSeq: msg.toSeq })
           const nextSeqState = gapDecision.state
           applySeqState(nextSeqState)
+          markPacedReplayReceived(msg.attachRequestId, msg.toSeq)
           resetParserAppliedSurface(parserAppliedSeqRef.current)
           if (gapDecision.requiresSurfaceQuarantine) {
             recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
@@ -4436,6 +5162,85 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             resetStartupProbeParser({ discardReplayRemainder: Boolean(previousSeqState.pendingReplay) })
             setIsAttaching(false)
             markAttachComplete()
+          }
+          // Delivery-loss repair (responsive-terminal-restore WS3→WS2,
+          // negotiated lane only): a queue_overflow gap on the STILL-OPEN
+          // connection means this connection missed sequenced output — the
+          // shared restore contract requires repair from retained output,
+          // never silent advancement and never a stranded screen. The
+          // round-4 fixed-boundary exit (plan:146) is the SAME delivery
+          // loss: the paced session completed at its FIXED boundary with
+          // output staged past it, and the server declared the exact
+          // retained interval as the `handoff_boundary_reached` gap — the
+          // ring still holds it, so the identical checkpoint-cursor
+          // repair fetches it. In both shapes the ring retained the
+          // declared range, so the repair RESUMES from the surface
+          // checkpoint cursor (the checkpoint-aware delta resume): a delta
+          // attach refills the visible surface WITHOUT clearing it. One
+          // bounded repair attach per gap, through the recovery accounting
+          // — repeated gaps exhaust to the visible retry strip. If the
+          // server answers that retention has expired past the cursor (the
+          // bounds-carrying gap), the existing honest-loss UX applies
+          // below — never a destructive rebuild. Only when no valid
+          // checkpoint exists may the repair fall back to a full hydrate,
+          // and even then the viewport is not cleared before the new
+          // baseline is actually established by attach content (the
+          // deferred content reset). Old servers never emit these
+          // negotiated gap shapes; their local-notice behavior (pinned
+          // above) is unchanged.
+          if (
+            pacedReplayNegotiated
+            && (msg.reason === 'queue_overflow' || msg.reason === 'handoff_boundary_reached')
+            && gapDecision.requiresSurfaceQuarantine
+          ) {
+            recordTerminalPerfAuditEvent('terminal.restore.queue_overflow_repair', {
+              terminalId: tid,
+              attachRequestId: msg.attachRequestId,
+              activeAttachRequestId: currentAttachRef.current?.requestId,
+              fromSeq: msg.fromSeq,
+              toSeq: msg.toSeq,
+              reason: msg.reason,
+            })
+            // The gap's local-notice invalidation bumped the surface
+            // epoch; re-save the quarantined surface's pinned cursor under
+            // the new epoch so the delta repair's checkpoint decision
+            // validates and resumes from the coverage cursor.
+            persistSurfaceCheckpointForAttach(tid, currentAttachRef.current, parserAppliedSeqRef.current)
+            const checkpointDecision = getCheckpointDeltaReplayDecision(tid)
+            if (checkpointDecision.ok) {
+              attachTerminal(tid, 'transport_reconnect', {
+                clearViewportFirst: false,
+                sinceSeq: checkpointDecision.sinceSeq,
+              })
+            } else {
+              attachTerminal(tid, 'viewport_hydrate', {
+                clearViewportFirst: false,
+                deferViewportClearUntilContent: true,
+                ...viewportHydrateReplayOptions(contentRef.current, pacedReplayNegotiated),
+              })
+            }
+            // THE HONEST NOTICE RIDES CHROME (round-5 finding 2, the
+            // round-4 F4 fix's successor): during a checkpoint-based
+            // delta repair NOTHING may write to the xterm surface before
+            // the replayed bytes apply — the pre-fix local notice was
+            // enqueued right here, between the surface state the
+            // checkpoint captured and the repair's replayed terminal
+            // instructions, shifting the cursor/parser state the
+            // replayed bytes were addressed to (an in-flight multi-frame
+            // escape sequence made the corruption direct: the notice
+            // bytes were consumed as escape continuation). The notice is
+            // React state — set AFTER the repair attach (which clears
+            // stale notices) — so it is honestly shown through the
+            // generation change, and the repaired surface stays exactly
+            // the uninterrupted reference.
+            const noticeReason = msg.reason === 'handoff_boundary_reached'
+              ? 'restore boundary reached'
+              : 'slow link backlog'
+            setDeliveryGapNotice({
+              fromSeq: msg.fromSeq,
+              toSeq: msg.toSeq,
+              reason: noticeReason,
+            })
           }
         }
 
@@ -4541,7 +5346,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             updateContent({ streamId: undefined })
             attachTerminal(tid, 'viewport_hydrate', {
               clearViewportFirst: true,
-              ...viewportHydrateReplayOptions(contentRef.current),
+              ...viewportHydrateReplayOptions(contentRef.current, isPacedReplayNegotiated()),
             })
             return
           }
@@ -4576,7 +5381,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             resetParserAppliedSurface(parserAppliedSeqRef.current)
             attachTerminal(tid, 'viewport_hydrate', {
               clearViewportFirst: true,
-              ...viewportHydrateReplayOptions(contentRef.current),
+              ...viewportHydrateReplayOptions(contentRef.current, isPacedReplayNegotiated()),
             })
             return
           }
@@ -4628,6 +5433,29 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             replayToSeq: msg.replayToSeq,
           })
           applySeqState(nextSeqState)
+          // Paced replay consumption (Workstream 1): record the session
+          // window end (replayToSeq on a paced ready describes the SESSION
+          // window — the fixed catch-up target — never a single page's
+          // bounds) and the restore-contract fields. Legacy-path ready frames
+          // on a negotiated connection (an already-Exited terminal) carry the
+          // contract fields too; their credits are inert server-side.
+          const pacedReadyState = pacedReplayRef.current
+          if (pacedReadyState && msg.attachRequestId === pacedReadyState.attachRequestId) {
+            pacedReplayRef.current = pacedReplayOnReady(pacedReadyState, {
+              replayToSeq: msg.replayToSeq,
+            })
+            recordTerminalPerfAuditEvent('terminal.restore.paced_ready', {
+              terminalId: tid,
+              attachRequestId: msg.attachRequestId,
+              requestedSinceSeq: msg.requestedSinceSeq,
+              effectiveSinceSeq: msg.effectiveSinceSeq,
+              oldestRetainedSeq: msg.oldestRetainedSeq,
+              replayResetReason: msg.replayResetReason,
+              headSeq: msg.headSeq,
+              replayFromSeq: msg.replayFromSeq,
+              replayToSeq: msg.replayToSeq,
+            })
+          }
           setIsAttaching(Boolean(nextSeqState.pendingReplay))
           if (!nextSeqState.pendingReplay) {
             // Completion-clear edge for empty-tracker / no-replay attaches
@@ -4804,11 +5632,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               pendingReason: 'terminal_created',
             }
             setIsAttaching(false)
-            // F8: a hidden pane still owes the server an attach. Drive it
-            // through the background hydration queue (one-at-a-time stagger)
-            // instead of waiting for reveal -- otherwise the terminal sits
-            // detached server-side and is idle-reaped after 15 minutes.
-            // Order matters (verified queue semantics):
+            // Lifetime (responsive-terminal-restore WS1): a claim-negotiated
+            // hidden pane NEVER attaches while hidden — its terminalId is
+            // claimed in the interest snapshot (TerminalInterestReporter) and
+            // the deferred intent above arms the reveal hydrate. The
+            // server-side claim keeps the terminal alive without replay.
+            if (isLifetimeClaimNegotiated()) {
+              unregisterBackgroundHydration()
+              return
+            }
+            // F8 (old-server fallback — no claim echo): a hidden pane still
+            // owes the server an attach. Drive it through the background
+            // hydration queue (one-at-a-time stagger) instead of waiting for
+            // reveal -- otherwise the terminal sits detached server-side and
+            // is idle-reaped after 15 minutes. Order matters (verified queue
+            // semantics):
             // 1) clear this pane's stale active slot -- a background
             //    hydration that died with the old connection otherwise
             //    wedges the whole queue (no-op when not the active pane);
@@ -4959,11 +5797,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             exitCode: msg.exitCode,
             at: Date.now(),
           }))
-          const pendingReplacement = pendingDurableReplacementRef.current
-          if (pendingReplacement?.terminalId === tid) {
-            completeDurableReplacement(pendingReplacement)
-            return
-          }
 
           const launchAttempt = launchAttemptRef.current
           const exitedDuringLaunch = launchAttempt?.terminalId === tid && !launchAttempt.attachReady
@@ -5366,7 +6199,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           const currentTerminalId = terminalIdRef.current
           const current = contentRef.current
           const launchAttempt = launchAttemptRef.current
-          const pendingReplacement = pendingDurableReplacementRef.current
           if (debugRef.current) log.debug('[TRACE resumeSessionId] INVALID_TERMINAL_ID received', {
             paneId: paneIdRef.current,
             msgTerminalId: msg.terminalId,
@@ -5376,13 +6208,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             currentResumeSessionId: current?.resumeSessionId,
             currentStatus: current?.status,
           })
-          if (
-            pendingReplacement
-            && (!msg.terminalId || msg.terminalId === pendingReplacement.terminalId)
-          ) {
-            completeDurableReplacement(pendingReplacement)
-            return
-          }
           if (msg.terminalId && msg.terminalId !== currentTerminalId) {
             // Show feedback if the terminal already exited (the ID was cleared by
             // the exit handler, so msg.terminalId no longer matches the ref)
@@ -5654,9 +6479,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
                 pendingSinceSeq: 0,
                 pendingReason: 'hidden_reveal',
               }
-          // Same three-step re-register as the terminal.created hidden path
-          // (~:4506): a stale active slot or a consumed registration guard
-          // otherwise wedges this pane out of the post-reconnect pump entirely.
+          // Lifetime (responsive-terminal-restore WS1): a claim-negotiated
+          // hidden pane reconnects WITHOUT attaching — the fresh connection's
+          // interest snapshot re-claims its terminalId (the ready-frame
+          // re-flush carries the claim set), and the deferred intent above
+          // arms the reveal attach.
+          if (isLifetimeClaimNegotiated()) {
+            unregisterBackgroundHydration()
+            return
+          }
+          // Old-server fallback: same three-step re-register as the
+          // terminal.created hidden path (~:4506): a stale active slot or a
+          // consumed registration guard otherwise wedges this pane out of the
+          // post-reconnect pump entirely.
           getHydrationQueue().onHydrationComplete(paneIdRef.current)
           hydrationRegisteredRef.current = false
           // Always queueIfStarted: a hidden pane's reattach must not wait for
@@ -5710,15 +6545,76 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               }
           setIsAttaching(false)
 
-          // Register with hydration queue for progressive background hydration
+          // Lifetime (responsive-terminal-restore WS1): a claim-negotiated
+          // hidden pane does NOT register for background hydration — its
+          // terminalId is claimed in the interest snapshot, and the deferred
+          // intent above arms the reveal attach.
+          if (isLifetimeClaimNegotiated()) {
+            unregisterBackgroundHydration()
+            return
+          }
+          // Old-server fallback: register with hydration queue for
+          // progressive background hydration.
           registerForBackgroundHydration()
         } else {
-          const intent: AttachIntent = deferredAttachStateRef.current.mode === 'live'
+          // Goal-4 re-drive gate (task-009b): a reconcile-driven re-run whose
+          // pane identity is unchanged — the ready round's pending-window
+          // opening, or a no-change verdict fold closing it
+          // (applyReconcileAttach skips the epoch bump for no-change folds)
+          // — must NOT re-attach a pane whose attach lifecycle is already in
+          // motion. The old mode heuristic re-fired a viewport_hydrate here
+          // on every reconnect flap and superseded the in-flight checkpoint
+          // delta resume with a full refetch. Scoped to the negotiated
+          // (paced-replay) lane AND to a current attach generation that was
+          // itself built post-negotiation (pacedReplayRef is absent for
+          // non-negotiated attaches): a pre-ready MOUNT attach carries the
+          // legacy 128 KiB truncation budget, and the re-drive chain was
+          // load-bearing as the repair that replaced it with the full paced
+          // restore — such a pane must still re-drive. Old servers
+          // (no paced replay) keep today's exact re-drive chain. Corrective
+          // folds (epoch changed), identity changes, and an un-anchored pane
+          // (mode 'none') always re-drive below.
+          const deferredMode = deferredAttachStateRef.current.mode
+          const reconcileNoopRedrive = isPacedReplayNegotiated()
+            && pacedReplayRef.current !== null
+            && previousReconcileDrive !== null
+            && reconcileEpoch === previousReconcileDrive.epoch
+            && reconcilePendingSince !== previousReconcileDrive.pendingSince
+            && createRequestId === previousReconcileDrive.createRequestId
+            && currentTerminalId === previousReconcileDrive.terminalId
+            && (deferredMode === 'live' || deferredMode === 'attaching')
+          if (reconcileNoopRedrive) {
+            if (debugRef.current) {
+              log.debug('[TRACE resumeSessionId] skipping reconcile re-drive: identity unchanged, attach lifecycle in motion', {
+                paneId: paneIdRef.current,
+                terminalId: currentTerminalId,
+                reconcileEpoch,
+                reconcilePendingSince,
+                deferredMode,
+              })
+            }
+            return
+          }
+          // Checkpoint-aware re-drive intent (task-009b): a corrective fold
+          // that lands mid-attach used to pick viewport_hydrate off the
+          // 'attaching' mode alone and refetch the whole retained buffer;
+          // on the negotiated lane, with a healthy checkpoint for THIS
+          // surface, the re-drive resumes instead (attachTerminal's internal
+          // geometry-aware decision still falls back to viewport_hydrate
+          // when the checkpoint is unusable — the same contract as the
+          // hidden branch above). Non-negotiated connections keep the mode
+          // heuristic exactly.
+          const checkpointDecision = getCheckpointDeltaReplayDecision(currentTerminalId)
+          const intent: AttachIntent = deferredMode === 'live'
+            || (isPacedReplayNegotiated() && checkpointDecision.ok)
             ? 'keepalive_delta'
             : 'viewport_hydrate'
-          attachTerminal(currentTerminalId, intent, intent === 'viewport_hydrate'
-            ? viewportHydrateReplayOptions(contentRef.current)
-            : undefined)
+          attachTerminal(currentTerminalId, intent, {
+            ...(intent === 'viewport_hydrate'
+              ? viewportHydrateReplayOptions(contentRef.current, isPacedReplayNegotiated())
+              : undefined),
+            ...(reconcileAttemptKey !== undefined ? { recoveryAttemptKey: reconcileAttemptKey } : {}),
+          })
           // One-shot reconcile notice (attach/corrected/duplicate verdicts):
           // render it on the attach that the verdict fold re-fired, then
           // clear it from the store.
@@ -5865,9 +6761,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     getTerminalCheckpointStreamId,
     isCurrentAttachMessage,
     isCurrentAttachStreamMessage,
+    isLifetimeClaimNegotiated,
     markAttachComplete,
     markParserAppliedFrame,
     markTerminalOutputRangeLost,
+    advanceSurfaceCoverageAndPersist,
     recordTerminalPerfAuditEvent,
     registerForBackgroundHydration,
     resetParserAppliedSurface,
@@ -5932,9 +6830,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   ): Promise<KillAck | null> => {
     const tid = terminalIdRef.current
     if (!tid) return null
-    // Advisory guard (matrix arm E): the opencode replay-window replacement
-    // flow already owns this pane's recovery — a second kill would race it.
-    if (pendingDurableReplacementRef.current) return null
+    // (The opencode replay-window replacement flow's advisory guard is gone
+    // with the flow itself: this branch's checkpoint-resume contract replaces
+    // the durable-PTY-replacement mechanism — the ref is never set anymore.)
     // In-flight re-entrancy lock (matrix arm G, review Minor-1): a second
     // click while this pane's kill-await is outstanding is a no-op. Both
     // stuck-card actions share this entry, so the lock covers restart AND
@@ -6295,8 +7193,61 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           </span>
         </div>
       )}
+      {retentionLossNotice && (
+        // Honest incomplete-history state (responsive-terminal-restore): a
+        // negotiated retention gap's accessible notice — live output keeps
+        // flowing below it.
+        <div
+          role="status"
+          aria-live="polite"
+          data-testid="restore-retention-loss-notice"
+          className="pointer-events-none absolute inset-x-0 top-0 z-10 bg-amber-100/90 px-3 py-1 text-xs text-amber-900 dark:bg-amber-900/80 dark:text-amber-100"
+        >
+          Some earlier terminal output is no longer available on the server. Live output continues.
+        </div>
+      )}
+      {deliveryGapNotice && (
+        // Honest delivery-loss state (responsive-terminal-restore,
+        // round-5 finding 2): a negotiated queue_overflow /
+        // handoff_boundary_reached gap's accessible CHROME notice. Never a
+        // surface write — during the checkpoint delta repair NOTHING may
+        // mutate the xterm surface before the replayed bytes apply, so the
+        // notice rides React state and the screen below it is repaired to
+        // exactly the uninterrupted reference.
+        <div
+          role="status"
+          aria-live="polite"
+          data-testid="restore-delivery-gap-notice"
+          className={`pointer-events-none absolute inset-x-0 ${retentionLossNotice ? 'top-9' : 'top-0'} z-10 bg-amber-100/90 px-3 py-1 text-xs text-amber-900 dark:bg-amber-900/80 dark:text-amber-100`}
+        >
+          {`Terminal output gap ${deliveryGapNotice.fromSeq}-${deliveryGapNotice.toSeq} (${deliveryGapNotice.reason}). The missing output is being refetched — the screen below is completed as it arrives.`}
+        </div>
+      )}
+      {recoveryExhausted && (
+        // Bounded automatic recovery (responsive-terminal-restore WS2): the
+        // visible, accessible retry state. Automatic re-attach cycling was
+        // stopped after repeated attempts with no restore progress; the
+        // terminal content below is PRESERVED and an explicit retry resumes.
+        <div
+          role="alert"
+          data-testid="restore-recovery-retry"
+          className={`absolute inset-x-0 ${retentionLossNotice && deliveryGapNotice ? 'top-[4.5rem]' : retentionLossNotice || deliveryGapNotice ? 'top-9' : 'top-0'} z-10 flex items-center justify-between gap-2 bg-amber-100/95 px-3 py-1 text-xs text-amber-900 dark:bg-amber-900/85 dark:text-amber-100`}
+        >
+          <span>Terminal restore is not making progress. What is on screen is unchanged.</span>
+          <button
+            type="button"
+            onClick={retryTerminalRestore}
+            aria-label="Retry terminal restore"
+            className="shrink-0 rounded bg-amber-200/90 px-2 py-0.5 font-medium text-amber-950 ring-1 ring-amber-400/60 transition-colors hover:bg-amber-300 dark:bg-amber-800/90 dark:text-amber-50 dark:ring-amber-500/40 dark:hover:bg-amber-700"
+          >
+            Retry restore
+          </button>
+        </div>
+      )}
       {truncatedHistoryGap && (
-        <div className="absolute inset-x-0 top-0 z-10 flex justify-center">
+        <div
+          className={`absolute inset-x-0 ${retentionLossNotice && deliveryGapNotice ? 'top-[4.5rem]' : retentionLossNotice || deliveryGapNotice ? 'top-9' : 'top-0'} z-10 flex justify-center`}
+        >
           <button
             type="button"
             className="rounded-b bg-muted/90 px-3 py-1 text-xs text-muted-foreground shadow-sm ring-1 ring-border/60 hover:bg-muted hover:text-foreground transition-colors"

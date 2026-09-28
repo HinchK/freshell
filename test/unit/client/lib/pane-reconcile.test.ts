@@ -393,4 +393,14 @@ describe('schema tests for reconcile v1 widening', () => {
     // stripped, the feature silently never activates. Assert the key SURVIVES:
     expect(parsed.success ? parsed.data?.paneReconcileFreshAgentV1 : undefined).toBe(true)
   })
+
+  it('ReadyCapabilitiesSchema preserves pacedTerminalReplayV1 through parsing', () => {
+    // Workstream 1 (responsive terminal restore) negotiation: the paced-replay
+    // echo must SURVIVE Zod parsing, not just parse successfully — the same
+    // strip hazard as paneReconcileFreshAgentV1 above (an undeclared key is
+    // silently stripped and the paced restore feature would never activate).
+    const parsed = ReadyCapabilitiesSchema.safeParse({ pacedTerminalReplayV1: true })
+    expect(parsed.success).toBe(true)
+    expect(parsed.success ? parsed.data?.pacedTerminalReplayV1 : undefined).toBe(true)
+  })
 })

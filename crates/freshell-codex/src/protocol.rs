@@ -24,7 +24,9 @@ use serde_json::{json, Map, Value};
 
 /// The four codex turn statuses (`CodexTurnStatusSchema`, `protocol.ts:104`;
 /// `TURN_STATUSES`, `json-rpc-side-effects.ts:176`). `turn/completed` fires for ALL of
-/// these — only `completed` is a positive completion (see [`crate::events`]).
+/// these — the unified guard (see [`crate::events`]) rings every terminal turn end
+/// among them (plus an absent status); only a USER-armed `interrupted` and the
+/// non-terminal `inProgress` stay silent.
 pub const TURN_STATUSES: &[&str] = &["completed", "interrupted", "failed", "inProgress"];
 
 /// A JSON-RPC request id — string or integer (`CodexRequestIdSchema`, `protocol.ts:3`). The

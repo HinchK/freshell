@@ -148,6 +148,110 @@ async function bootAndConnect(
   return harness
 }
 
+/**
+ * SCENARIO 6 lane boot (shared by the crash-attention scenarios): an owned
+ * server whose freshcodex app-server is the deterministic fake wired to
+ * crash itself immediately after answering `turn/start` — with a 3s
+ * per-method delay so a spec can move the user's attention (active tab vs
+ * background tab) BEFORE the crash lands. The delay is consumed before the
+ * response AND the exit (both fire inside the same delayed tick), so the
+ * turn is provably in flight at process death — the Rust crash-while-busy
+ * edge is what rings for it (the fake screams no protocol frame on the way
+ * out, like a real crash; an edge from the fake would double-ring).
+ */
+async function bootCrashingFreshcodexLane(
+  page: import('@playwright/test').Page,
+  sharedRoot: string,
+): Promise<{
+  server: Awaited<ReturnType<typeof createE2eServerHandle>>
+  harness: TestHarness
+  tabId: string
+  freshAgentPaneId: string
+  sessionId: string
+}> {
+  const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
+
+  const server = await createE2eServerHandle(process.env, {
+    construct: {
+      env: {
+        CODEX_CMD: fakeCodexPath,
+        // Crash the fake app-server process itself immediately after it
+        // answers `turn/start` — the per-method delay hands the spec a
+        // deterministic window to background (or keep watching) the tab
+        // before the mid-turn provider crash lands.
+        FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
+          delayMethodsMs: { 'turn/start': 3_000 },
+          exitProcessAfterMethodsOnce: ['turn/start'],
+        }),
+      },
+      setupHome: async (homeDir) => {
+        const freshellDir = path.join(homeDir, '.freshell')
+        await fs.mkdir(freshellDir, { recursive: true })
+        await fs.writeFile(path.join(freshellDir, 'config.json'), JSON.stringify({
+          version: 1,
+          settings: {
+            freshAgent: { enabled: true },
+            codingCli: {
+              enabledProviders: ['codex'],
+              providers: { codex: { model: 'gpt-5-codex', sandbox: 'workspace-write' } },
+            },
+          },
+        }, null, 2))
+      },
+    },
+  })
+  const info = await server.start()
+  const harness = await bootAndConnect(page, info)
+  await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+
+  await page.evaluate(() => {
+    window.__FRESHELL_TEST_HARNESS__?.dispatch({
+      type: 'connection/setAvailableClis',
+      payload: { claude: false, codex: true },
+    })
+  })
+
+  await harness.clearSentWsMessages()
+  const picker = await openPanePicker(page)
+  await picker.getByRole('button', { name: /^Freshcodex$/i }).click({ force: true })
+  await page.getByRole('option').first().click()
+
+  const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+  await expect(paneRoot).toBeVisible({ timeout: 15_000 })
+
+  const tabId = (await harness.getActiveTabId())!
+  expect(tabId).toBeTruthy()
+
+  const sessionId: string = await expect.poll(async () => {
+    const layout = await harness.getPaneLayout(tabId)
+    const leaf = findFreshAgentLeaf(layout)
+    return leaf?.content?.sessionId ?? leaf?.content?.sessionRef?.sessionId ?? null
+  }, { timeout: 30_000 }).not.toBeNull().then(async () => {
+    const layout = await harness.getPaneLayout(tabId)
+    const leaf = findFreshAgentLeaf(layout)
+    return leaf.content.sessionId ?? leaf.content.sessionRef.sessionId
+  })
+  expect(sessionId).toBeTruthy()
+
+  // The freshcodex pane's own DOM node id (the tab is a SPLIT — shell pane +
+  // this pane — so pane-scoped assertions must address it by its paneId).
+  const freshAgentPaneId: string = await expect.poll(async () => {
+    const layout = await harness.getPaneLayout(tabId)
+    return findFreshAgentLeaf(layout)?.id ?? null
+  }, { timeout: 10_000 }).not.toBeNull().then(async () => {
+    const layout = await harness.getPaneLayout(tabId)
+    return findFreshAgentLeaf(layout).id as string
+  })
+
+  // The pane opens idle (no in-flight turn at lane start).
+  await expect.poll(async () => {
+    const layout = await harness.getPaneLayout(tabId)
+    return findFreshAgentLeaf(layout)?.content?.status
+  }, { timeout: 20_000 }).toBe('idle')
+
+  return { server, harness, tabId, freshAgentPaneId, sessionId }
+}
+
 test.describe('Restore Matrix', () => {
   test.setTimeout(180_000)
 
@@ -1116,125 +1220,63 @@ test.describe('Restore Matrix', () => {
   // SCENARIO 6 -- TERM-18: RECOVER PROVIDER PROCESS LOSS mid-turn.
   // -------------------------------------------------------------------
   // "Kill the exact fake ... child mid-turn, assert blue clears and an
-  // exited/retry state appears with no sound, click retry/send again, and
-  // verify the same durable session continues under one replacement
-  // process." Rather than hunting down the OS PID of a process spawned
-  // through a synchronous re-exec wrapper (`installFakeCodexAppServer`,
-  // fragile and racy), this uses the fake app-server's OWN, already-existing
+  // exited/retry state appears, click retry/send again, and verify the same
+  // durable session continues under one replacement process." Rather than
+  // hunting down the OS PID of a process spawned through a synchronous
+  // re-exec wrapper (`installFakeCodexAppServer`, fragile and racy), the
+  // lane uses the fake app-server's OWN, already-existing
   // `exitProcessAfterMethodsOnce` behavior flag (`fake-app-server.mjs`) to
   // make the fixture crash ITSELF immediately after answering `turn/start`
   // -- i.e., exactly mid-turn, while the pane is still busy waiting for a
   // completion it will now never receive from that process. This is
-  // configuration (an env var this spec sets), not a fixture code change.
-  test('a crashed Codex provider process is recovered mid-turn with no chime, and the same durable session continues', async ({ page }) => {
-    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-restore-matrix-codex-crash-'))
+  // configuration (env vars this spec sets), not a fixture code change.
+  //
+  // Under the unified needs-attention contract a crash is a turn end like
+  // any other, so the old single lane (which asserted "no chime" by reading
+  // the browser's OUTBOUND WS ledger -- vacuous w.r.t. the server's edge)
+  // is split into TWO explicit scenarios the witness state selects:
+  //   A (unwitnessed): the pane's tab is BACKGROUND when the crash lands ->
+  //     the Rust crash-while-busy synthesis rings exactly ONE bell pipeline
+  //     event (turnCompletion.seq 0 -> 1) and the full attention marks;
+  //   B (watched): the pane's tab is ACTIVE and the window focused -> NO
+  //     bell (the client partitions the edge as watched: no attention flags,
+  //     no sidebar row highlight), the tab strip alone carries the watched
+  //     mark. The shared `bootCrashingFreshcodexLane` helper wires the
+  //     deterministic delayed crash (3s per-method delay -> background or
+  //     watch at the spec's choice).
+  test('a crashed Codex provider process mid-turn in a BACKGROUND tab rings the unified attention edge once, then recovers on the same durable session', async ({ page }) => {
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-restore-matrix-codex-crash-bg-'))
     try {
-      const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
-
-      const server = await createE2eServerHandle(process.env, {
-        construct: {
-          env: {
-            CODEX_CMD: fakeCodexPath,
-            // Crash the fake app-server process itself immediately after it
-            // answers `turn/start` -- simulating a real mid-turn provider
-            // crash without needing to track/kill an OS PID directly.
-            FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
-              exitProcessAfterMethodsOnce: ['turn/start'],
-            }),
-          },
-          setupHome: async (homeDir) => {
-            const freshellDir = path.join(homeDir, '.freshell')
-            await fs.mkdir(freshellDir, { recursive: true })
-            await fs.writeFile(path.join(freshellDir, 'config.json'), JSON.stringify({
-              version: 1,
-              settings: {
-                freshAgent: { enabled: true },
-                codingCli: {
-                  enabledProviders: ['codex'],
-                  providers: { codex: { model: 'gpt-5-codex', sandbox: 'workspace-write' } },
-                },
-              },
-            }, null, 2))
-          },
-        },
-      })
-      const info = await server.start()
+      const { server, harness, tabId, freshAgentPaneId, sessionId } = await bootCrashingFreshcodexLane(page, sharedRoot)
 
       try {
-        const harness = await bootAndConnect(page, info)
-        await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
-
-        await page.evaluate(() => {
-          window.__FRESHELL_TEST_HARNESS__?.dispatch({
-            type: 'connection/setAvailableClis',
-            payload: { claude: false, codex: true },
-          })
-        })
-
-        await harness.clearSentWsMessages()
-        const picker = await openPanePicker(page)
-        await picker.getByRole('button', { name: /^Freshcodex$/i }).click({ force: true })
-        await page.getByRole('option').first().click()
-
         const paneRoot = page.locator('[data-context="fresh-agent"]').last()
-        await expect(paneRoot).toBeVisible({ timeout: 15_000 })
-
-        const tabId = await harness.getActiveTabId()
-        expect(tabId).toBeTruthy()
-
-        const originalSessionId: string = await expect.poll(async () => {
-          const layout = await harness.getPaneLayout(tabId!)
-          const leaf = findFreshAgentLeaf(layout)
-          return leaf?.content?.sessionId ?? leaf?.content?.sessionRef?.sessionId ?? null
-        }, { timeout: 30_000 }).not.toBeNull().then(async () => {
-          const layout = await harness.getPaneLayout(tabId!)
-          const leaf = findFreshAgentLeaf(layout)
-          return leaf.content.sessionId ?? leaf.content.sessionRef.sessionId
-        })
-        expect(originalSessionId).toBeTruthy()
-
-        // The picker's shell fixture (from `bootAndConnect`) makes this a
-        // SPLIT tab (shell pane + this freshcodex pane) -- so the freshcodex
-        // pane's own DOM node needs to be found by its OWN paneId, not
-        // assumed to be the tab's only pane.
-        const freshAgentPaneId: string = await expect.poll(async () => {
-          const layout = await harness.getPaneLayout(tabId!)
-          return findFreshAgentLeaf(layout)?.id ?? null
-        }, { timeout: 10_000 }).not.toBeNull().then(async () => {
-          const layout = await harness.getPaneLayout(tabId!)
-          return findFreshAgentLeaf(layout).id as string
-        })
-
-        // Send a turn: the fixture answers `turn/start` (the pane goes
-        // busy/blue) and then, per `exitProcessAfterMethodsOnce`, the
-        // process exits -- a genuine mid-turn crash, not a simulated flag.
         const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
-        await expect.poll(async () => {
-          const layout = await harness.getPaneLayout(tabId!)
-          return findFreshAgentLeaf(layout)?.content?.status
-        }, { timeout: 20_000 }).toBe('idle')
 
-        // TERM-18 "clear activity"/"assert blue clears" -- positive control
-        // FIRST. The fixture's `turn/start` response, and the process exit
-        // triggered by `exitProcessAfterMethodsOnce`, both fire within the
-        // SAME JS tick on the fixture side -- there is no real-world gap for
-        // the multi-hop server -> browser -> Redux -> render pipeline to
-        // observably paint a "running" frame before the crash (verified: an
-        // earlier version of this test tried asserting blue immediately
-        // after clicking Send and the busy window was never observable --
-        // the crash banner was already showing by the time the assertion's
-        // own poll started). Rather than fabricate a passing assertion by
-        // loosening the "clears" check into something that can't fail, seed
-        // the SAME production Redux slot the live crash path is about to
-        // overwrite (`agentSession.status`, via the real
-        // `freshAgent/setSessionStatus` action -- the identical
-        // action/selector pattern already established in
-        // `pane-activity-indicator.spec.ts`) so the busy/blue indicator
-        // (`resolvePaneActivity` -> `PaneHeader`/`TabItem`) is proven to
-        // genuinely turn on for THIS exact session/pane first. The
-        // subsequent crash below is still the REAL fixture-driven crash;
-        // only the "it was on" half is synthetically seeded, so the
-        // "clears" assertion cannot pass merely because blue was never true.
+        // Send the turn FIRST (the composer enqueues every submit and the
+        // queue only drains while the pane is NOT busy — seeding the blue
+        // control BEFORE the send would strand the message in the client's
+        // queue and the turn would never start).
+        await composer.fill('term18-crash-mid-turn probe')
+        await paneRoot.getByRole('button', { name: 'Send' }).click()
+
+        // TERM-18 "clear activity"/"assert blue clears" -- positive control.
+        // The fixture's `turn/start` response and the process exit both fire
+        // within the SAME delayed tick on the fixture side -- there is no
+        // real-world gap for the multi-hop server -> browser -> Redux ->
+        // render pipeline to observably paint a "running" frame before the
+        // crash. Rather than fabricating a passing assertion by loosening
+        // the "clears" check into something that can't fail, seed the SAME
+        // production Redux slot the live crash path is about to overwrite
+        // (`agentSession.status`, via the real `freshAgent/setSessionStatus`
+        // action -- the identical action/selector pattern already established
+        // in pane-activity-indicator.spec.ts) INSIDE the deterministic 3s
+        // window so the busy/blue indicator (`resolvePaneActivity` ->
+        // `PaneHeader`/`TabItem`) is proven to genuinely turn on for THIS
+        // exact session/pane before the crash. The subsequent crash below is
+        // still the REAL fixture-driven crash; only the "it was on" half is
+        // synthetically seeded, so the "clears" assertion cannot pass merely
+        // because blue was never true.
         await page.evaluate(({ currentSessionId }) => {
           window.__FRESHELL_TEST_HARNESS__?.dispatch({
             type: 'freshAgent/setSessionStatus',
@@ -1245,65 +1287,96 @@ test.describe('Restore Matrix', () => {
               status: 'running',
             },
           })
-        }, { currentSessionId: originalSessionId })
+        }, { currentSessionId: sessionId })
 
         // Scoped to THIS pane specifically (`data-pane-id`) -- the tab is a
-        // SPLIT (shell pane + this freshcodex pane, per `bootAndConnect`
-        // above), so an unscoped tab-level icon or `getByRole('banner')`
-        // lookup would ambiguously match the shell pane's icon/banner too.
-        // Fresh-agent pane headers render the busy/blue state on the agent
-        // icon inside its tooltip wrapper (`PaneHeader.tsx`), the same
-        // `PaneIcon` treatment terminal panes get.
+        // SPLIT (shell pane + this freshcodex pane), so an unscoped tab-level
+        // icon lookup would ambiguously match the shell pane too.
         const freshAgentIcon = page
           .locator(`[data-pane-shell="true"][data-pane-id="${freshAgentPaneId}"]`)
           .getByTitle('Codex (freshcodex pane)')
           .locator('svg')
         await expect(freshAgentIcon).toHaveClass(/text-blue-500/, { timeout: 15_000 })
 
-        await composer.fill('term18-crash-mid-turn probe')
-        await paneRoot.getByRole('button', { name: 'Send' }).click()
+        // Then BACKGROUND the pane's tab inside the fixture's remaining
+        // crash window -- the user is in another tab when the mid-turn
+        // provider death lands.
+        await page.getByRole('button', { name: 'New shell tab' }).click()
+        await harness.waitForTabCount(2)
+        const shellTabId = await harness.getActiveTabId()
+        expect(shellTabId).not.toBe(tabId)
 
-        // Blue clears and an exited state appears -- never silently stuck
-        // "busy" forever. The crash-derived "exited" status lives on the
-        // per-session Redux slice (`agentSession.status`, written via
-        // `writeSessionStatus`), NOT on the pane layout's own
-        // `content.status` field -- so the truthful, user-visible signal is
-        // the "session has ended" banner FreshAgentView renders whenever
-        // `effectiveStatus === 'exited'` (`sessionEnded`), matching how a
-        // real user would observe this.
+        // UNWITNESSED crash: the Rust crash-while-busy synthesis rings the
+        // unified attention edge -- exactly ONE turnCompletion event enters
+        // the bell/attention pipeline (seq 0 -> 1), and the unwitnessed
+        // partition marks everything: tab flag, pane-header mark, and the
+        // background tab's emerald alert class.
+        await expect
+          .poll(
+            async () => (await harness.getState())?.turnCompletion?.seq ?? 0,
+            { timeout: 30_000, message: 'the background crash rings exactly one unified edge (seq 1)' },
+          )
+          .toBe(1)
+        await expect
+          .poll(
+            async () => (await harness.getState())?.turnCompletion?.attentionByTab?.[tabId] ?? null,
+            { timeout: 15_000, message: 'the background crash sets the tab attention flag' },
+          )
+          .toBe(true)
+        await expect
+          .poll(
+            async () => (await harness.getState())?.turnCompletion?.attentionByPane?.[freshAgentPaneId] ?? null,
+            { timeout: 15_000, message: 'the background crash sets the pane-header attention mark' },
+          )
+          .toBe(true)
+        const crashedTab = page.locator(`[data-context="tab"][data-tab-id="${tabId}"]`)
+        await expect(crashedTab).toHaveClass(/bg-emerald-100/, { timeout: 10_000 })
+
+        // One-shot: the synthesis rings exactly once -- no double edge from
+        // the respawn/exit bookkeeping. Stable across a settle window.
+        await page.waitForTimeout(1_500)
+        expect((await harness.getState())?.turnCompletion?.seq).toBe(1)
+
+        // Visiting the tab dismisses the attention (click mode)...
+        await crashedTab.click()
+        await expect
+          .poll(
+            async () => (await harness.getState())?.turnCompletion?.attentionByTab?.[tabId] ?? null,
+            { timeout: 10_000 },
+          )
+          .toBeNull()
+        await expect
+          .poll(
+            async () => (await harness.getState())?.turnCompletion?.attentionByPane?.[freshAgentPaneId] ?? null,
+            { timeout: 10_000 },
+          )
+          .toBeNull()
+        await expect(crashedTab).not.toHaveClass(/bg-emerald-100/)
+
+        // ...and the crash surfaces exactly as before: the "session has
+        // ended" banner is user-visible, and the busy state the seeded
+        // control proved was on is now off -- never silently stuck "busy"
+        // forever after the provider process is lost.
         await expect(paneRoot.getByText(/This session has ended/i)).toBeVisible({ timeout: 30_000 })
-
-        // TERM-18 core assertion: once the crash is detected (the banner
-        // above), the REAL crash-derived exited-status write has overwritten
-        // the busy state seeded above -- the indicator asserted ON above
-        // MUST now be gone, never left stuck blue after the provider
-        // process is lost.
         await expect(freshAgentIcon).not.toHaveClass(/text-blue-500/, { timeout: 15_000 })
-
-        // No chime: the harness's sent-message ledger and the pane's own
-        // visible state are the only two truthful signals this spec can
-        // check without a real audio backend; a genuine completion sound
-        // is gated on a `freshAgent.turn.complete` edge (AGENTS.md), which
-        // a crash must never emit alongside the exit.
-        const sentDuringCrash = await harness.getSentWsMessages()
-        expect(sentDuringCrash.some((m: any) => m?.type === 'freshAgent.turn.complete')).toBe(false)
 
         // The durable session id is preserved through the crash (TERM-18's
         // "preserve the durable identity") -- this is NOT a "Start new
         // session" flow, which would mint a fresh id.
-        const exitedLayout = await harness.getPaneLayout(tabId!)
+        const exitedLayout = await harness.getPaneLayout(tabId)
         const exitedLeaf = findFreshAgentLeaf(exitedLayout)
         expect(exitedLeaf?.content?.sessionId ?? exitedLeaf?.content?.sessionRef?.sessionId)
-          .toBe(originalSessionId)
+          .toBe(sessionId)
 
         // Retry/send again: the lazy self-heal respawns a replacement
         // process and the SAME durable session continues (crates/
         // freshell-freshagent/src/codex.rs's `ensure_session_alive`
         // transparent respawn, exercised here end-to-end through the real
         // browser/pane/composer path rather than only at the Rust unit
-        // level). "Start new session" is the client's own recovery affordance
-        // for this exact state -- clicking it clears `sessionEnded` and
-        // triggers the respawn, matching TERM-18's "click retry/send again".
+        // level). "Start new session" is the client's own recovery
+        // affordance for this exact state -- clicking it clears
+        // `sessionEnded` and triggers the respawn, matching TERM-18's
+        // "click retry/send again".
         await paneRoot.getByRole('button', { name: 'Start new session' }).click()
         await expect(paneRoot.getByText(/This session has ended/i)).not.toBeVisible({ timeout: 20_000 })
 
@@ -1312,17 +1385,81 @@ test.describe('Restore Matrix', () => {
 
         await expect(paneRoot.getByText('term18-retry-after-crash probe')).toBeVisible({ timeout: 15_000 })
         await expect.poll(async () => {
-          const layout = await harness.getPaneLayout(tabId!)
+          const layout = await harness.getPaneLayout(tabId)
           return findFreshAgentLeaf(layout)?.content?.status
         }, { timeout: 30_000 }).toBe('idle')
 
         // The pane's Freshell-level session identity is unchanged -- one
         // replacement process, one continuing durable session, not a
         // second/duplicate conversation.
-        const finalLayout = await harness.getPaneLayout(tabId!)
+        const finalLayout = await harness.getPaneLayout(tabId)
         const finalLeaf = findFreshAgentLeaf(finalLayout)
         expect(finalLeaf?.content?.sessionId ?? finalLeaf?.content?.sessionRef?.sessionId)
-          .toBe(originalSessionId)
+          .toBe(sessionId)
+      } finally {
+        await server.stop().catch(() => {})
+      }
+    } finally {
+      await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  test('a crashed Codex provider process mid-turn while WATCHED rings no bell and marks the tab strip only', async ({ page }) => {
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-restore-matrix-codex-crash-watched-'))
+    try {
+      const { server, harness, tabId, sessionId } = await bootCrashingFreshcodexLane(page, sharedRoot)
+
+      try {
+        const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+        const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
+
+        // The pane's tab stays ACTIVE and the window focused -- the user is
+        // watching when the mid-turn crash lands.
+        await composer.fill('term18-watched-crash probe')
+        await paneRoot.getByRole('button', { name: 'Send' }).click()
+
+        // The crash surfaces through the exited banner (the eye-witness that
+        // the turn died). The unified edge still ARRIVES (the fold is
+        // watch-independent: seq 0 -> 1) -- but the client partitions it as
+        // WATCHED: no attention flags anywhere (that partition is what
+        // skips the bell), and the tab strip alone carries the watched mark.
+        await expect(paneRoot.getByText(/This session has ended/i)).toBeVisible({ timeout: 30_000 })
+        await expect
+          .poll(
+            async () => (await harness.getState())?.turnCompletion?.seq ?? 0,
+            { timeout: 30_000, message: 'the watched crash edge still folds (seq 1) -- watch partitions the MARKS, not the edge' },
+          )
+          .toBe(1)
+        // One edge, no more: stable across a settle window.
+        await page.waitForTimeout(1_500)
+        const watchedState = await harness.getState()
+        expect(watchedState?.turnCompletion?.seq).toBe(1)
+        expect(
+          watchedState?.turnCompletion?.attentionByTab?.[tabId],
+          'a watched crash creates no unwitnessed tab attention',
+        ).toBeUndefined()
+        expect(
+          Object.keys(watchedState?.turnCompletion?.attentionByPane ?? {}),
+          'a watched crash creates no pane-header attention mark',
+        ).toEqual([])
+        expect(
+          watchedState?.turnCompletion?.watchedCompletionByTab?.[tabId],
+          'the watched crash sets the tab-strip-only watched mark',
+        ).toBe(true)
+        const watchedTab = page.locator(`[data-context="tab"][data-tab-id="${tabId}"]`)
+        await expect(watchedTab, 'the active tab renders the watched green top-line mark').toHaveClass(/border-t-success/)
+
+        // The sidebar row for the pane's session stays dark: the sidebar
+        // highlight pipeline reads attentionByTab (which stays empty for a
+        // watched ending), so the strict "tab only" contract holds in the
+        // DOM, not just in state.
+        const sessionList = page.getByTestId('sidebar-session-list')
+        const sessionRow = sessionList.locator(`[data-session-id="${sessionId}"][data-provider="codex"]`)
+        await expect(sessionRow, 'the pane session has a sidebar row to check').toBeVisible({ timeout: 30_000 })
+        await expect(
+          sessionRow,
+          'a watched crash never highlights the sidebar row',
+        ).not.toHaveClass(/bg-emerald-50|border-l-emerald-500/)
       } finally {
         await server.stop().catch(() => {})
       }

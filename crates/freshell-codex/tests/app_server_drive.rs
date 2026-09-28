@@ -2,7 +2,7 @@
 //! [`ChannelTransport`] — NO real app-server, NO live API calls. Proves the full CORE path
 //! the T2-over-rust step (3.8b) will later run live: connect → initialize→initialized
 //! handshake → `thread/start` → `turn/start` (**effort forwarded VERBATIM**, DEV-0003) →
-//! `turn/completed` notification → the STATUS-GUARDED positive completion edge.
+//! `turn/completed` notification → the unified turn-complete attention edge.
 //!
 //! The server side is scripted with the committed fake-app-server's message shapes
 //! (`test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs`).
@@ -106,7 +106,7 @@ async fn full_drive_completed_turn_emits_the_positive_edge_with_verbatim_effort(
         json!({ "threadId": THREAD_ID, "turnId": "turn-1", "turn": { "id": "turn-1", "status": "completed" } }),
     );
 
-    // The consumer classifies it; the subscription gate turns it into the positive edge.
+    // The consumer classifies it; the subscription guard turns it into the unified edge.
     let mut sub = CodexSubscription::new(THREAD_ID);
     let notification = notifs.recv().await.expect("a notification");
     let events = match notification {
@@ -117,12 +117,12 @@ async fn full_drive_completed_turn_emits_the_positive_edge_with_verbatim_effort(
         events
             .iter()
             .any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })),
-        "completed → the positive sdk.turn.complete edge fired: {events:?}"
+        "completed → the unified sdk.turn.complete edge fired: {events:?}"
     );
 }
 
 #[tokio::test]
-async fn full_drive_interrupted_turn_does_not_chime() {
+async fn full_drive_user_armed_interrupted_turn_does_not_chime() {
     let (transport, peer) = new_channel_transport();
     let (client, mut notifs) = CodexAppServerClient::connect(transport);
     let client = Arc::new(client);
@@ -165,13 +165,19 @@ async fn full_drive_interrupted_turn_does_not_chime() {
     peer.respond(&turn_id, json!({ "turn": { "id": "turn-1" } }));
     driver.await.expect("driver task");
 
-    // An interrupt arrives as turn/completed with status 'interrupted' — must NOT chime.
+    // An interrupt arrives as turn/completed with status 'interrupted' — a
+    // USER-initiated interrupt (the marker the real interrupt lane arms) must
+    // NOT ring the unified edge.
     peer.emit_notification(
         "turn/completed",
         json!({ "threadId": THREAD_ID, "turnId": "turn-1", "turn": { "id": "turn-1", "status": "interrupted" } }),
     );
 
     let mut sub = CodexSubscription::new(THREAD_ID);
+    // This drive fabricates the completion directly (no FreshCodexState
+    // interrupt lane), so arm the user-interrupt marker the real lane would
+    // have armed before its `turn/interrupt` RPC.
+    sub.arm_user_interrupt();
     let notification = notifs.recv().await.expect("a notification");
     let events = match notification {
         CodexNotification::TurnCompleted(ev) => sub.on_turn_completed(&ev, 1_700_000_000_000),
@@ -181,7 +187,7 @@ async fn full_drive_interrupted_turn_does_not_chime() {
         !events
             .iter()
             .any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })),
-        "interrupted → NO chime: {events:?}"
+        "a USER-armed interrupted turn → NO unified edge: {events:?}"
     );
     assert!(
         events

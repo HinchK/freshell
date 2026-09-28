@@ -435,6 +435,18 @@ export const HelloSchema = z.object({
     // STRIP unknown keys, so without this the capability would silently no-op.
     paneReconcileV1: z.literal(true).optional(),
     paneReconcileFreshAgentV1: z.literal(true).optional(),
+    // Paced terminal restore (responsive-terminal-restore Workstream 1): the
+    // client understands bounded, ascending paced replay batches with
+    // continuation credit. Additive optional — declared, not just sent (same
+    // strip hazard as above); absent for the frozen client shape.
+    pacedTerminalReplayV1: z.literal(true).optional(),
+    // Hidden-pane lifetime claims (responsive-terminal-restore Workstream 1):
+    // the client understands non-hydrating per-connection terminal lifetime
+    // claims carried on `terminal.interest.claimedTerminalIds`, sent only
+    // after the `ready` echo advertises the capability. Additive optional —
+    // declared, not just sent (same strip hazard as above); absent for the
+    // frozen client shape.
+    terminalLifetimeClaimV1: z.literal(true).optional(),
   }).optional(),
   client: z.object({
     mobile: z.boolean().optional(),
@@ -532,6 +544,29 @@ export const TerminalAttachSchema = z.object({
   expectedSessionRef: SessionLocatorSchema.optional(),
   sinceSeq: z.number().int().nonnegative().optional(),
   maxReplayBytes: z.number().int().positive().optional(),
+  /** Paced terminal restore (responsive-terminal-restore Workstream 1):
+    *  the negotiated forward-page limit the client requests — an optional
+    *  UPPER BOUND on each paced replay page's serialized bytes, honored
+    *  only on pacedTerminalReplayV1 connections and clamped by the server
+    *  to its own page-budget cap (min(requested, server cap)). E2R1
+    *  finding 2 (the honest bound): pages are bounded by
+    *  max(requested, the atomic frame size) — a single frame larger than
+    *  the request forms its own ATOMIC single-frame page, bounded by the
+    *  server's fragment cap (every frame is pre-fragmented, so one
+    *  frame's serialized size never exceeds it). Additive optional;
+    *  absent or invalid values keep the server's default. */
+  replayPageBytes: z
+    .number()
+    .int()
+    .positive()
+    .describe(
+      'Optional upper bound on each paced replay page\'s serialized bytes ' +
+        '(pacedTerminalReplayV1 connections only), clamped to the server\'s ' +
+        'page-budget cap. Pages are bounded by max(requested, the atomic ' +
+        'frame size): a single frame larger than the request forms its own ' +
+        'atomic page, bounded by the server fragment cap.',
+    )
+    .optional(),
   attachRequestId: z.string().min(1).optional(),
   /** Positive marker: the attaching xterm surface was freshly constructed
    * (page load / renderer recreation / user reset). Servers that know this
@@ -1104,6 +1139,13 @@ export const ReadyCapabilitiesSchema = z
     terminalInterestV1: z.literal(true).optional(),
     paneReconcileV1: z.literal(true).optional(),
     paneReconcileFreshAgentV1: z.literal(true).optional(),
+    // Paced terminal restore (Workstream 1): echoed only for a hello that
+    // opted in via capabilities.pacedTerminalReplayV1.
+    pacedTerminalReplayV1: z.literal(true).optional(),
+    // Hidden-pane lifetime claims (Workstream 1): echoed only for a hello
+    // that opted in via capabilities.terminalLifetimeClaimV1. Present iff the
+    // client may send `terminal.interest.claimedTerminalIds`.
+    terminalLifetimeClaimV1: z.literal(true).optional(),
   })
   .optional()
 
@@ -1115,8 +1157,32 @@ export const TerminalInterestSchema = z.object({
   revision: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
   focusedTerminalId: z.string().min(1).max(512).nullable().optional(),
   visibleTerminalIds: z.array(z.string().min(1).max(512)).max(1024),
+  /** Hidden-pane lifetime claims (negotiated `terminalLifetimeClaimV1` only):
+   *  terminals this connection wants kept alive WITHOUT attaching. The claim
+   *  never grants replay or output delivery and never touches geometry or
+   *  stream identity; a later snapshot omitting an id is the explicit
+   *  withdrawal (release). The client sends the field only after the ready
+   *  echo; older clients never send it. */
+  claimedTerminalIds: z.array(z.string().min(1).max(512)).max(1024).optional(),
 })
 export type TerminalInterestMessage = z.infer<typeof TerminalInterestSchema>
+
+/**
+ * Paced replay continuation credit (responsive-terminal-restore Workstream 1):
+ * sent by a client whose hello negotiated `pacedTerminalReplayV1` after it
+ * fully consumed an ordered replay page. `consumedSeq` is the last sequence
+ * consumed in order; `attachRequestId` scopes the credit to one attach
+ * generation. Additive optional — older servers accept-and-strip it and
+ * protocol version stays 10.
+ */
+export const TerminalReplayCreditSchema = z.object({
+  type: z.literal('terminal.replay.credit'),
+  terminalId: z.string().min(1).max(512),
+  streamId: z.string().min(1).max(512),
+  attachRequestId: z.string().min(1).max(512),
+  consumedSeq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+})
+export type TerminalReplayCreditMessage = z.infer<typeof TerminalReplayCreditSchema>
 
 // ── Client message discriminated union ──
 
@@ -1138,6 +1204,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   TerminalInputSchema,
   TerminalResizeSchema,
   TerminalKillSchema,
+  TerminalReplayCreditSchema,
   CodexActivityListSchema,
   OpencodeActivityListSchema,
   ClaudeActivityListSchema,
@@ -1278,7 +1345,9 @@ export type TerminalAttachReadyMessage = {
   geometryAuthority?: TerminalGeometryAuthority
   requestedSinceSeq?: number
   effectiveSinceSeq?: number
-  replayResetReason?: 'geometry_authority_unknown'
+  /** Restore contract (negotiated pacedTerminalReplayV1 only): earliest sequence position still available for replay (headSeq+1 when nothing older is retained). */
+  oldestRetainedSeq?: number
+  replayResetReason?: 'geometry_authority_unknown' | 'retention_lost'
   headSeq: number
   replayFromSeq: number
   replayToSeq: number
@@ -1467,8 +1536,16 @@ export type TerminalOutputGapMessage = {
   streamId: string
   fromSeq: number
   toSeq: number
-  reason: 'queue_overflow' | 'replay_window_exceeded' | 'replay_budget_exceeded'
+  reason:
+    | 'queue_overflow'
+    | 'replay_window_exceeded'
+    | 'replay_budget_exceeded'
+    | 'handoff_boundary_reached'
   attachRequestId?: string
+  /** Restore contract (negotiated pacedTerminalReplayV1 only): the terminal's current headSeq at gap-emission time. */
+  headSeq?: number
+  /** Restore contract (negotiated pacedTerminalReplayV1 only): earliest sequence position still available for replay at gap-emission time. */
+  oldestRetainedSeq?: number
 }
 
 export type TerminalTitleUpdatedMessage = {

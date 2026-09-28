@@ -133,6 +133,41 @@ fn measure_json_bytes(value: &Value) -> usize {
         .len()
 }
 
+/// The FIXED scaffold of the legacy `terminal.output` envelope — every byte
+/// of [`measure_legacy_output_bytes`] except the `seqStart`/`seqEnd` digit
+/// widths and the JSON-escaped `data` literal — measured once so a paced
+/// page walk can account frames INCREMENTALLY (responsive-terminal-restore):
+///
+/// `measure(seq_start, seq_end, data) == scaffold + digits(seq_start)
+///  + digits(seq_end) + json_escaped_len(data)`
+///
+/// exactly, with no per-candidate re-serialization of the accumulated run.
+pub(crate) fn legacy_envelope_scaffold_bytes(
+    terminal_id: &str,
+    stream_id: &str,
+    attach_request_id: Option<&str>,
+    source: Option<&str>,
+) -> usize {
+    // seqs "0"/"0" contribute one digit each; the empty data contributes
+    // exactly its two quote characters.
+    measure_legacy_output_bytes(terminal_id, stream_id, 0, 0, "", attach_request_id, source)
+        .saturating_sub(4)
+}
+
+/// The compact-JSON byte length of a string payload INCLUDING its quotes
+/// (exactly the `"data":<this>` segment the envelope measure accounts).
+pub(crate) fn json_escaped_len(data: &str) -> usize {
+    serde_json::to_string(data)
+        .expect("terminal data is always serializable")
+        .len()
+}
+
+/// Decimal digit count of an i64 (0 has one digit; negatives never occur for
+/// seqs but stay honest).
+pub(crate) fn digit_count(n: i64) -> usize {
+    n.checked_abs().unwrap_or(i64::MAX).to_string().len()
+}
+
 /// `defaultPayloadForFrame` (`output-batch.ts:83-99`) measured as the legacy
 /// `terminal.output` envelope — the merge-budget size for `data`.
 fn measure_legacy_output_bytes(

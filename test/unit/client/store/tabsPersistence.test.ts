@@ -14,7 +14,7 @@ const localStorageMock = (() => {
 
 Object.defineProperty(globalThis, 'localStorage', { value: localStorageMock, writable: true })
 
-import tabsReducer, { updateTab } from '@/store/tabsSlice'
+import tabsReducer, { updateTab, removeTab } from '@/store/tabsSlice'
 import panesReducer, { replacePane } from '@/store/panesSlice'
 import machineIdentityReducer, { setMachineReady } from '@/store/machineIdentitySlice'
 import tabRecencyReducer, {
@@ -29,6 +29,7 @@ import {
   resetPersistedLayoutCacheForTests,
 } from '@/store/persistMiddleware'
 import { onPersistBroadcast, resetPersistBroadcastForTests } from '@/store/persistBroadcast'
+import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { MACHINE_ID_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY } from '@/store/storage-keys'
 import { parsePersistedLayoutRaw } from '@/store/persistedState'
 import { handleUiCommand } from '@/lib/ui-commands'
@@ -592,5 +593,106 @@ describe('persisted layout machineId stamp', () => {
     const raw = localStorage.getItem(LAYOUT_STORAGE_KEY)
     expect(raw).not.toBeNull()
     expect(JSON.parse(raw!)).not.toHaveProperty('machineId')
+  })
+})
+
+// Task-008b review F1 (landed by task-010): a persist flush that throws
+// (quota pressure, storage failure) must not permanently lose that dirty
+// cycle. The dirty flags stay armed so the NEXT flush opportunity (a new
+// action, a flushPersistedLayoutNow dispatch, or the visibility/pagehide
+// flushNow) retries the same state, and the failure surfaces as one
+// structured error line instead of being swallowed.
+describe('persist flush failure retry', () => {
+  beforeEach(() => {
+    localStorageMock.clear()
+    vi.useFakeTimers()
+    resetPersistFlushListenersForTests()
+    resetPersistBroadcastForTests()
+    resetPersistedLayoutCacheForTests()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  /**
+   * Wrap localStorage.setItem so the FIRST write to the layout key throws
+   * (a transient quota-pressure failure) and every other write — including
+   * that key's retry — goes through to real storage.
+   */
+  function failFirstLayoutWrite() {
+    const originalSetItem = localStorageMock.setItem.bind(localStorageMock)
+    let thrown = false
+    vi.spyOn(localStorageMock, 'setItem').mockImplementation((key: string, value: string) => {
+      if (!thrown && key === LAYOUT_STORAGE_KEY) {
+        thrown = true
+        throw new DOMException('The quota has been exceeded.', 'QuotaExceededError')
+      }
+      originalSetItem(key, value)
+    })
+  }
+
+  it('keeps the dirty state and retries the next flush when a persist flush fails once', () => {
+    ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true
+    const consoleErrors: unknown[][] = []
+    vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      consoleErrors.push(args)
+    })
+    failFirstLayoutWrite()
+    const store = makeStore()
+
+    store.dispatch(updateTab({ id: 'tab-1', updates: { title: 'Retry Me' } }))
+    vi.advanceTimersByTime(PERSIST_DEBOUNCE_MS)
+
+    // The failed flush persisted nothing...
+    expect(localStorage.getItem(LAYOUT_STORAGE_KEY)).toBeNull()
+    // ...and surfaced as ONE structured error line naming the failure
+    // (not a silent swallow).
+    expect(consoleErrors.length).toBe(1)
+    const [prefix, message, context] = consoleErrors[0]
+    expect(String(prefix)).toBe('[PanesPersist]')
+    expect(String(message)).toContain('Failed to persist layout')
+    expect((context as { reason?: string } | undefined)?.reason).toBe('persist_flush_failed')
+
+    // The next flush opportunity retries the SAME dirty state and
+    // succeeds — the transient failure lost nothing.
+    store.dispatch(flushPersistedLayoutNow())
+    const raw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    expect(raw).not.toBeNull()
+    expect(JSON.parse(raw!).tabs.tabs[0].title).toBe('Retry Me')
+  })
+
+  it('a failed flush preserves the user-close authorization so the retry persists the closed layout instead of being refused by the empty-tabs guard', () => {
+    ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true
+    const consoleErrors: unknown[][] = []
+    vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      consoleErrors.push(args)
+    })
+    // Seed a protected (unparseable-but-present) persisted layout — the
+    // exact shape the destructive empty-tabs guard exists to defend.
+    localStorage.setItem(LAYOUT_STORAGE_KEY, '{not valid json, but not empty either')
+    failFirstLayoutWrite()
+    const store = makeStore()
+
+    // The user closes their last tab: the only write that may lawfully
+    // replace the protected layout with an empty one.
+    store.dispatch(removeTab('tab-1'))
+    vi.advanceTimersByTime(PERSIST_DEBOUNCE_MS)
+
+    // The authorized close-flush failed transiently: the protected layout
+    // was left untouched (still the seeded unparseable raw).
+    expect(localStorage.getItem(LAYOUT_STORAGE_KEY)).toBe('{not valid json, but not empty either')
+
+    // The retry must still carry the user-close authorization — otherwise
+    // the guard would refuse the retried write (the pending dirty state IS
+    // the user's close) and permanently lose it.
+    store.dispatch(flushPersistedLayoutNow())
+    const raw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    expect(raw).not.toBeNull()
+    expect(JSON.parse(raw!).tabs.tabs).toEqual([])
+    expect(
+      consoleErrors.map((args) => args.map(String).join(' ')).join('\n'),
+    ).not.toContain('empty_tabs_write_refused')
   })
 })

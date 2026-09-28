@@ -95,10 +95,13 @@ const CANONICAL_UUID_RE =
 
 // ── Fixture program (the shared claude/kilroy lane) ─────────────────────────
 // Text-driven raises; responds continue the turn: allow → success completion,
-// deny → a NON-success closure (the denial is not a positive completion and
-// must never chime green), question answers → success completion. Compact
-// emits the compacting status then completes after a pollable window. Crash
-// exits the process mid-turn — no protocol frames, like a real sidecar death.
+// deny → a NON-SUCCESS closure that rings the unified attention edge — a deny
+// is an unwitnessed-error turn end and rings exactly like any other turn end
+// (the edge is outcome-agnostic; only a user-initiated interrupt stays
+// silent), question answers → success completion. Compact emits the compacting
+// status then completes after a pollable window. Crash exits the process
+// mid-turn — no protocol frames, like a real sidecar death (the Rust
+// unrequested-death synthesis rings for it, never the fake).
 const CLAUDE_PROGRAM = {
   rules: [
     {
@@ -655,13 +658,24 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('approval: Deny writes the deny decision, no success completion, pane stays usable', async ({ page }) => {
+  test('approval: Deny writes the deny decision, no success completion, rings the unified attention edge, pane stays usable', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       await raisePermissionAndAssertNoDecisions(page, lane.harness, lane.tabId, lane.stdinLog)
 
       const card = page.getByRole('alert', { name: 'Permission request for Bash' })
+
+      // The raise's waiting edge (freshAgent.turn.waiting — the 0→≥1 pending
+      // transition) is the FIRST turnCompletion event (seq 1). Capture it
+      // BEFORE the deny so the deny's own edge is pinned as an exact delta.
+      await expect
+        .poll(
+          async () => (await lane.harness.getState())?.turnCompletion?.seq ?? 0,
+          { timeout: 15_000, message: 'the waiting edge folds as seq 1 while the card is up' },
+        )
+        .toBe(1)
+
       await card.getByRole('button', { name: 'Deny tool use' }).click()
 
       const respond = await waitForStdinFrame(
@@ -685,14 +699,14 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
         'a deny must never produce a success completion',
       ).toBe(true)
 
-      // D1-F2 WIRE TRUTH: the fixture mirrors the real sidecar — the errored
-      // turn emits sdk.result{result:'error'} + sdk.status:idle and NO
-      // sdk.turn.complete, so the browser can never receive a false positive
-      // freshAgent.turn.complete through the Rust rename. Race-free: poll the
-      // outbound ledger until the errored result AND the following idle marker
-      // exist, THEN assert the absence of turn.complete earlier in the log
-      // (the follow-up send below is a LATER, legitimately-completing turn on
-      // the same session — this assertion is fenced BEFORE it).
+      // D1-F2 WIRE TRUTH, unified contract: the fixture mirrors the real
+      // sidecar's gate — the denied turn's ERRORED result rings the SAME
+      // sdk.turn.complete edge a success would. A deny is an error turn
+      // end; only a user-initiated interrupt stays silent. Race-free: poll
+      // the outbound ledger until the errored result AND the edge AND the
+      // following idle marker exist, THEN assert the edge's exact-once shape
+      // — fenced BEFORE the follow-up send below (a LATER, legitimately-
+      // completing turn on the same session).
       const deniedBridgeId = respond.sessionId as string
       await expect
         .poll(
@@ -703,35 +717,83 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
                 && r.frame?.result === 'error',
             )
             if (resultIdx === -1) return false
-            return wires.slice(resultIdx + 1).some(
-              (r) => r.frame?.type === 'sdk.status' && r.frame?.sessionId === deniedBridgeId
+            const idleIdx = wires.findIndex(
+              (r, i) => i > resultIdx && r.frame?.type === 'sdk.status' && r.frame?.sessionId === deniedBridgeId
                 && r.frame?.status === 'idle',
             )
+            if (idleIdx === -1) return false
+            return wires
+              .slice(resultIdx, idleIdx + 1)
+              .some((r) => r.frame?.type === 'sdk.turn.complete' && r.frame?.sessionId === deniedBridgeId)
           },
-          { timeout: 15_000, message: 'the errored sdk.result + trailing idle marker for the denied turn' },
+          { timeout: 15_000, message: 'the errored sdk.result + unified edge + trailing idle marker for the denied turn' },
         )
         .toBe(true)
       const wires = readJsonl(lane.eventsLog).filter((r) => r.kind === 'wire')
-      const resultIdx = wires.findIndex(
+      const denyResultIdx = wires.findIndex(
         (r) => r.frame?.type === 'sdk.result' && r.frame?.sessionId === deniedBridgeId
           && r.frame?.result === 'error',
       )
-      expect(resultIdx, 'the denied turn produced an errored sdk.result').toBeGreaterThanOrEqual(0)
-      const idleIdx = wires.findIndex(
-        (r, i) => i > resultIdx && r.frame?.type === 'sdk.status' && r.frame?.sessionId === deniedBridgeId
+      expect(denyResultIdx, 'the denied turn produced an errored sdk.result').toBeGreaterThanOrEqual(0)
+      const denyEdgeIdx = wires.findIndex(
+        (r, i) => i > denyResultIdx && r.frame?.type === 'sdk.turn.complete' && r.frame?.sessionId === deniedBridgeId,
+      )
+      expect(denyEdgeIdx, 'the unified attention edge follows the errored result in stream order').toBeGreaterThan(denyResultIdx)
+      const denyIdleIdx = wires.findIndex(
+        (r, i) => i > denyEdgeIdx && r.frame?.type === 'sdk.status' && r.frame?.sessionId === deniedBridgeId
           && r.frame?.status === 'idle',
       )
+      expect(denyIdleIdx, 'the idle close follows the edge in stream order').toBeGreaterThan(denyEdgeIdx)
+      expect(
+        Number.isFinite(wires[denyEdgeIdx]?.frame?.at),
+        'the edge carries a finite numeric monotonic at',
+      ).toBe(true)
       expect(
         wires
-          .slice(0, idleIdx + 1)
+          .slice(denyResultIdx, denyIdleIdx + 1)
           .filter((r) => r.frame?.type === 'sdk.turn.complete' && r.frame?.sessionId === deniedBridgeId),
-        'no sdk.turn.complete may exist for the denied session up to its close (never a false completion)',
-      ).toEqual([])
+        'exactly one unified edge for the denied turn',
+      ).toHaveLength(1)
       expect(
         wires.some((r) => r.frame?.type === 'sdk.assistant' && r.frame?.sessionId === deniedBridgeId
           && r.frame?.content?.[0]?.text?.includes('denied')),
         'the denial assistant frame did arrive on the wire',
       ).toBe(true)
+
+      // BROWSER-FACING contract: the deny's edge crossed the Rust rename and
+      // folded in the browser as EXACTLY ONE new turnCompletion event
+      // (seq 1 → 2), recorded under the bare completion namespace (distinct
+      // from the waiting edge's `#waiting` bucket). The user is WATCHING
+      // this pane — they clicked Deny — so the unified client partition
+      // renders the tab-strip mark ONLY: the watched mark is set and no
+      // unwitnessed attention flags exist (no bell, no sidebar row, no
+      // pane-header mark from THIS ending).
+      await expect
+        .poll(
+          async () => (await lane.harness.getState())?.turnCompletion?.seq ?? 0,
+          { timeout: 15_000, message: 'the deny edge folds as exactly one new event (seq 2)' },
+        )
+        .toBe(2)
+      const deniedState = await lane.harness.getState()
+      expect(
+        deniedState?.turnCompletion?.lastAtByTerminalId?.[`claude:${deniedBridgeId}`],
+        'the deny edge folded in the completion namespace',
+      ).toBeGreaterThan(0)
+      expect(
+        deniedState?.turnCompletion?.watchedCompletionByTab?.[lane.tabId],
+        'the watched deny sets the tab-strip-only watched mark',
+      ).toBe(true)
+      expect(
+        deniedState?.turnCompletion?.attentionByTab?.[lane.tabId],
+        'a watched deny creates no unwitnessed tab attention',
+      ).toBeUndefined()
+      expect(
+        Object.keys(deniedState?.turnCompletion?.attentionByPane ?? {}),
+        'a watched deny creates no pane-header attention mark',
+      ).toEqual([])
+      const deniedTab = page.locator(`[data-context="tab"][data-tab-id="${lane.tabId}"]`)
+      await expect(deniedTab, 'the active tab renders the watched top-line mark').toHaveClass(/border-t-success/)
+      await expect(deniedTab, 'the watched mark never shades an active tab like a background alert').not.toHaveClass(/bg-emerald-100/)
 
       // Prompt-usable again: a plain follow-up send completes normally.
       await sendComposerText(page, 'follow-up after deny')
@@ -1947,7 +2009,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
 
       // Past the bound: the stuck notice surfaces (role=alert), and the pane
       // stops asserting "working" — the session status the card reads is now
-      // 'stuck', never a fabricated idle/turn-complete.
+      // 'stuck' (the STATUS frame itself asserts no outcome).
       await expect(stuckAlert, 'stuck notice after the quiet window').toBeVisible({ timeout: 25_000 })
       await expect
         .poll(
@@ -1956,11 +2018,39 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
         )
         .toBe('stuck')
 
+      // Unified attention contract: the deadman rings DELIBERATELY — alongside
+      // the stuck status, the server emits the companion freshAgent.turn.complete
+      // edge, so the pane's tab gets exactly one turnCompletion event (seq 1).
+      // The user is watching this pane (single tab, focused window), so the
+      // client partitions the edge as WATCHED — the tab-strip mark, no bell —
+      // but the edge itself MUST arrive: a wedged turn is a turn end.
+      await expect
+        .poll(
+          async () => (await lane.harness.getState())?.turnCompletion?.seq ?? 0,
+          { timeout: 15_000, message: 'the deadman companion edge folds as exactly one event (seq 1)' },
+        )
+        .toBe(1)
+      const deadmanState = await lane.harness.getState()
+      expect(
+        deadmanState?.turnCompletion?.lastAtByTerminalId?.[`codex:${threadId}`],
+        'the deadman edge folded under the completion namespace for the wedged thread',
+      ).toBeGreaterThan(0)
+      expect(
+        deadmanState?.turnCompletion?.watchedCompletionByTab?.[lane.tabId],
+        'the watched deadman fire sets the tab-strip-only watched mark',
+      ).toBe(true)
+      expect(
+        deadmanState?.turnCompletion?.attentionByTab?.[lane.tabId],
+        'a watched deadman fire creates no unwitnessed tab attention',
+      ).toBeUndefined()
+
       // The wedge is a live, in-flight turn: exactly one recorded turn
-      // renders (user + assistant rows) and nothing ever completes it.
+      // renders (user + assistant rows) and the PROVIDER never completes it
+      // — the ring above is the deadman's deliberate synthesis, not a
+      // fabricated provider turn/completed.
       await expect(
         paneRoot.locator('article[data-turn-index]'),
-        'exactly one wedged turn renders (user+assistant rows), alive but silent',
+        'exactly one wedged turn renders (user+assistant rows), alive with no provider completion',
       ).toHaveCount(2, { timeout: 30_000 })
 
       // Recovery: restart the sidecar and resume the durable thread. Truthful

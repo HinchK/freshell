@@ -54,6 +54,7 @@ import {
   wirePaneFocusOwnershipInvalidation,
   paneSelectionMiddleware,
 } from '@/lib/pane-focus-ownership'
+import { turnCompletionReceiptMiddleware } from './turnCompletionReceipt'
 
 enableMapSet()
 
@@ -104,6 +105,11 @@ export const store = configureStore({
       },
     }).concat(
       paneSelectionMiddleware,
+      // DR5-3: stamp the watched witness bit at event-RECEIPT (the dispatch
+      // that queues a turn-completion/terminal-idle event), so the
+      // notification hook consumes the receipt-time classification instead
+      // of recomputing at drain time.
+      turnCompletionReceiptMiddleware,
       perfMiddleware,
       tabFallbackIdentityMiddleware,
       tabRecencyPruneMiddleware,

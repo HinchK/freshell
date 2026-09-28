@@ -194,6 +194,69 @@ fn ready_carries_build_id_and_omits_it_when_absent() {
 }
 
 #[test]
+fn hello_roundtrips_paced_terminal_replay_v1_opt_in() {
+    // Workstream 1 (responsive terminal restore) negotiation: the client opt-in
+    // rides `hello.capabilities.pacedTerminalReplayV1`. Additive optional — a
+    // negotiating hello round-trips byte-identically...
+    let wire = r#"{"type":"hello","protocolVersion":10,"token":"t","capabilities":{"terminalOutputBatchV1":true,"pacedTerminalReplayV1":true}}"#;
+    match client_roundtrip(wire, "hello") {
+        ClientMessage::Hello(h) => {
+            assert_eq!(
+                h.capabilities.and_then(|c| c.paced_terminal_replay_v1),
+                Some(true),
+                "the paced-replay opt-in must parse through the typed struct"
+            );
+        }
+        other => panic!("expected Hello, got {other:?}"),
+    }
+
+    // ...and a non-negotiating hello never invents the key (the frozen
+    // client's wire shape is unchanged).
+    let wire = r#"{"type":"hello","protocolVersion":10,"token":"t","capabilities":{"terminalOutputBatchV1":true}}"#;
+    match client_roundtrip(wire, "hello") {
+        ClientMessage::Hello(h) => {
+            assert_eq!(
+                h.capabilities.and_then(|c| c.paced_terminal_replay_v1),
+                None,
+                "an absent pacedTerminalReplayV1 must stay absent (skip_serializing_if)"
+            );
+        }
+        other => panic!("expected Hello, got {other:?}"),
+    }
+}
+
+#[test]
+fn ready_roundtrips_paced_terminal_replay_v1_echo_and_omission() {
+    // The negotiated echo rides `ready.capabilities` — only for a connection
+    // whose hello opted in.
+    let wire = r#"{"type":"ready","timestamp":"2026-09-19T00:00:00.000Z","serverInstanceId":"srv-abc","bootId":"boot-1","capabilities":{"pacedTerminalReplayV1":true}}"#;
+    match server_roundtrip(wire, "ready") {
+        ServerMessage::Ready(r) => {
+            assert_eq!(
+                r.capabilities.and_then(|c| c.paced_terminal_replay_v1),
+                Some(true),
+                "the negotiated paced-replay echo must parse through the typed struct"
+            );
+        }
+        other => panic!("expected Ready, got {other:?}"),
+    }
+
+    // A non-negotiating capabilities object stays byte-identical to today's
+    // output — no paced key is invented for the frozen client.
+    let wire = r#"{"type":"ready","timestamp":"2026-09-19T00:00:00.000Z","serverInstanceId":"srv-abc","bootId":"boot-1","capabilities":{"paneReconcileV1":true}}"#;
+    match server_roundtrip(wire, "ready") {
+        ServerMessage::Ready(r) => {
+            assert_eq!(
+                r.capabilities.and_then(|c| c.paced_terminal_replay_v1),
+                None,
+                "a non-paced negotiation must not invent pacedTerminalReplayV1"
+            );
+        }
+        other => panic!("expected Ready, got {other:?}"),
+    }
+}
+
+#[test]
 fn terminal_inventory_and_settings_parse_from_transcript() {
     let transcript = read_json("port/oracle/fixtures/handshake-transcript.json");
     let entries = transcript["transcript"].as_array().unwrap();
@@ -333,6 +396,69 @@ fn rich_client_messages() {
             assert_eq!(a.priority, Some(TerminalAttachPriority::Foreground));
         }
         other => panic!("expected TerminalAttach, got {other:?}"),
+    }
+
+    // terminal.attach (inbound) — the negotiated forward-page bound
+    // (round-2 finding F3): present-and-positive round-trips on the
+    // frozen contract; malformed and non-positive values fall back to
+    // None (the server default) instead of failing the whole attach
+    // frame. The invalid shapes are deliberately OUTSIDE the frozen
+    // contract (the Zod schema rejects them), so they are parsed
+    // directly — the tolerance is the server-side accept-and-strip
+    // parity, not a contract case.
+    let wire = r#"{"type":"terminal.attach","terminalId":"t1","intent":"viewport_hydrate","cols":80,"rows":24,"attachRequestId":"a1","replayPageBytes":2048}"#;
+    match client_roundtrip(wire, "terminal.attach") {
+        ClientMessage::TerminalAttach(a) => {
+            assert_eq!(a.replay_page_bytes, Some(2048));
+        }
+        other => panic!("expected TerminalAttach, got {other:?}"),
+    }
+    for invalid in ["\"2048\"", "0", "-5", "1.5"] {
+        let wire = format!(
+            r#"{{"type":"terminal.attach","terminalId":"t1","intent":"viewport_hydrate","cols":80,"rows":24,"attachRequestId":"a1","replayPageBytes":{invalid}}}"#
+        );
+        match serde_json::from_str::<ClientMessage>(&wire)
+            .expect("the invalid bound must not fail the attach frame")
+        {
+            ClientMessage::TerminalAttach(a) => {
+                assert_eq!(
+                    a.replay_page_bytes, None,
+                    "an invalid replayPageBytes ({invalid}) falls back to the server default"
+                );
+            }
+            other => panic!("expected TerminalAttach, got {other:?}"),
+        }
+    }
+
+    // E2R1 finding 3: integer-VALUED number spellings. JSON has one
+    // number type, so `2048.0` and `2e3` carry the same VALUE as the
+    // canonical `2048`/`2000`, and the TS/Zod contract
+    // (`z.number().int().positive()`) accepts that value as an integer —
+    // the frozen JSON Schema agrees (an integer-valued float satisfies
+    // `"type": "integer"`). The lossy deserializer must accept and
+    // validate them the same way, never silently drop the requested
+    // bound to the server default. (These parse directly, not via
+    // `client_roundtrip`, because the re-serialized canonical form
+    // legitimately differs from the non-canonical input spelling.)
+    for (spelling, expected) in [("2048.0", 2048i64), ("2e3", 2000i64)] {
+        let wire = format!(
+            r#"{{"type":"terminal.attach","terminalId":"t1","intent":"viewport_hydrate","cols":80,"rows":24,"attachRequestId":"a1","replayPageBytes":{spelling}}}"#
+        );
+        let raw: Value = serde_json::from_str(&wire).expect("the spelling is JSON");
+        let schema = inbound_schema()["schemas"]["ClientMessageSchema"].clone();
+        assert_conforms(&validator(&schema), &raw, "replayPageBytes {spelling}");
+        match serde_json::from_str::<ClientMessage>(&wire)
+            .expect("an integer-valued spelling must not fail the attach frame")
+        {
+            ClientMessage::TerminalAttach(a) => {
+                assert_eq!(
+                    a.replay_page_bytes,
+                    Some(expected),
+                    "the {spelling} spelling keeps the client's requested bound"
+                );
+            }
+            other => panic!("expected TerminalAttach, got {other:?}"),
+        }
     }
 
     // ping — unit variant.
@@ -595,6 +721,104 @@ fn client_sessions_prefs_roundtrips_and_conforms() {
     let schema = inbound_schema()["schemas"]["ClientMessageSchema"].clone();
     assert!(!schema.is_null(), "frozen client-message schema must exist");
     assert_conforms(&validator(&schema), &back, "sessions.prefs");
+}
+
+#[test]
+fn attach_ready_roundtrips_restore_bounds_and_retention_lost_reset_reason() {
+    // Responsive-terminal-restore shared contract: negotiated connections get
+    // the sequence-bounds fields additively — `oldestRetainedSeq` (earliest
+    // sequence position still available for replay) and the extended
+    // `replayResetReason` value space.
+    let wire = r#"{"type":"terminal.attach.ready","terminalId":"t1","streamId":"s1","headSeq":41,"replayFromSeq":7,"replayToSeq":41,"attachRequestId":"a1","requestedSinceSeq":0,"effectiveSinceSeq":0,"oldestRetainedSeq":7}"#;
+    match server_roundtrip(wire, "terminal.attach.ready") {
+        ServerMessage::TerminalAttachReady(r) => {
+            assert_eq!(r.oldest_retained_seq, Some(7));
+            assert_eq!(r.replay_reset_reason, None);
+        }
+        other => panic!("expected TerminalAttachReady, got {other:?}"),
+    }
+
+    // The new `retention_lost` reset-reason value round-trips through the
+    // typed field (task 3 emits it with the negotiated retention gap; this
+    // contract increment only extends the value space).
+    let wire = r#"{"type":"terminal.attach.ready","terminalId":"t1","streamId":"s1","headSeq":41,"replayFromSeq":42,"replayToSeq":41,"replayResetReason":"retention_lost","oldestRetainedSeq":42}"#;
+    match server_roundtrip(wire, "terminal.attach.ready") {
+        ServerMessage::TerminalAttachReady(r) => {
+            assert_eq!(
+                r.replay_reset_reason,
+                Some(TerminalReplayResetReason::RetentionLost)
+            );
+            assert_eq!(r.oldest_retained_seq, Some(42));
+        }
+        other => panic!("expected TerminalAttachReady, got {other:?}"),
+    }
+
+    // The pre-existing reset-reason value keeps round-tripping.
+    let wire = r#"{"type":"terminal.attach.ready","terminalId":"t1","streamId":"s1","headSeq":9,"replayFromSeq":1,"replayToSeq":9,"replayResetReason":"geometry_authority_unknown"}"#;
+    match server_roundtrip(wire, "terminal.attach.ready") {
+        ServerMessage::TerminalAttachReady(r) => {
+            assert_eq!(
+                r.replay_reset_reason,
+                Some(TerminalReplayResetReason::GeometryAuthorityUnknown)
+            );
+        }
+        other => panic!("expected TerminalAttachReady, got {other:?}"),
+    }
+
+    // The frozen-client shape stays byte-identical: no new keys are invented
+    // for a connection that did not negotiate the restore contract.
+    let wire = r#"{"type":"terminal.attach.ready","terminalId":"t1","streamId":"s1","headSeq":3,"replayFromSeq":1,"replayToSeq":3}"#;
+    match server_roundtrip(wire, "terminal.attach.ready") {
+        ServerMessage::TerminalAttachReady(r) => {
+            assert_eq!(r.oldest_retained_seq, None);
+            assert_eq!(r.replay_reset_reason, None);
+        }
+        other => panic!("expected TerminalAttachReady, got {other:?}"),
+    }
+}
+
+#[test]
+fn output_gap_roundtrips_restore_bounds_and_omits_them_for_frozen_clients() {
+    // Negotiated shape: a queue-overflow gap carries the terminal's current
+    // `headSeq` and earliest-replayable `oldestRetainedSeq` at emission time.
+    let wire = r#"{"type":"terminal.output.gap","terminalId":"t1","streamId":"s1","fromSeq":1,"toSeq":9,"reason":"queue_overflow","attachRequestId":"a1","headSeq":12,"oldestRetainedSeq":2}"#;
+    match server_roundtrip(wire, "terminal.output.gap") {
+        ServerMessage::TerminalOutputGap(g) => {
+            assert_eq!(g.head_seq, Some(12));
+            assert_eq!(g.oldest_retained_seq, Some(2));
+        }
+        other => panic!("expected TerminalOutputGap, got {other:?}"),
+    }
+
+    // Non-negotiated shape: both fields stay absent — the frozen client's
+    // gap frame is byte-identical to the pre-contract wire.
+    let wire = r#"{"type":"terminal.output.gap","terminalId":"t1","streamId":"s1","fromSeq":1,"toSeq":9,"reason":"queue_overflow"}"#;
+    match server_roundtrip(wire, "terminal.output.gap") {
+        ServerMessage::TerminalOutputGap(g) => {
+            assert_eq!(g.head_seq, None);
+            assert_eq!(g.oldest_retained_seq, None);
+        }
+        other => panic!("expected TerminalOutputGap, got {other:?}"),
+    }
+}
+
+#[test]
+fn terminal_replay_credit_roundtrips_and_conforms() {
+    // Responsive-terminal-restore Workstream 1 (paced replay): the
+    // continuation-credit message a pacedTerminalReplayV1 client sends after
+    // consuming an ordered replay page — additive optional, protocol version
+    // stays 10. Task 3 owns the Rust struct + Zod schema in lockstep; the
+    // client's sending behavior is task 4.
+    let wire = r#"{"type":"terminal.replay.credit","terminalId":"t1","streamId":"s1","attachRequestId":"a1","consumedSeq":41}"#;
+    match client_roundtrip(wire, "terminal.replay.credit") {
+        ClientMessage::TerminalReplayCredit(credit) => {
+            assert_eq!(credit.terminal_id, "t1");
+            assert_eq!(credit.stream_id, "s1");
+            assert_eq!(credit.attach_request_id, "a1");
+            assert_eq!(credit.consumed_seq, 41);
+        }
+        other => panic!("expected TerminalReplayCredit, got {other:?}"),
+    }
 }
 
 #[test]
