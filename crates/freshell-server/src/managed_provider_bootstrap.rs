@@ -1,5 +1,9 @@
-use freshell_runtime_protocol::{ProviderSecretProfile, ProviderSecretReference};
+#[cfg(unix)]
+use freshell_runtime_protocol::ProviderSecretProfile;
+use freshell_runtime_protocol::ProviderSecretReference;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 
 /// This is the provider-effective model configured by the approved OneCLI
@@ -8,6 +12,15 @@ pub const AMPLIFIER_MODEL: &str = "glm-5.3";
 pub const AMPLIFIER_REASONING_EFFORT: &str = "provider-default";
 pub const AMPLIFIER_PROGRAM: &str = "/usr/local/bin/freshell-amplifier-onecli";
 
+#[cfg(not(unix))]
+pub fn amplifier_secret_references(
+    _model: Option<&str>,
+    _effort: Option<&str>,
+) -> Result<Vec<ProviderSecretReference>, String> {
+    Err("Amplifier OneCLI bootstrap requires Unix file permissions".into())
+}
+
+#[cfg(unix)]
 pub fn amplifier_secret_references(
     model: Option<&str>,
     effort: Option<&str>,
@@ -38,6 +51,7 @@ pub fn amplifier_secret_references(
     )
 }
 
+#[cfg(unix)]
 fn validate_amplifier_bootstrap(
     model: Option<&str>,
     effort: Option<&str>,
@@ -105,7 +119,7 @@ fn validate_amplifier_bootstrap(
     }])
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::fs;

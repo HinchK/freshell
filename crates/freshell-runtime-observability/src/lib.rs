@@ -8,16 +8,24 @@
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Mutex, OnceLock,
     },
 };
+
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
 
 fn token_field_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -227,8 +235,7 @@ impl RotatingJsonlWriter {
     ) -> std::io::Result<Self> {
         let path = path.into();
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-            fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+            create_private_dir(parent)?;
         }
         let file = secure_append_file(&path)?;
         let size = file.metadata()?.len();
@@ -292,22 +299,22 @@ pub fn atomic_write_redacted_json<T: Serialize>(
     let parent = path
         .parent()
         .ok_or_else(|| std::io::Error::other("document path has no parent"))?;
-    fs::create_dir_all(parent)?;
-    fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    create_private_dir(parent)?;
     let redacted = redacted_json(value, true, process_secret)?;
     static TEMP_NONCE: AtomicU64 = AtomicU64::new(1);
     let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_extension(format!("tmp-{}-{nonce}", std::process::id()));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&tmp)?;
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&tmp)?;
     let result = (|| {
         file.write_all(redacted.as_bytes())?;
         file.write_all(b"\n")?;
         file.sync_all()?;
         fs::rename(&tmp, path)?;
+        #[cfg(unix)]
         File::open(parent)?.sync_all()?;
         Ok(())
     })();
@@ -322,12 +329,13 @@ pub fn now_rfc3339_millis() -> String {
 }
 
 fn secure_append_file(path: &Path) -> std::io::Result<File> {
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)?;
-    fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(file)
 }
 
@@ -376,7 +384,6 @@ mod tests {
 
     #[test]
     fn rotation_and_atomic_documents_are_private_and_bounded() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
         let writer = RotatingJsonlWriter::create(&path, 180, 2, "secret").unwrap();
@@ -391,6 +398,7 @@ mod tests {
         }
         writer.sync_all().unwrap();
         assert!(path.exists());
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -417,6 +425,7 @@ mod tests {
         .unwrap();
         let content = fs::read_to_string(&document).unwrap();
         assert!(!content.contains("secret-value"));
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(document).unwrap().permissions().mode() & 0o777,
             0o600
