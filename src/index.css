@@ -36,9 +36,9 @@ html {
   min-width: min-content;
 }
 
-/* Narrow mobile panes (approved preview): the dir/branch meta hides entirely —
-   the icons + title carry the header; the strip below still shows context. */
+/* In narrow panes, hide optional metadata so the title and controls stay visible. */
 @container (max-width: 480px) {
+  .pane-header-runtime-meta,
   .pane-header--fresh-agent .pane-header-fresh-agent-meta {
     display: none;
   }

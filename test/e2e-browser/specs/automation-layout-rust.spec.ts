@@ -344,6 +344,17 @@ test.describe('Automation layout parity (Rust only)', () => {
         message: 'pane renamed',
       })
       await expect(paneShellA.getByText('P1', { exact: true })).toBeVisible({ timeout: 10_000 })
+      const paneHeaderA = paneShellA.getByRole('banner', { name: 'Pane: P1' })
+      await expect(paneHeaderA).toBeVisible()
+      for (const name of ['Search in terminal', 'Maximize pane', 'Close pane']) {
+        const button = paneHeaderA.getByRole('button', { name })
+        await expect(button).toBeVisible()
+        const headerBox = await paneHeaderA.boundingBox()
+        const buttonBox = await button.boundingBox()
+        expect(headerBox && buttonBox).toBeTruthy()
+        expect(buttonBox!.x).toBeGreaterThanOrEqual(headerBox!.x)
+        expect(buttonBox!.x + buttonBox!.width).toBeLessThanOrEqual(headerBox!.x + headerBox!.width)
+      }
     } finally {
       await server.stop().catch(() => {})
     }

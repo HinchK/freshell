@@ -260,7 +260,7 @@ export default function PaneHeader({
       <div className="pane-header-actions ml-auto flex h-full shrink-0 items-center gap-0">
         {!isFreshAgentPane && metaLabel && (
           <span
-            className="mr-2 max-w-[18rem] truncate text-xs text-muted-foreground text-right"
+            className="pane-header-runtime-meta mr-2 max-w-[18rem] truncate text-xs text-muted-foreground text-right"
             title={metaTooltip || metaLabel}
           >
             {metaLabel}
