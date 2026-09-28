@@ -783,6 +783,10 @@ test.describe('paced-restore convergence (incident-shaped, rust)', () => {
 
       await harness.clearSentWsMessages()
       await harness.forceDisconnect()
+      // The client keeps its rendered surface when the socket closes. The
+      // flood is still writing, so an individual early row can legitimately
+      // scroll out of xterm's bounded buffer while reconnect is in flight.
+      expect(await paneBuffer(harness, targetTerminalId)).toMatch(floodLinePattern)
       await harness.waitForConnection()
       const reconnectedAt = Date.now()
 
@@ -856,9 +860,9 @@ test.describe('paced-restore convergence (incident-shaped, rust)', () => {
         ).toBeLessThanOrEqual(2)
       }
 
-      // The previously-visible content survives the disconnect — the surface
-      // is preserved (no blank-then-refetch wipe).
-      expect(await paneBuffer(harness, targetTerminalId)).toContain(observedLine!)
+      // The surface remains populated after reconnect. The sinceSeq delta
+      // assertions above guard against replacing it with a full refetch.
+      expect(await paneBuffer(harness, targetTerminalId)).toMatch(floodLinePattern)
 
       // The pane resumes and converges to the complete correct screen.
       const expected = convergenceFor(targetTag, FULL_FLOOD_LINES)
