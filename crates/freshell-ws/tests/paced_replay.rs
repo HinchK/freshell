@@ -4239,11 +4239,12 @@ async fn natural_exit_exit_page_read_uncredited_holds_the_exit_for_its_credit() 
 
     // The shell produces one FINAL marker line and exits naturally while
     // the first page is uncredited (octal escapes keep the echoed command
-    // from containing the literal marker).
+    // from containing the literal marker). Replacing the login shell avoids
+    // a later "logout" line that would make the marker page non-final.
     send_input(
         &mut paced,
         &terminal_id,
-        "printf '\\106\\111\\116\\101\\114\\063\\055\\115\\101\\122\\113\\105\\122\\012'; exit\n",
+        "printf '\\106\\111\\116\\101\\114\\063\\055\\115\\101\\122\\113\\105\\122\\012'; exec /bin/true\n",
     )
     .await;
     // The withhold: nothing flows without credits (no page, no exit).
