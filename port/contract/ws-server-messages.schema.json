@@ -4201,6 +4201,16 @@
         "notice": {
           "type": "string"
         },
+        "ownerEpoch": {
+          "type": "number"
+        },
+        "ownerGeneration": {
+          "type": "number"
+        },
+        "ownerKind": {
+          "const": "terminal",
+          "type": "string"
+        },
         "requestId": {
           "type": "string"
         },
@@ -4861,6 +4871,19 @@
       "additionalProperties": false,
       "properties": {
         "error": {
+          "type": "string"
+        },
+        "ownerEpoch": {
+          "type": "number"
+        },
+        "ownerGeneration": {
+          "type": "number"
+        },
+        "ownerKind": {
+          "enum": [
+            "terminal",
+            "fresh-agent"
+          ],
           "type": "string"
         },
         "requestId": {

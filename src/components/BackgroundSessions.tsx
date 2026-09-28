@@ -1,6 +1,8 @@
-import { useCallback, useEffect } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 import { nanoid } from 'nanoid'
 import { resolveTerminalKillFence, sendTerminalKill } from '@/lib/terminal-kill'
+import { foldRefusalFencePair, hasRefusalFencePair } from '@/lib/owner-fence-heal'
+import { getWsClient } from '@/lib/ws-client'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
@@ -46,6 +48,38 @@ export default function BackgroundSessions() {
   }, [refresh])
 
   const detachedRunning = terminals.filter((t) => t.status === 'running' && !t.hasClients)
+
+  // b8ke fence-heal (fix b): detached terminals have NO mounted
+  // TerminalView to consume their typed kill refusal — fold it HERE so
+  // the next Kill click (whose send-time fence read re-selects from the
+  // store) carries the fresh pair. The pane-like target mirrors the
+  // component's own kill fence shape below; a refusal matching no row is
+  // a no-op.
+  const detachedRunningRef = useRef<BackgroundTerminal[]>([])
+  detachedRunningRef.current = detachedRunning
+
+  useEffect(() => {
+    const unsubscribe = getWsClient().onMessage((raw) => {
+      const msg = raw as {
+        type?: string
+        requestId?: string
+        terminalId?: string
+        ownerEpoch?: number
+        ownerGeneration?: number
+      }
+      if (msg.type !== 'error' || msg.requestId || !msg.terminalId) return
+      const row = detachedRunningRef.current.find((r) => r.terminalId === msg.terminalId)
+      if (!row?.sessionRef) return
+      if (!hasRefusalFencePair(msg)) return
+      foldRefusalFencePair(
+        dispatch,
+        appStore.getState(),
+        { sessionRef: row.sessionRef, provider: row.sessionRef.provider },
+        msg,
+      )
+    })
+    return unsubscribe
+  }, [dispatch, appStore])
 
   const now = Date.now()
 

@@ -5,7 +5,7 @@ import {
   resetTerminalReleaseMarks,
 } from '@/lib/terminal-release-marks'
 import { configureStore } from '@reduxjs/toolkit'
-import freshAgentReducer, { applyRuntimeOwner } from '@/store/freshAgentSlice'
+import freshAgentReducer, { applyRuntimeOwner, applyRuntimeOwnerFenceRefresh } from '@/store/freshAgentSlice'
 
 const { mockSend } = vi.hoisted(() => ({ mockSend: vi.fn() }))
 
@@ -84,5 +84,33 @@ describe('resolveTerminalKillFence (b8ke ext r20 F2)', () => {
       provider: 'codex',
       sessionRef: { provider: 'codex', sessionId: 'ses-2' },
     })).toEqual({ observedEpoch: 5, observedGeneration: 34 })
+  })
+
+  // b8ke fence-heal (fix b): a typed refusal's CURRENT pair folds into the
+  // runtimeOwners record — the NEXT kill's send-time fence read must carry
+  // the fresh pair instead of looping on the refused stale one.
+  it('a fence-refreshed record is what the NEXT kill carries (b8ke fence-heal fix b)', () => {
+    const store = configureStore({ reducer: { freshAgent: freshAgentReducer } })
+    store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: 'ses-3',
+      epoch: 12,
+      generation: 34,
+      ownerKind: 'terminal',
+      operationId: 'op-1',
+      transition: 'handoff-committed',
+    }))
+    // The typed refusal's current pair folds (merge-only).
+    store.dispatch(applyRuntimeOwnerFenceRefresh({
+      provider: 'codex',
+      sessionId: 'ses-3',
+      epoch: 12,
+      generation: 40,
+    }))
+    expect(resolveTerminalKillFence(store, {
+      provider: 'codex',
+      sessionRef: { provider: 'codex', sessionId: 'ses-3' },
+    })).toEqual({ observedEpoch: 12, observedGeneration: 40 })
   })
 })

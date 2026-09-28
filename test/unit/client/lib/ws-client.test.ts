@@ -997,4 +997,44 @@ describe('WsClient terminal.create stagger', () => {
     vi.advanceTimersByTime(450)
     expect(createsOf(MockWebSocket.instances[0]).map((m) => m.requestId)).toEqual(['tc-1', 'tc-3'])
   })
+
+  it('isolates a throwing message handler — later handlers still receive the frame', async () => {
+    // Task 7 fence-heal follow-up: the dispatch loop used a bare forEach —
+    // one handler's synchronous throw aborted the iteration and every
+    // LATER handler silently dropped the frame (the recorded e2e wedge: a
+    // pane's terminal.exit fold never ran because an earlier handler threw).
+    // Each handler invocation must be isolated so one bad handler is
+    // logged, never load-bearing for the others.
+    const c = new WsClient('ws://example/ws')
+    const p = c.connect()
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._message({ type: 'ready' })
+    await p
+
+    const throwing = vi.fn(() => {
+      throw new Error('handler exploded')
+    })
+    const first = vi.fn()
+    const after = vi.fn()
+    c.onMessage(first as any)
+    c.onMessage(throwing as any)
+    const unsubscribeLast = c.onMessage(after as any)
+
+    expect(() => {
+      MockWebSocket.instances[0]._message({ type: 'terminal.exit', terminalId: 't1' })
+    }).not.toThrow()
+    expect(first).toHaveBeenCalledTimes(1)
+    expect(throwing).toHaveBeenCalledTimes(1)
+    // The throw must not starve the later handler — this is the regression.
+    expect(after).toHaveBeenCalledTimes(1)
+
+    // Isolation holds for every subsequent frame too, and the subscriber
+    // list itself is unaffected (no partial-mutation wedge).
+    MockWebSocket.instances[0]._message({ type: 'terminal.exit', terminalId: 't2' })
+    expect(first).toHaveBeenCalledTimes(2)
+    expect(throwing).toHaveBeenCalledTimes(2)
+    expect(after).toHaveBeenCalledTimes(2)
+
+    unsubscribeLast()
+  })
 })

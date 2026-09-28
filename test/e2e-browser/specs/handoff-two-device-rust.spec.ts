@@ -167,6 +167,59 @@ function seedSpecConfig(input: {
 }
 
 /**
+ * Seed ~/.codex/sessions/<id>.jsonl so both devices' sidebars list a
+ * resumable codex TERMINAL session (the wall spec's seedCodexHome shape,
+ * copied per the suite's per-spec-ownership convention): config.json with
+ * codex-only providers plus a titled session transcript.
+ */
+function seedFenceHealCodexHome(
+  sessionId: string,
+  sessionTitle: string,
+  projectDir: string,
+): (homeDir: string) => Promise<void> {
+  return async (homeDir: string) => {
+    await seedSpecConfig({ providers: ['codex'] })(homeDir)
+    const codexSessionsDir = path.join(homeDir, '.codex', 'sessions')
+    await fs.mkdir(codexSessionsDir, { recursive: true })
+    const lines = [
+      JSON.stringify({
+        timestamp: '2026-07-21T08:00:00.000Z',
+        type: 'session_meta',
+        payload: { id: sessionId, cwd: projectDir },
+      }),
+      JSON.stringify({
+        timestamp: '2026-07-21T08:00:01.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: `${sessionTitle} request 1` }],
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-07-21T08:00:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: `${sessionTitle} reply 1` }],
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-07-21T08:00:03.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: `${sessionTitle} request 2` }],
+        },
+      }),
+    ]
+    await fs.writeFile(path.join(codexSessionsDir, `${sessionId}.jsonl`), `${lines.join('\n')}\n`)
+  }
+}
+
+/**
  * The fake app-server's rollout path for a thread (its own
  * rolloutFilename/getRolloutSessionDir: UTC-dated dir, percent-encoded id).
  */
@@ -325,6 +378,38 @@ async function openDevicePage(
     })
   }
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+  // The server-owned machine registry gates every fresh context's boot: a
+  // server that already registered a machine (this spec's FIRST device
+  // auto-creates one — a fresh context's localStorage holds no selection)
+  // shows the "Choose a machine" dialog to every later fresh-context page,
+  // and the machine gate blocks the WS transport while the dialog shows.
+  // Answer it with the REAL "Add this machine" affordance: the submit
+  // registers a fresh machine for this context (each device stays its OWN
+  // machine — machine-identity.ts resolves the deviceId from the machine
+  // id) and reloads; the next boot resolves with the persisted selection.
+  // Best-effort by contract (the installRecoveryOfferAutoDecline pattern):
+  // a dialog that never shows is a no-op, and a failed answer falls
+  // through to waitForHarness/waitForConnection's own diagnostics.
+  const machineChooser = page.getByRole('dialog', { name: 'Choose a machine' })
+  await page
+    .waitForFunction(
+      () =>
+        Boolean(
+          document.querySelector('[data-testid="sidebar-session-list"]')
+            || (document.querySelector('section[role="dialog"]')?.textContent ?? '').includes('Choose a machine'),
+        ),
+      undefined,
+      { timeout: 15_000 },
+    )
+    .catch(() => {})
+  if (await machineChooser.isVisible().catch(() => false)) {
+    await page.getByRole('button', { name: 'Add this machine' }).click()
+    // The chooser's submit reloads the page; the reloaded boot resolves the
+    // machine identity from the persisted selection and mounts the app. A
+    // failed answer falls through to waitForHarness/waitForConnection's own
+    // diagnostics.
+    await machineChooser.waitFor({ state: 'detached', timeout: 20_000 }).catch(() => {})
+  }
   const harness = new TestHarness(page)
   await harness.waitForHarness()
   await harness.waitForConnection()
@@ -633,8 +718,24 @@ test.describe('Session handoff across two devices (rust only)', () => {
         .toBe(CODEX_THREAD_ID)
       await waitForPaneLeafStatus(desktop.harness, desktopTabId, 'idle', 45_000)
       await waitForPaneLeafStatus(phone.harness, phoneSession.tabId, 'idle', 45_000)
-      await expect(desktop.page.getByText('two-device handoff turn one', { exact: true })).toBeVisible({ timeout: 30_000 })
-      await expect(phone.page.getByText('two-device handoff turn one', { exact: true })).toBeVisible({ timeout: 30_000 })
+      // Scope to the transcript: the session row button and the pane header
+      // legitimately show the same text (the extracted session title IS the
+      // turn text), so a page-global getByText would strict-violate on three
+      // matches.
+      await expect(
+        desktop.page
+          .locator('[data-context="fresh-agent"]')
+          .last()
+          .locator('.fresh-agent-transcript-scroll')
+          .getByText('two-device handoff turn one', { exact: true }),
+      ).toBeVisible({ timeout: 30_000 })
+      await expect(
+        phone.page
+          .locator('[data-context="fresh-agent"]')
+          .last()
+          .locator('.fresh-agent-transcript-scroll')
+          .getByText('two-device handoff turn one', { exact: true }),
+      ).toBeVisible({ timeout: 30_000 })
       await sendComposerText(desktop.page, 'two-device handoff turn after restart')
       await expect
         .poll(
@@ -1226,6 +1327,231 @@ test.describe('Session handoff across two devices (rust only)', () => {
     } finally {
       await desktopCtx?.close().catch(() => {})
       await phoneCtx?.close().catch(() => {})
+      await server.stop().catch(() => {})
+      await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  // the-usual ownership-fence-fix Task 7 Test B (delta round-4 rework, F1;
+  // focused review 2): the cross-device leg. Device A opens the seeded
+  // session (terminal-lane resume create) and stays connected; device B
+  // attaches to the SAME terminal from its own sidebar, then KILLS it via
+  // the real shift-click affordance -- committing a new ownership generation
+  // (the durable stop) behind A's back. A's pane folds the exit and must
+  // converge to the honest EXITED state and STAY there: a killed session
+  // NEVER auto-restarts (delta F1) -- nothing moves until the user acts (a
+  // bounded negative poll pins the stillness). The pane must also SURFACE
+  // its recovery affordance (focused review 2: the killed-session shape --
+  // clean exit code 0 + the canonical owner record folded VACANT -- renders
+  // the in-pane Reopen action, never an actionless dead pane). The
+  // USER-DRIVEN reopen -- A clicks that surfaced in-pane affordance (the
+  // respawn resume-create) -- must converge with NO page reload: post-fix
+  // every terminal-lane commit broadcasts its own committed (epoch,
+  // generation) pair AND terminal.created carries it (folded before the
+  // queued attach), so the reopen's attach lands and A's page is live
+  // again. Pre-fix the commits were silent: the reopen's queued attach was
+  // refused typed forever -- the recorded incident's exact wedge (the pane
+  // stuck "Recovering terminal output", no PTY output until a page reload).
+  test('cross-device kill+reopen does not wedge a connected page (no reload)', async ({ browser }) => {
+    const CODEX_SESSION_ID = '21000000-aaaa-4bbb-8ccc-000000000002'
+    const SESSION_TITLE = 'fence-heal cross-device codex session'
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-handoff2d-fence-heal-'))
+    const projectDir = path.join(sharedRoot, 'project')
+    await fs.mkdir(projectDir, { recursive: true })
+    // Dual-role: the codex terminal lane boots a `codex app-server` sidecar
+    // FIRST (PTY_SPAWN_FAILED otherwise), so the fake must answer both
+    // app-server argv and terminal argv (codex-dual-role.ts).
+    const fakeCodex = await installDualRoleCodexCli(
+      path.join(sharedRoot, 'bin'),
+      FAKE_CODEX_TERMINAL,
+    )
+    const server = new RustServer({
+      env: { CODEX_CMD: fakeCodex },
+      setupHome: seedFenceHealCodexHome(CODEX_SESSION_ID, SESSION_TITLE, projectDir),
+    })
+    let deviceACtx: BrowserContext | null = null
+    let deviceBCtx: BrowserContext | null = null
+    try {
+      const info = await server.start()
+      deviceACtx = await newDeviceContext(browser)
+      deviceBCtx = await newDeviceContext(browser)
+      const deviceA = await openDevicePage(deviceACtx, info)
+      const deviceB = await openDevicePage(deviceBCtx, info)
+
+      // Two contexts ⇒ two durable device ids (the cross-device premise).
+      expect(await deviceId(deviceA.page)).not.toBe(await deviceId(deviceB.page))
+
+      const sessionRowOn = (page: Page) =>
+        page.getByTestId('sidebar-session-list').locator(`[data-session-id="${CODEX_SESSION_ID}"]`)
+
+      await selectShellIfPickerShowing(deviceA.page)
+      await selectShellIfPickerShowing(deviceB.page)
+
+      // 1. DEVICE A opens the seeded session from the sidebar (the
+      //    terminal-lane resume create) and stays connected; the pane
+      //    attaches -- the fake's resumed marker can only arrive through
+      //    the attach stream.
+      const aRow = sessionRowOn(deviceA.page)
+      await expect(aRow).toBeVisible({ timeout: 15_000 })
+      const aTabCountBefore = await deviceA.harness.getTabCount()
+      await aRow.click()
+      await expect(async () => {
+        expect(await deviceA.harness.getTabCount()).toBe(aTabCountBefore + 1)
+      }).toPass({ timeout: 15_000 })
+      const aTabId = (await deviceA.harness.getActiveTabId())!
+
+      const firstTerminalId: string = await expect
+        .poll(
+          async () => (await deviceA.harness.getPaneLayout(aTabId))?.content?.terminalId ?? null,
+          { timeout: 20_000 },
+        )
+        .not.toBeNull()
+        .then(async () => (await deviceA.harness.getPaneLayout(aTabId))?.content?.terminalId)
+      await expect
+        .poll(async () => {
+          const buffer = await deviceA.harness.getTerminalBuffer(firstTerminalId)
+          const unwrapped = typeof buffer === 'string' ? buffer.replace(/\n/g, '') : ''
+          return unwrapped.includes(`codex: resumed session ${CODEX_SESSION_ID}`)
+        }, { timeout: 30_000 })
+        .toBe(true)
+
+      // 2. DEVICE B opens the SAME session from its own sidebar: B's row
+      //    reports A's running terminal (data-is-running /
+      //    data-running-terminal-id), which routes the click through the
+      //    direct-attach arm -- B's pane lands on the SAME terminalId,
+      //    never a respawn.
+      const bRow = sessionRowOn(deviceB.page)
+      await expect(bRow).toBeVisible({ timeout: 15_000 })
+      await expect(bRow).toHaveAttribute('data-is-running', 'true', { timeout: 30_000 })
+      await expect(bRow).toHaveAttribute('data-running-terminal-id', firstTerminalId, { timeout: 30_000 })
+      const bTabCountBefore = await deviceB.harness.getTabCount()
+      await bRow.click()
+      await expect(async () => {
+        expect(await deviceB.harness.getTabCount()).toBe(bTabCountBefore + 1)
+      }).toPass({ timeout: 15_000 })
+      const bTabId = (await deviceB.harness.getActiveTabId())!
+      await expect
+        .poll(
+          async () => (await deviceB.harness.getPaneLayout(bTabId))?.content?.terminalId ?? null,
+          { timeout: 20_000 },
+        )
+        .toBe(firstTerminalId)
+      await expect
+        .poll(async () => {
+          const buffer = await deviceB.harness.getTerminalBuffer(firstTerminalId)
+          const unwrapped = typeof buffer === 'string' ? buffer.replace(/\n/g, '') : ''
+          return unwrapped.includes(`codex: resumed session ${CODEX_SESSION_ID}`)
+        }, { timeout: 30_000 })
+        .toBe(true)
+
+      // The no-reload sentinels (both pages): surviving to the end proves
+      // neither device ever needed a reload.
+      await deviceA.page.evaluate(() => {
+        ;(window as any).__fenceHealNoReloadSentinel = 'xdev-a'
+      })
+      await deviceB.page.evaluate(() => {
+        ;(window as any).__fenceHealNoReloadSentinel = 'xdev-b'
+      })
+
+      // 3. DEVICE B KILLS the shared terminal via the REAL kill affordance:
+      //    shift-click its tab's CLOSE button (plain close is DETACH-ONLY;
+      //    TabBar decides kill vs detach from e.shiftKey on the
+      //    CLOSE-BUTTON event). B's tab closes after the durable-close ack.
+      await deviceB.page
+        .locator(`[data-context="tab"][data-tab-id="${bTabId}"]`)
+        .getByRole('button', { name: /close/i })
+        .click({ modifiers: ['Shift'] })
+      await expect(async () => {
+        expect(await deviceB.harness.getTabCount()).toBe(bTabCountBefore)
+      }).toPass({ timeout: 15_000 })
+
+      // 4. A's CONNECTED pane converges to the honest EXITED state — and
+      //    STAYS there: a killed session never auto-restarts (delta F1).
+      //    The exit fold clears the pane's terminalId; the bounded negative
+      //    poll (8s) genuinely pins the stillness — no new terminalId
+      //    appears without user action.
+      await expect
+        .poll(
+          async () => (await deviceA.harness.getPaneLayout(aTabId))?.content?.status ?? null,
+          { timeout: 20_000 },
+        )
+        .toBe('exited')
+      await expect
+        .poll(
+          async () => (await deviceA.harness.getPaneLayout(aTabId))?.content?.terminalId ?? null,
+          { timeout: 20_000 },
+        )
+        .toBe(null)
+      await expect(aRow).toHaveAttribute('data-is-running', 'false', { timeout: 15_000 })
+      // A kill is a CLEAN exit by wire contract (the registry fans
+      // terminal.exit{exitCode:0} on the kill path), so the loud crash
+      // banner intentionally does NOT render — but the killed-session
+      // shape (clean exit + the stop commit's VACANT owner record) must
+      // SURFACE the recovery affordance (focused review 2): never an
+      // actionless dead pane. Recovery is USER-DRIVEN, never automatic.
+      const reopenButton = deviceA.page
+        .locator(`[data-context="terminal"][data-tab-id="${aTabId}"]`)
+        .getByRole('button', { name: 'Reopen codex session' })
+      await expect(reopenButton).toBeVisible({ timeout: 15_000 })
+      await deviceA.page.waitForTimeout(8_000)
+      expect((await deviceA.harness.getPaneLayout(aTabId))?.content?.terminalId ?? null).toBe(null)
+      expect((await deviceA.harness.getPaneLayout(aTabId))?.content?.status).toBe('exited')
+
+      // 5. The USER-DRIVEN reopen (no reload): A clicks the pane's SURFACED
+      //    recovery affordance — the respawn resume-create that commits a
+      //    new ownership generation in the SAME pane. Post-fix the commit
+      //    broadcasts its own committed pair AND terminal.created carries it
+      //    (folded before the queued attach), so the reopened pane lands on a
+      //    new terminal; pre-fix (base_ref) the reopen wedged behind the
+      //    silent commits (the recorded incident).
+      const aTabCountAtReopen = await deviceA.harness.getTabCount()
+      await reopenButton.click()
+      const reopenedTerminalId: string = await expect
+        .poll(
+          async () => (await deviceA.harness.getPaneLayout(aTabId))?.content?.terminalId ?? null,
+          { timeout: 30_000 },
+        )
+        .not.toBeNull()
+        .then(async () => (await deviceA.harness.getPaneLayout(aTabId))?.content?.terminalId)
+      // The reopen stays in the SAME pane/tab — no new tab was minted.
+      expect(await deviceA.harness.getTabCount()).toBe(aTabCountAtReopen)
+      // A TRUE kill never resurrects the dead terminal: the reopen is a
+      // new PTY.
+      expect(reopenedTerminalId).not.toBe(firstTerminalId)
+      await expect
+        .poll(async () => {
+          const buffer = await deviceA.harness.getTerminalBuffer(reopenedTerminalId)
+          const unwrapped = typeof buffer === 'string' ? buffer.replace(/\n/g, '') : ''
+          return unwrapped.includes(`codex: resumed session ${CODEX_SESSION_ID}`)
+        }, { timeout: 30_000 })
+        .toBe(true)
+      await expect(aRow).toHaveAttribute('data-is-running', 'true', { timeout: 30_000 })
+      await expect(aRow).toHaveAttribute('data-running-terminal-id', reopenedTerminalId, { timeout: 30_000 })
+
+      // 6. A round-trips input on the reopened terminal -- the connected page
+      //    never wedged and never reloaded.
+      await deviceA.page
+        .locator(`[data-context="terminal"][data-tab-id="${aTabId}"] .xterm`)
+        .first()
+        .click()
+      await deviceA.page.keyboard.type('fence-heal-cross-device')
+      await expect
+        .poll(async () => {
+          const buffer = await deviceA.harness.getTerminalBuffer(reopenedTerminalId)
+          const unwrapped = typeof buffer === 'string' ? buffer.replace(/\n/g, '') : ''
+          return unwrapped.includes('fence-heal-cross-device')
+        }, { timeout: 30_000 })
+        .toBe(true)
+
+      expect(
+        await deviceA.page.evaluate(() => (window as any).__fenceHealNoReloadSentinel),
+      ).toBe('xdev-a')
+      expect(
+        await deviceB.page.evaluate(() => (window as any).__fenceHealNoReloadSentinel),
+      ).toBe('xdev-b')
+    } finally {
+      await deviceACtx?.close().catch(() => {})
+      await deviceBCtx?.close().catch(() => {})
       await server.stop().catch(() => {})
       await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
     }

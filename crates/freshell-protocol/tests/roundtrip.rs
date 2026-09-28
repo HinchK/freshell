@@ -683,6 +683,9 @@ fn terminal_created_notice_is_optional_and_additive() {
         notice: None,
         session_name: None,
         name_ref: None,
+        owner_kind: None,
+        owner_epoch: None,
+        owner_generation: None,
     };
     let json = serde_json::to_value(ServerMessage::TerminalCreated(created.clone())).unwrap();
     assert!(json.get("notice").is_none());

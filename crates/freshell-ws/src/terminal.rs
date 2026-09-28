@@ -3789,6 +3789,9 @@ pub(crate) async fn handle_create(
                     // last-known record).
                     session_name: state.registry.session_name_of(&existing),
                     name_ref: state.identity.name_ref_for(&existing),
+                    owner_kind: None,
+                    owner_epoch: None,
+                    owner_generation: None,
                 });
                 // An adoption IS a successful create for this requestId:
                 // settle the server-wide dedupe entry exactly like the main
@@ -4088,7 +4091,10 @@ pub(crate) async fn handle_create(
                                  different epoch) — \
                                  the create aborts typed, nothing spawns"
                             );
-                            let _ = send_create_error(
+                            // b8ke fence-heal (fix b): the refusal carries the
+                            // coordinator's CURRENT pair for the client's
+                            // fence fold.
+                            let _ = send_create_error_with_stale_pair(
                                 out,
                                 ErrorCode::SessionReserved,
                                 format!(
@@ -4097,6 +4103,8 @@ pub(crate) async fn handle_create(
                                     locator.session_id
                                 ),
                                 &create.request_id,
+                                current_epoch,
+                                current_generation,
                             )
                             .await;
                             return false;
@@ -4153,16 +4161,24 @@ pub(crate) async fn handle_create(
                             )
                             .await;
                         }
-                        freshell_ownership::BeginOutcome::StaleGeneration { .. } => {
+                        freshell_ownership::BeginOutcome::StaleGeneration {
+                            current_epoch,
+                            current_generation,
+                        } => {
                             // Typed stale refusal, retryable: false — no
-                            // retry hint (the caller must refresh its fence).
-                            return send_create_error(
+                            // retry hint (the caller must refresh its
+                            // fence). b8ke fence-heal (fix b): the frame
+                            // carries the coordinator's CURRENT pair for
+                            // exactly that refresh.
+                            return send_create_error_with_stale_pair(
                                 out,
                                 ErrorCode::SessionReserved,
                                 "Session ownership moved on (stale observed generation); \
                                  refresh and retry."
                                     .to_string(),
                                 &create.request_id,
+                                *current_epoch,
+                                *current_generation,
                             )
                             .await;
                         }
@@ -4230,6 +4246,25 @@ pub(crate) async fn handle_create(
                         // `create.request_id` (same discipline as the main
                         // spawn path's dedupe locals).
                         let dedupe_request_id = create.request_id.clone();
+                        // b8ke fence-heal (fix c): the created frame rides the
+                        // commit's own pair so the attaching pane's queued
+                        // first attach is born fresh. The literal is built
+                        // pre-commit but only SENT post-commit (the commit's
+                        // Err arm below answers an error and never sends it),
+                        // so reading the claim ticket's generation HERE, on
+                        // the immutable ticket, is reading the committed pair
+                        // the frame will ride; None when no claim exists or
+                        // the coordinator is unwired (frozen-client parity —
+                        // Task 1's owner_trio pattern).
+                        let owner_trio: Option<(&str, u64, u64)> =
+                            match (terminal_ownership.as_ref(), state.ownership.as_ref()) {
+                                (Some(claim), Some(ownership)) => Some((
+                                    "terminal",
+                                    ownership.boot_epoch(),
+                                    claim.ticket.generation(),
+                                )),
+                                _ => None,
+                            };
                         let created = ServerMessage::TerminalCreated(TerminalCreated {
                             created_at: now_ms(),
                             request_id: create.request_id,
@@ -4246,6 +4281,9 @@ pub(crate) async fn handle_create(
                             // naming binding rides the attach answer.
                             session_name: state.registry.session_name_of(&terminal_id),
                             name_ref: state.identity.name_ref_for(&terminal_id),
+                            owner_kind: owner_trio.map(|(kind, _, _)| kind.to_string()),
+                            owner_epoch: owner_trio.map(|(_, epoch, _)| epoch),
+                            owner_generation: owner_trio.map(|(_, _, gen)| gen),
                         });
                         // Attaching to the winner IS a successful create for
                         // this requestId: settle the dedupe entry exactly
@@ -4273,6 +4311,16 @@ pub(crate) async fn handle_create(
                         // double-committed, never clobbering the later owner).
                         if let Some(ownership_claim) = terminal_ownership.take() {
                             let locator = ownership_claim.locator.clone();
+                            // b8ke fence-heal (fix a), r32 F2: capture the
+                            // claim ticket's OWN pair BEFORE the consuming
+                            // commit() — the broadcast below carries THIS
+                            // pair, never a re-observed current generation
+                            // (the same pre-commit capture as the frame's
+                            // owner_trio above; the ticket is immutable, so
+                            // both reads are the committed pair).
+                            let owner_operation_id =
+                                ownership_claim.ticket.operation_id().to_string();
+                            let owner_generation = ownership_claim.ticket.generation();
                             match ownership_claim.commit(&terminal_id) {
                                 Ok(()) => {
                                     tracing::info!(
@@ -4280,6 +4328,23 @@ pub(crate) async fn handle_create(
                                         provider = %locator.provider,
                                         session_id = %locator.session_id,
                                         "session_ref.ownership_committed (terminal lane, attach)"
+                                    );
+                                    // b8ke fence-heal (fix a): the attach-claim
+                                    // commit broadcasts the authoritative owner
+                                    // frame (the r29 F1 "every ownership
+                                    // transition broadcasts" invariant, extended
+                                    // to the terminal lane's attach claim) so
+                                    // every connected client folds the fresh
+                                    // fence instead of wedging behind its
+                                    // pre-attach observed fence.
+                                    crate::identity_ownership::broadcast_owner_frame(
+                                        state,
+                                        &locator.provider,
+                                        &locator.session_id,
+                                        &terminal_id,
+                                        &owner_operation_id,
+                                        owner_generation,
+                                        "handoff-committed",
                                     );
                                 }
                                 Err(outcome) => {
@@ -4887,6 +4952,28 @@ pub(crate) async fn handle_create(
                                 )
                                 .await;
                             }
+                        }
+                        freshell_ownership::BeginOutcome::StaleGeneration {
+                            current_epoch,
+                            current_generation,
+                        } => {
+                            // b8ke fence-heal (fix b): the same CURRENT-pair
+                            // fold the wire-claim arms carry. Defensive
+                            // parity: the learned claim passes no observed
+                            // fence today, so this arm cannot fire — but a
+                            // later change that threads one self-heals
+                            // instead of wedging the caller's stale pair.
+                            send_create_error_with_stale_pair(
+                                out,
+                                ErrorCode::SessionReserved,
+                                "Session ownership moved on (stale observed generation); \
+                                 refresh and retry."
+                                    .to_string(),
+                                &create.request_id,
+                                *current_epoch,
+                                *current_generation,
+                            )
+                            .await;
                         }
                         _ => {
                             let reason = format!(
@@ -5998,8 +6085,23 @@ pub(crate) async fn handle_create(
             }
         }
     }
+    // b8ke fence-heal (fixes a + c): the terminal lane's commit-to-Live now
+    // BROADCASTS the authoritative owner record (the r29 F1 "every ownership
+    // transition broadcasts" invariant, extended to the terminal lane) and
+    // rides the commit's OWN pair on `terminal.created` — both carry the
+    // (epoch, generation) captured from the claim ticket BEFORE the
+    // consuming commit (r32 F2 — never a re-observed current generation), so
+    // every connected client folds the fresh fence and the creating pane's
+    // first attach is born fresh. Pre-fix this settle committed Live with NO
+    // broadcast, so every connected client kept its pre-create observed
+    // fence until a page reload and the pane's queued attach / later kills
+    // and recreates were refused typed ("moved to a newer runtime; refresh
+    // and retry").
+    let mut committed_owner_generation: Option<u64> = None;
     if let Some(ownership_claim) = terminal_ownership.take() {
         let locator = ownership_claim.locator.clone();
+        let owner_operation_id = ownership_claim.ticket.operation_id().to_string();
+        let owner_generation = ownership_claim.ticket.generation();
         match ownership_claim.commit(&terminal_id) {
             Ok(()) => {
                 tracing::info!(
@@ -6008,6 +6110,16 @@ pub(crate) async fn handle_create(
                     session_id = %locator.session_id,
                     "session_ref.ownership_committed (terminal lane)"
                 );
+                crate::identity_ownership::broadcast_owner_frame(
+                    state,
+                    &locator.provider,
+                    &locator.session_id,
+                    &terminal_id,
+                    &owner_operation_id,
+                    owner_generation,
+                    "handoff-committed",
+                );
+                committed_owner_generation = Some(owner_generation);
             }
             Err(outcome) => {
                 tracing::error!(target: "invariant",
@@ -6060,6 +6172,15 @@ pub(crate) async fn handle_create(
     let dedupe_terminal_id = terminal_id.clone();
     let dedupe_restore = create.restore;
 
+    // b8ke fence-heal (fix c): the created frame carries the commit's own
+    // pair so the creating pane's first attach is born fresh; None when no
+    // claim committed or the coordinator is unwired (frozen-client parity).
+    let owner_trio: Option<(&str, u64, u64)> =
+        match (committed_owner_generation, state.ownership.as_ref()) {
+            (Some(gen), Some(ownership)) => Some(("terminal", ownership.boot_epoch(), gen)),
+            _ => None,
+        };
+
     let created = ServerMessage::TerminalCreated(TerminalCreated {
         created_at: now_ms(),
         request_id: create.request_id,
@@ -6075,6 +6196,9 @@ pub(crate) async fn handle_create(
         // Unified agent names: the just-admitted naming projection.
         name_ref,
         session_name,
+        owner_kind: owner_trio.map(|(kind, _, _)| kind.to_string()),
+        owner_epoch: owner_trio.map(|(_, epoch, _)| epoch),
+        owner_generation: owner_trio.map(|(_, _, gen)| gen),
     });
     // Record the settled create (server-wide requestId dedupe) and forward
     // the frame to any cross-connection waiters — AFTER the origin reply's
@@ -7117,6 +7241,40 @@ pub(crate) async fn send_create_error_with_owner(
         terminal_exit_code: None,
         terminal_id: None,
         live_terminal_id,
+    });
+    out.send(&msg).await
+}
+
+/// b8ke fence-heal (fix b server contract): a typed `StaleGeneration` create
+/// refusal carries the coordinator's CURRENT (epoch, generation) — the pair
+/// the client folds into its runtimeOwners fence so its next attempt is born
+/// fresh instead of looping on the same stale pair. The owning KIND stays
+/// honestly absent: the `StaleGeneration` outcome names only the fence
+/// mismatch, never an owner identity (the attach lane's refusal precedent).
+/// Additive fields only — every non-stale create error keeps its frame
+/// byte-identical on the wire (frozen-client parity).
+pub(crate) async fn send_create_error_with_stale_pair(
+    out: &mut crate::create_gate::CreateOutput<'_>,
+    code: ErrorCode,
+    message: String,
+    request_id: &str,
+    current_epoch: u64,
+    current_generation: u64,
+) -> bool {
+    let msg = ServerMessage::Error(ErrorMsg {
+        owner_kind: None,
+        owner_generation: Some(current_generation),
+        owner_epoch: Some(current_epoch),
+        code,
+        message,
+        timestamp: crate::now_iso(),
+        actual_session_ref: None,
+        expected_session_ref: None,
+        request_id: Some(request_id.to_string()),
+        retry_after_ms: None,
+        terminal_exit_code: None,
+        terminal_id: None,
+        live_terminal_id: None,
     });
     out.send(&msg).await
 }
@@ -8175,6 +8333,27 @@ fn handle_auto_resume_cancel(cancel: TerminalAutoResumeCancel, state: &WsState) 
     tracing::info!(terminal_id = %cancel.terminal_id, "terminal.auto_resume.user_cancelled");
 }
 
+/// The wire `ownerKind` a `StopOutcome::StaleClaim` refusal names: the kind
+/// of the owner the refused-claim state carries, where the state provides
+/// one (Live's owner, Starting's kind, Handoff's target kind, Stopping's/
+/// Fenced's prior owner). `None` keeps the field off the wire
+/// (frozen-client parity).
+fn stale_claim_owner_kind(state: &freshell_ownership::OwnershipState) -> Option<&'static str> {
+    use freshell_ownership::{OwnershipState, RuntimeOwnerKind};
+    let kind = match state {
+        OwnershipState::Live { owner, .. } => Some(owner.kind),
+        OwnershipState::Starting { kind, .. } => Some(*kind),
+        OwnershipState::Handoff { to_kind, .. } => Some(*to_kind),
+        OwnershipState::Stopping { owner, .. } => owner.as_ref().map(|owner| owner.kind),
+        OwnershipState::Fenced { prior, .. } => prior.as_ref().map(|(owner, _)| owner.kind),
+        OwnershipState::Vacant | OwnershipState::Aliased { .. } => None,
+    };
+    kind.map(|kind| match kind {
+        RuntimeOwnerKind::Terminal => "terminal",
+        RuntimeOwnerKind::FreshAgent => "fresh-agent",
+    })
+}
+
 async fn handle_kill(
     kill: TerminalKill,
     ws_tx: &mut WsSink,
@@ -8300,6 +8479,11 @@ async fn handle_kill(
                         terminal_id: kill.terminal_id,
                         success: false,
                         error: Some(reason),
+                        // No owner trio: the fence was INVALID (half-sent),
+                        // not stale — there is no current pair to teach.
+                        owner_kind: None,
+                        owner_generation: None,
+                        owner_epoch: None,
                     });
                     return send(ws_tx, &msg).await;
                 }
@@ -8343,6 +8527,16 @@ async fn handle_kill(
             initiator,
             now_ms().max(0) as u64,
         );
+        // b8ke fence-heal (fix b): the typed stale-claim refusal carries
+        // the coordinator's CURRENT (epoch, generation) — the pair the
+        // client folds into its runtimeOwners fence so its next attempt is
+        // born fresh instead of looping on the same stale pair. Only the
+        // StaleClaim arm knows the pair (and the state's owner kind); every
+        // other refusal keeps the fields absent (byte-identical legacy
+        // frames, frozen-client parity).
+        let mut refused_owner_kind: Option<String> = None;
+        let mut refused_owner_epoch: Option<u64> = None;
+        let mut refused_owner_generation: Option<u64> = None;
         let refused_reason: Option<String> = match &outcome {
             freshell_ownership::StopOutcome::Granted { generation } => {
                 stop_commit = Some((
@@ -8382,7 +8576,15 @@ async fn handle_kill(
             freshell_ownership::StopOutcome::BlockedHandoff { .. } => Some(
                 "a handoff owns this session's transition; retry after it settles".to_string(),
             ),
-            freshell_ownership::StopOutcome::StaleClaim { .. } => {
+            freshell_ownership::StopOutcome::StaleClaim {
+                current_epoch,
+                current_generation,
+                state,
+            } => {
+                refused_owner_kind =
+                    stale_claim_owner_kind(state).map(|kind| kind.to_string());
+                refused_owner_epoch = Some(*current_epoch);
+                refused_owner_generation = Some(*current_generation);
                 Some("ownership moved to a newer runtime; refresh and retry".to_string())
             }
         };
@@ -8402,13 +8604,18 @@ async fn handle_kill(
                     terminal_id: kill.terminal_id,
                     success: false,
                     error: Some(reason),
+                    // b8ke fence-heal: the refusal trio (additive, skip-None
+                    // — absent on every non-stale kill answer).
+                    owner_kind: refused_owner_kind,
+                    owner_generation: refused_owner_generation,
+                    owner_epoch: refused_owner_epoch,
                 });
                 return send(ws_tx, &msg).await;
             }
             let msg = ServerMessage::Error(ErrorMsg {
-                owner_kind: None,
-                owner_generation: None,
-                owner_epoch: None,
+                owner_kind: refused_owner_kind,
+                owner_generation: refused_owner_generation,
+                owner_epoch: refused_owner_epoch,
                 code: ErrorCode::SessionReserved,
                 message: reason,
                 timestamp: crate::now_iso(),
@@ -8506,6 +8713,11 @@ async fn handle_kill(
                     terminal_id: kill.terminal_id,
                     success: false,
                     error: Some(CLOSE_FAILURE_COPY.to_string()),
+                    // No owner trio: a ledger close failure is not an ownership
+                    // refusal (the granted stop already rolled back above).
+                    owner_kind: None,
+                    owner_generation: None,
+                    owner_epoch: None,
                 });
                 return send(ws_tx, &msg).await;
             }
@@ -8559,6 +8771,11 @@ async fn handle_kill(
             terminal_id: kill.terminal_id,
             success: !persisted_despite_error,
             error: persisted_despite_error.then(|| PERSISTED_CLOSE_COPY.to_string()),
+            // No owner trio: the kill SUCCEEDED the ownership sequence —
+            // the trio rides refusals only.
+            owner_kind: None,
+            owner_generation: None,
+            owner_epoch: None,
         });
         return send(ws_tx, &msg).await;
     }
@@ -10067,6 +10284,159 @@ mod terminal_kill_stop_wedge_tests {
             "the retried kill must complete the stop sequence to Vacant"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A REAL loopback websocket pair (the `pane_reconcile_gate_tests`
+    /// pattern): a scratch axum app upgrades the client connection and hands
+    /// its write half (the production `WsSink` type) to the test, so
+    /// `handle_kill` runs its real serialization + send path and the refusal
+    /// frames are asserted off the wire by a real tungstenite client.
+    type KillTestClient = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn kill_loopback_sink_and_client() -> (WsSink, KillTestClient) {
+        let (sink_tx, sink_rx) = tokio::sync::oneshot::channel::<WsSink>();
+        let sink_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(sink_tx)));
+        let router = axum::Router::new().route(
+            "/ws",
+            axum::routing::any(move |upgrade: axum::extract::ws::WebSocketUpgrade| {
+                let sink_tx = std::sync::Arc::clone(&sink_tx);
+                async move {
+                    upgrade.on_upgrade(move |socket| async move {
+                        let (sink, _read) = socket.split();
+                        let (sender, pump) = connection_writer::WriterSender::new(
+                            16 * 1024 * 1024,
+                            16 * 1024 * 1024,
+                            std::time::Duration::from_secs(5),
+                        );
+                        tokio::spawn(pump.run(sink));
+                        if let Some(tx) = sink_tx.lock().await.take() {
+                            let _ = tx.send(sender);
+                        }
+                        // Park: keep the upgraded socket (and with it the
+                        // handed-out write half) alive until the test's
+                        // runtime tears the connection down.
+                        std::future::pending::<()>().await;
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral loopback port");
+        let addr = listener.local_addr().expect("loopback local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let (client, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("ws connect to scratch server");
+        let sink = sink_rx
+            .await
+            .expect("upgrade handler delivered the write half");
+        (sink, client)
+    }
+
+    async fn kill_next_text_frame(client: &mut KillTestClient) -> serde_json::Value {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+            .await
+            .expect("frame within timeout")
+            .expect("stream not ended")
+            .expect("no ws error");
+        match msg {
+            tokio_tungstenite::tungstenite::Message::Text(text) => {
+                serde_json::from_str(&text).expect("json frame")
+            }
+            other => panic!("expected a text frame, got {other:?}"),
+        }
+    }
+
+    /// The fixture's committed Live pair, as the stale kill claim must be
+    /// stale AGAINST (the Live state's own generation).
+    fn committed_live_generation(
+        ownership: &Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+    ) -> u64 {
+        match ownership.observe(KILL_PROVIDER, KILL_SESSION).state {
+            freshell_ownership::OwnershipState::Live { generation, .. } => generation,
+            other => panic!("fixture must seed Live, got {other:?}"),
+        }
+    }
+
+    /// b8ke fence-heal (fix b): a kill refused on a stale claim carries the
+    /// coordinator's CURRENT pair (+ the state's owner kind) on the
+    /// requestId'd `terminal.killed{success:false}` ack — the ONLY frame the
+    /// client's correlated await resolves, so the fold pair must ride it
+    /// (Task 6 consumes the trio).
+    #[tokio::test]
+    async fn kill_refused_on_a_stale_claim_carries_the_current_pair_on_the_killed_ack() {
+        let (state, ownership, terminal_id) =
+            state_with_live_terminal_owner(crate::pane_ledger::PaneLedger::disabled());
+        let (mut ws_tx, mut client) = kill_loopback_sink_and_client().await;
+        let generation = committed_live_generation(&ownership);
+        let mut kill = kill_for(&terminal_id);
+        kill.observed_epoch = Some(ownership.boot_epoch());
+        kill.observed_generation = Some(generation - 1);
+        handle_kill(kill, &mut ws_tx, &state, "ws-kill-conn-test").await;
+        let frame = kill_next_text_frame(&mut client).await;
+        assert_eq!(frame["type"], "terminal.killed");
+        assert_eq!(frame["requestId"], "req-kill-wedge");
+        assert_eq!(frame["success"], false, "the stale claim must be refused");
+        assert_eq!(
+            frame["ownerKind"], "terminal",
+            "the refusal names the incumbent owner kind: {frame}"
+        );
+        assert_eq!(
+            frame["ownerGeneration"], generation,
+            "the refusal carries the CURRENT generation: {frame}"
+        );
+        assert_eq!(
+            frame["ownerEpoch"],
+            ownership.boot_epoch(),
+            "the refusal carries the CURRENT epoch: {frame}"
+        );
+        // Nothing is killed: the incumbent Live owner stands.
+        assert!(matches!(
+            ownership.observe(KILL_PROVIDER, KILL_SESSION).state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ));
+    }
+
+    /// b8ke fence-heal (fix b): the requestId-less stale-claim refusal rides
+    /// the legacy Error arm — the SAME additive trio the killed ack carries
+    /// (the belt wire with no client consumer claim today).
+    #[tokio::test]
+    async fn kill_refused_on_a_stale_claim_carries_the_trio_on_the_error_arm() {
+        let (state, ownership, terminal_id) =
+            state_with_live_terminal_owner(crate::pane_ledger::PaneLedger::disabled());
+        let (mut ws_tx, mut client) = kill_loopback_sink_and_client().await;
+        let generation = committed_live_generation(&ownership);
+        let mut kill = kill_for(&terminal_id);
+        kill.request_id = None;
+        kill.observed_epoch = Some(ownership.boot_epoch());
+        kill.observed_generation = Some(generation - 1);
+        handle_kill(kill, &mut ws_tx, &state, "ws-kill-conn-test").await;
+        let frame = kill_next_text_frame(&mut client).await;
+        assert_eq!(frame["type"], "error");
+        assert_eq!(frame["code"], "SESSION_RESERVED");
+        assert_eq!(
+            frame["ownerKind"], "terminal",
+            "the refusal names the incumbent owner kind: {frame}"
+        );
+        assert_eq!(
+            frame["ownerGeneration"], generation,
+            "the refusal carries the CURRENT generation: {frame}"
+        );
+        assert_eq!(
+            frame["ownerEpoch"],
+            ownership.boot_epoch(),
+            "the refusal carries the CURRENT epoch: {frame}"
+        );
+        // Nothing is killed: the incumbent Live owner stands.
+        assert!(matches!(
+            ownership.observe(KILL_PROVIDER, KILL_SESSION).state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ));
     }
 }
 

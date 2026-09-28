@@ -1172,10 +1172,16 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                         .take(),
                 );
                 if let Some(mut claim) = parked {
+                    // b8ke fence-heal (plan Task 3), r32 F2: capture the
+                    // claim ticket's OWN pair BEFORE the consuming commit —
+                    // the broadcast below carries THIS pair, never a
+                    // re-observed current generation.
+                    let owner_operation_id = claim.ticket.operation_id().to_string();
+                    let owner_generation = claim.ticket.generation();
                     let outcome = state.registry.commit_session_ref_ownership(
                         &claim.locator,
-                        claim.ticket.operation_id(),
-                        claim.ticket.generation(),
+                        &owner_operation_id,
+                        owner_generation,
                         &new_terminal_id,
                     );
                     if !matches!(outcome, freshell_ownership::CommitOutcome::Committed) {
@@ -1198,6 +1204,21 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                         }
                         return false;
                     }
+                    // b8ke fence-heal (plan Task 3): the respawn settle is a
+                    // terminal-lane commit-to-Live — it broadcasts its own
+                    // committed pair (r29 F1 invariant / r32 F2 pair) so
+                    // every connected client folds the replacement's fresh
+                    // fence instead of wedging behind its pre-respawn
+                    // observed fence.
+                    crate::identity_ownership::broadcast_owner_frame(
+                        &state,
+                        &claim.locator.provider,
+                        &claim.locator.session_id,
+                        &new_terminal_id,
+                        &owner_operation_id,
+                        owner_generation,
+                        "handoff-committed",
+                    );
                     // b8ke d4 F4: the successful commit consumed the claim —
                     // DISARM the ticket so its Drop (the end of this scope)
                     // does not also perform the typed fail
@@ -3181,6 +3202,78 @@ mod tests {
         }
         state.registry.kill("t-replacement");
         let _ = delayed_release.await;
+    }
+
+    /// b8ke fence-heal (plan Task 3): the respawn settle is a terminal-lane
+    /// commit-to-Live — it must BROADCAST its own committed (epoch,
+    /// generation) pair (the r29 F1 "every ownership transition broadcasts"
+    /// invariant; r32 F2: the pair captured from the claim ticket BEFORE
+    /// the consuming commit, never a re-observed current generation).
+    /// Pre-Task-3 the settle committed Live with NO broadcast, so every
+    /// connected client kept its pre-respawn observed fence and later
+    /// lifecycle controls against the replacement were refused typed
+    /// until a reload or an unrelated transition supplied one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_completed_respawn_claim_broadcasts_its_committed_owner_pair() {
+        let (state, ownership) = ownership_state();
+        let driver = WsAutoResumeDriver {
+            state: state.clone(),
+            pending_ownership: Default::default(),
+            pending_attach_guard: Default::default(),
+        };
+        let sid = "ses-fenceheal-t3-respawn".to_string();
+        // The broadcast receiver subscribed BEFORE the commit (the shared
+        // bus every connected client folds owner frames from).
+        let mut rx = state.broadcast_tx.subscribe();
+
+        // The claim: a vacant key GRANTS and parks the ticket (the
+        // ordinary crash-recovery shape — no incumbent to Adopt).
+        assert!(
+            driver
+                .claim_session("claude", &sid, "req-fenceheal-t3", None)
+                .await,
+            "the vacant-key claim parks the Granted ticket"
+        );
+        // The ticket's committed generation: the Granted claim's Starting
+        // record generation — the exact pair the settle's commit consumes.
+        let committed_generation = ownership.observe("claude", &sid).generation;
+
+        // The replacement spawns (a real row) and the settle commits the
+        // parked ticket.
+        spawn_real_shell_row(&state, "t-fenceheal-t3-replacement", "claude");
+        assert!(
+            driver
+                .complete_claim(
+                    "claude",
+                    &sid,
+                    "req-fenceheal-t3",
+                    "t-fenceheal-t3-replacement"
+                )
+                .await,
+            "the settle succeeds under the held authority"
+        );
+
+        // THE CONTRACT: the commit's own pair rode the bus — same drain
+        // discipline as identity_ownership's race tests.
+        let mut owner_frame = None;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).expect("bus json");
+            if frame["type"] == "session.runtimeOwner"
+                && frame["sessionId"] == serde_json::json!(sid)
+            {
+                owner_frame = Some(frame);
+            }
+        }
+        let frame = owner_frame.expect("the respawn settle broadcast its committed owner pair");
+        assert_eq!(frame["ownerKind"], serde_json::json!("terminal"));
+        assert_eq!(frame["transition"], serde_json::json!("handoff-committed"));
+        assert_eq!(frame["generation"], serde_json::json!(committed_generation));
+        assert_eq!(frame["epoch"], serde_json::json!(ownership.boot_epoch()));
+        assert_eq!(
+            frame["terminalId"],
+            serde_json::json!("t-fenceheal-t3-replacement")
+        );
+        state.registry.kill("t-fenceheal-t3-replacement");
     }
 
     /// b8ke ext r13 F2: the losing shape — the incumbent's row is still

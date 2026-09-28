@@ -6,6 +6,7 @@ import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { sendTerminalKillAndAwait } from '@/lib/kill-ack'
 import { resolveTerminalKillFence } from '@/lib/terminal-kill'
+import { foldRefusalFencePair } from '@/lib/owner-fence-heal'
 import { collectPaneEntries, collectTerminalCloseTargets } from '@/lib/pane-utils'
 import { getBusyPaneIdsForTab } from '@/lib/pane-activity'
 import { resolvePaneRepoCwd, pathBasename, buildRepoIconUrl } from '@/lib/repo-icon'
@@ -542,7 +543,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
               // only; the server close stays authoritative.
               void (async () => {
                 const acks = await Promise.all(
-                  targets.map((t) => {
+                  targets.map(async (t) => {
                     // b8ke ext r20 F2: each close-target kill carries
                     // the session's observed (epoch, generation) pair —
                     // the fence resolution consults the runtimeOwners
@@ -551,10 +552,21 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
                     const fence = t.sessionRef
                       ? resolveTerminalKillFence(appStore, { sessionRef: t.sessionRef })
                       : undefined
-                    return sendTerminalKillAndAwait(t.terminalId, {
+                    const ack = await sendTerminalKillAndAwait(t.terminalId, {
                       createRequestId: t.createRequestId,
                       ...(fence ?? {}),
                     })
+                    if (!ack.ok && t.sessionRef) {
+                      // b8ke fence-heal (fix b): a typed-refused kill
+                      // carries the coordinator's CURRENT pair on the
+                      // correlated ack — fold it onto the session's owner
+                      // record (the same bare { sessionRef } pane-like
+                      // shape the fence resolution above uses) so the
+                      // NEXT close attempt sends the fresh pair instead
+                      // of looping on the refused stale one.
+                      foldRefusalFencePair(dispatch, appStore.getState(), { sessionRef: t.sessionRef }, ack)
+                    }
+                    return ack
                   }),
                 )
                 if (acks.every((ack) => ack.ok)) {

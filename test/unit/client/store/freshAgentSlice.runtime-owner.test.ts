@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import freshAgentReducer, {
   applyRefusalFence,
   applyRuntimeOwner,
+  applyRuntimeOwnerFenceRefresh,
   resetRuntimeOwners,
   type RuntimeOwnerRecord,
 } from '@/store/freshAgentSlice'
@@ -19,7 +20,13 @@ const baseFrame = (overrides: Partial<SessionRuntimeOwnerMessage> = {}): Session
   ...overrides,
 })
 
-function reducerWith(...actions: Array<ReturnType<typeof applyRuntimeOwner> | ReturnType<typeof resetRuntimeOwners>>) {
+function reducerWith(
+  ...actions: Array<
+    ReturnType<typeof applyRuntimeOwner>
+    | ReturnType<typeof resetRuntimeOwners>
+    | ReturnType<typeof applyRuntimeOwnerFenceRefresh>
+  >
+) {
   return actions.reduce(freshAgentReducer, freshAgentReducer(undefined, { type: '@@INIT' }))
 }
 
@@ -129,5 +136,52 @@ describe('freshAgentSlice runtimeOwners fold', () => {
     }))
     expect(refusalFold(2).runtimeOwners['opencode:ses-fence'].generation).toBe(3)
     expect(refusalFold(4).runtimeOwners['opencode:ses-fence'].generation).toBe(4)
+  })
+})
+
+describe('applyRuntimeOwnerFenceRefresh (b8ke fence-heal, fix b)', () => {
+  it('merges the fresh pair into an existing record, preserving ownerKind/transition', () => {
+    const next = reducerWith(
+      applyRuntimeOwner(baseFrame({
+        sessionId: 's1',
+        generation: 3,
+        ownerKind: 'terminal',
+        transition: 'handoff-committed',
+        terminalId: 't-owner',
+        aliasOf: 'canonical-s1',
+      })),
+      applyRuntimeOwnerFenceRefresh({ provider: 'codex', sessionId: 's1', epoch: baseFrame().epoch, generation: 6 }),
+    )
+    const rec = next.runtimeOwners['codex:s1']
+    expect(rec.generation).toBe(6)
+    expect(rec.epoch).toBe(baseFrame().epoch)
+    expect(rec.ownerKind).toBe('terminal')
+    expect(rec.transition).toBe('handoff-committed')
+    // Merge-only: the identity fields of the EXISTING record survive.
+    expect(rec.terminalId).toBe('t-owner')
+    expect(rec.aliasOf).toBe('canonical-s1')
+  })
+
+  it('is a no-op when no record exists', () => {
+    const next = reducerWith(
+      applyRuntimeOwnerFenceRefresh({ provider: 'codex', sessionId: 'missing', epoch: 1, generation: 5 }),
+    )
+    expect(next.runtimeOwners['codex:missing']).toBeUndefined()
+  })
+
+  it('drops a same-epoch older generation and honors a new epoch', () => {
+    const sameEpoch = reducerWith(
+      applyRuntimeOwner(baseFrame({ sessionId: 's1', generation: 6 })),
+      applyRuntimeOwnerFenceRefresh({ provider: 'codex', sessionId: 's1', epoch: baseFrame().epoch, generation: 5 }),
+    )
+    expect(sameEpoch.runtimeOwners['codex:s1'].generation).toBe(6)
+
+    // A different epoch always wins (a restarted server's gen 1 beats the
+    // pre-restart 6) — the same monotonic gate as applyRuntimeOwner.
+    const newEpoch = reducerWith(
+      applyRuntimeOwner(baseFrame({ sessionId: 's1', epoch: 6, generation: 6 })),
+      applyRuntimeOwnerFenceRefresh({ provider: 'codex', sessionId: 's1', epoch: 7, generation: 1 }),
+    )
+    expect(newEpoch.runtimeOwners['codex:s1']).toMatchObject({ epoch: 7, generation: 1 })
   })
 })

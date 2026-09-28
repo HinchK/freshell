@@ -2948,11 +2948,39 @@ async fn bound_elsewhere_attach_commits_ownership_for_the_unclaimed_holder() {
         }),
     )
     .await;
-    let attached = await_frame(&mut ws_b, Duration::from_secs(20), |v| {
-        (v["type"] == "terminal.created" || v["type"] == "error")
-            && v["requestId"] == "attach-gap-2"
-    })
-    .await;
+    // b8ke fence-heal: collect BOTH the created reply and the
+    // session.runtimeOwner broadcast — separate delivery paths, no ordering
+    // guarantee between them, and `await_frame` DROPS non-matching frames
+    // (it would eat whichever of the two arrives first). Broadcasts fan
+    // out to every connection, so the SAME test socket sees both.
+    // Deadline note: the broadcast is queued to the bus BEFORE the created
+    // reply is sent, so 10s is generous — and it must stay well under the
+    // 30s sleeper's remaining lifetime, or a no-broadcast (RED) spin would
+    // let the holder PTY exit and fail the settle-commit observe below
+    // for an unrelated reason.
+    let mut attached: Option<Value> = None;
+    let mut broadcast: Option<Value> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while (attached.is_none() || broadcast.is_none()) && tokio::time::Instant::now() < deadline {
+        let msg = match tokio::time::timeout(Duration::from_millis(50), ws_b.next()).await {
+            Err(_) => continue, // no frame within the tick — re-check the deadline
+            Ok(None) => panic!("stream ended while collecting"),
+            Ok(Some(Err(e))) => panic!("ws error while collecting: {e}"),
+            Ok(Some(Ok(msg))) => msg,
+        };
+        let WsMessage::Text(text) = msg else {
+            continue;
+        };
+        let value: Value = serde_json::from_str(&text).expect("json frame");
+        if (value["type"] == "terminal.created" || value["type"] == "error")
+            && value["requestId"] == "attach-gap-2"
+        {
+            attached = Some(value);
+        } else if value["type"] == "session.runtimeOwner" && value["sessionId"] == json!(sid) {
+            broadcast = Some(value);
+        }
+    }
+    let attached = attached.expect("the attach create's terminal.created reply arrived");
     assert_eq!(
         attached["type"], "terminal.created",
         "the attach create must succeed: {attached}"
@@ -2975,6 +3003,42 @@ async fn bound_elsewhere_attach_commits_ownership_for_the_unclaimed_holder() {
             panic!("the attach settle must commit coverage for the live holder, got {other:?}")
         }
     }
+
+    // b8ke fence-heal: the attach-claim commit also broadcasts its own
+    // committed pair and rides it on the created frame. Both carry the
+    // (epoch, generation) captured from the claim ticket BEFORE the
+    // consuming commit (r32 F2 — never a re-observed current generation),
+    // so every connected client folds the fresh fence and the attaching
+    // pane's queued first attach is born fresh.
+    let broadcast = broadcast.expect(
+        "the attach-claim commit broadcast the committed owner frame \
+         (session.runtimeOwner for the attached session id)",
+    );
+    let current = ownership.observe("claude", &sid);
+    assert_eq!(broadcast["ownerKind"], json!("terminal"), "{broadcast}");
+    assert_eq!(
+        broadcast["transition"],
+        json!("handoff-committed"),
+        "{broadcast}"
+    );
+    assert_eq!(broadcast["terminalId"], json!(holder), "{broadcast}");
+    assert_eq!(broadcast["epoch"], json!(current.epoch), "{broadcast}");
+    assert_eq!(
+        broadcast["generation"],
+        json!(current.generation),
+        "{broadcast}"
+    );
+    assert!(
+        !broadcast["operationId"].as_str().unwrap_or("").is_empty(),
+        "the broadcast names the committing operation: {broadcast}"
+    );
+    assert_eq!(attached["ownerKind"], json!("terminal"), "{attached}");
+    assert_eq!(attached["ownerEpoch"], json!(current.epoch), "{attached}");
+    assert_eq!(
+        attached["ownerGeneration"],
+        json!(current.generation),
+        "{attached}"
+    );
 }
 
 // ── kata b8ke Task 5: the side-effect-free snapshot GET ────────────────────
@@ -6692,6 +6756,357 @@ async fn a_stale_generation_attach_is_refused_typed() {
             .contains("stale observed generation"),
         "the typed refusal names the stale generation: {refused}"
     );
+    // b8ke fence-heal: the refusal carries the coordinator's CURRENT pair so
+    // the client can refresh its fence (fix b server contract).
+    let current = ownership.observe("claude", &sid);
+    assert_eq!(
+        refused["ownerEpoch"],
+        json!(current.epoch),
+        "the refusal carries the current epoch: {refused}"
+    );
+    assert_eq!(
+        refused["ownerGeneration"],
+        json!(current.generation),
+        "the refusal carries the current generation: {refused}"
+    );
+    // fix (b) wire-level self-heal: the immediate re-attach with the pair the
+    // refusal just taught us must SUCCEED — the deterministic protocol-level
+    // proof that "the next attempt uses the fresh pair" heals the wedge.
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.attach",
+            "terminalId": terminal_id,
+            "intent": "viewport_hydrate",
+            "cols": 80,
+            "rows": 24,
+            "observedEpoch": refused["ownerEpoch"],
+            "observedGeneration": refused["ownerGeneration"],
+        }),
+    )
+    .await;
+    let attach_ready = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.attach.ready"
+    })
+    .await;
+    assert_eq!(
+        attach_ready["type"], "terminal.attach.ready",
+        "the re-attach with the refusal-taught pair must heal the wedge"
+    );
+    ws_state.registry.kill(&terminal_id);
+}
+
+/// b8ke fence-heal (fix b server contract): a create refused on a stale
+/// observed pair carries the coordinator's CURRENT (epoch, generation) —
+/// the pair the client folds into its runtimeOwners fence so its next
+/// attempt is born fresh instead of looping on the same stale pair.
+#[tokio::test]
+async fn a_stale_generation_create_refusal_carries_the_current_pair() {
+    let (url, _registry, ws_state) = spawn_server().await;
+    let mut ws = connect(&url).await;
+
+    // Seed the session Live exactly as the attach refusal test does: one
+    // terminal-lane create whose settle commits Live{Terminal}.
+    let sid = uuid::Uuid::new_v4().to_string();
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-fenceheal-create-seed",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == "req-fenceheal-create-seed"
+    })
+    .await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let ownership = ws_state.ownership.as_ref().expect("coordinator wired");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !matches!(
+        ownership.observe("claude", &sid).state,
+        freshell_ownership::OwnershipState::Live { .. }
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never committed Live"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // THE STALE CREATE: observed generation is one behind the committed
+    // Live pair — the typed refusal must carry the CURRENT pair.
+    let current = ownership.observe("claude", &sid);
+    assert!(
+        current.generation >= 1,
+        "the committed Live pair must have a generation to be stale against"
+    );
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-fenceheal-create-stale",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+            "observedEpoch": current.epoch,
+            "observedGeneration": current.generation - 1,
+        }),
+    )
+    .await;
+    let refused = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "error"
+            && v["code"] == "SESSION_RESERVED"
+            && v["requestId"] == "req-fenceheal-create-stale"
+    })
+    .await;
+    assert_eq!(
+        refused["code"], "SESSION_RESERVED",
+        "the stale create is the typed refusal: {refused}"
+    );
+    assert_eq!(
+        refused["ownerEpoch"],
+        json!(current.epoch),
+        "the refusal carries the current epoch: {refused}"
+    );
+    assert_eq!(
+        refused["ownerGeneration"],
+        json!(current.generation),
+        "the refusal carries the current generation: {refused}"
+    );
+    // Nothing spawned: the incumbent Live owner stands untouched.
+    let after = ownership.observe("claude", &sid);
+    assert!(
+        matches!(after.state, freshell_ownership::OwnershipState::Live { .. }),
+        "the stale create must not disturb the incumbent owner: {:?}",
+        after.state
+    );
+    ws_state.registry.kill(&terminal_id);
+}
+
+/// b8ke fence-heal (fix b server contract, review M-1): the create's ADOPT
+/// arm — the ATOMIC adopt guard — is the arm that refuses a fence the wire
+/// claim let through, and its refusal must carry the coordinator's CURRENT
+/// (epoch, generation) pair so the client folds the fresh pair instead of
+/// looping on the stale one. The lane claim's staleness gate only refuses
+/// fences OLDER than the record (`observedGeneration < current`), while the
+/// atomic adopt demands the fence name the Live record EXACTLY — so a fence
+/// naming a DIFFERENT generation (here one AHEAD of the record: the shape a
+/// client holds after a sweep re-created the record at a lower generation,
+/// or any well-meant fence that simply doesn't match) passes the lane claim
+/// (AdoptLive) and is refused by the adopt guard. Deterministic — no race
+/// window needed. The Adopt arm's session-suffixed message is the
+/// discriminator proving THIS arm answered, never the wire-claim Refused
+/// arm (whose message carries no suffix).
+#[tokio::test]
+async fn a_stale_generation_adopt_create_refusal_carries_the_current_pair() {
+    let (url, _registry, ws_state) = spawn_server().await;
+    let mut ws = connect(&url).await;
+
+    // Seed the session Live exactly as the wire-claim refusal test does:
+    // one terminal-lane create whose settle commits Live{Terminal}.
+    let sid = uuid::Uuid::new_v4().to_string();
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-fenceheal-adopt-seed",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == "req-fenceheal-adopt-seed"
+    })
+    .await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let ownership = ws_state.ownership.as_ref().expect("coordinator wired");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !matches!(
+        ownership.observe("claude", &sid).state,
+        freshell_ownership::OwnershipState::Live { .. }
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never committed Live"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // THE ADOPT-LANE STALE CREATE: the observed pair names a DIFFERENT
+    // record than the committed Live one (one generation AHEAD) — the lane
+    // claim's less-than gate passes it (AdoptLive), so the ATOMIC adopt
+    // guard is the arm that must refuse it carrying the CURRENT pair.
+    let current = ownership.observe("claude", &sid);
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-fenceheal-adopt-stale",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+            "observedEpoch": current.epoch,
+            "observedGeneration": current.generation + 1,
+        }),
+    )
+    .await;
+    let refused = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "error"
+            && v["code"] == "SESSION_RESERVED"
+            && v["requestId"] == "req-fenceheal-adopt-stale"
+    })
+    .await;
+    assert_eq!(
+        refused["code"], "SESSION_RESERVED",
+        "the adopt-lane stale create is the typed refusal: {refused}"
+    );
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&format!("(session {sid})")),
+        "the session-suffixed message proves the ADOPT arm answered (the \
+         wire-claim Refused arm's message carries no suffix): {refused}"
+    );
+    assert_eq!(
+        refused["ownerEpoch"],
+        json!(current.epoch),
+        "the refusal carries the current epoch: {refused}"
+    );
+    assert_eq!(
+        refused["ownerGeneration"],
+        json!(current.generation),
+        "the refusal carries the current generation: {refused}"
+    );
+    // Nothing spawned: the incumbent Live owner stands untouched.
+    let after = ownership.observe("claude", &sid);
+    assert!(
+        matches!(after.state, freshell_ownership::OwnershipState::Live { .. }),
+        "the adopt-lane stale create must not disturb the incumbent owner: {:?}",
+        after.state
+    );
+    ws_state.registry.kill(&terminal_id);
+}
+
+/// b8ke fence-heal (fixes a + c): the terminal-lane create settle commits
+/// Live{Terminal} and BROADCASTS the authoritative owner frame carrying the
+/// commit's OWN (epoch, generation) pair — captured from the claim ticket
+/// BEFORE the consuming commit (r32 F2 — never a re-observed current
+/// generation) — and the `terminal.created` reply rides the SAME committed
+/// pair so the creating pane's first attach is born fresh. Pre-fix the
+/// settle committed Live with NO broadcast and a pair-less created frame,
+/// so every connected client kept its pre-create observed fence until a
+/// page reload, and the pane's queued attach / later kills and recreates
+/// were refused typed ("moved to a newer runtime; refresh and retry").
+///
+/// Frame capture: the created reply and the broadcast use separate delivery
+/// paths with no ordering guarantee, so every incoming frame is matched
+/// against BOTH targets until both are captured — never `await_frame` one
+/// then the other (it DROPS non-matching frames and would eat the other
+/// one). Broadcasts fan out to every connection (each subscribes to the
+/// bus pre-handshake), so the SAME test socket gets both.
+///
+/// Consistency note (plan-review round 3, finding 1): the end-to-end path
+/// cannot DETERMINISTICALLY discriminate committed-pair vs re-observed
+/// emission — no transition can land between the commit and the
+/// same-handler-turn broadcast, and a captured frame never changes after
+/// capture. That discrimination lives in the helper-level unit test
+/// (`identity_ownership.rs`'s
+/// `a_broadcast_owner_frame_carries_the_committed_pair_not_the_current_generation`),
+/// which builds the divergence INTO the emission.
+#[tokio::test]
+async fn a_terminal_lane_create_settle_broadcasts_the_committed_owner_pair_and_rides_the_created_frame(
+) {
+    let (url, _registry, ws_state) = spawn_server().await;
+    let mut ws = connect(&url).await;
+
+    let sid = uuid::Uuid::new_v4().to_string();
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-fenceheal-settle",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+
+    let mut created: Option<Value> = None;
+    let mut broadcast: Option<Value> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while (created.is_none() || broadcast.is_none()) && tokio::time::Instant::now() < deadline {
+        let msg = match tokio::time::timeout(Duration::from_millis(50), ws.next()).await {
+            Err(_) => continue, // no frame within the tick — re-check the deadline
+            Ok(None) => panic!("stream ended while collecting"),
+            Ok(Some(Err(e))) => panic!("ws error while collecting: {e}"),
+            Ok(Some(Ok(msg))) => msg,
+        };
+        let WsMessage::Text(text) = msg else {
+            continue;
+        };
+        let value: Value = serde_json::from_str(&text).expect("json frame");
+        if value["type"] == "terminal.created" && value["requestId"] == "req-fenceheal-settle" {
+            created = Some(value);
+        } else if value["type"] == "session.runtimeOwner" && value["sessionId"] == json!(sid) {
+            broadcast = Some(value);
+        }
+    }
+    let created = created.expect("the terminal.created reply arrived");
+    let broadcast = broadcast.expect(
+        "the create settle broadcast the committed owner frame \
+         (session.runtimeOwner for the created session id)",
+    );
+    let committed_epoch = ws_state
+        .ownership
+        .as_ref()
+        .expect("ownership wired")
+        .boot_epoch();
+    // (fix c) the created frame carries the commit's own pair
+    assert_eq!(created["ownerKind"], json!("terminal"), "{created}");
+    assert_eq!(created["ownerEpoch"], json!(committed_epoch), "{created}");
+    // (fix a) the broadcast carried the SAME committed pair
+    assert_eq!(broadcast["ownerKind"], json!("terminal"), "{broadcast}");
+    assert_eq!(
+        broadcast["transition"],
+        json!("handoff-committed"),
+        "{broadcast}"
+    );
+    assert_eq!(
+        broadcast["terminalId"], created["terminalId"],
+        "{broadcast}"
+    );
+    assert_eq!(broadcast["epoch"], created["ownerEpoch"], "{broadcast}");
+    assert_eq!(
+        broadcast["generation"], created["ownerGeneration"],
+        "{broadcast}"
+    );
+    assert!(
+        !broadcast["operationId"].as_str().unwrap_or("").is_empty(),
+        "the broadcast names the committing operation: {broadcast}"
+    );
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
     ws_state.registry.kill(&terminal_id);
 }
 

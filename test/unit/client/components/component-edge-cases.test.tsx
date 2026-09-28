@@ -1138,16 +1138,26 @@ describe('Component Edge Cases', () => {
     })
 
     describe('BackgroundSessions', () => {
-      it('cleans up polling timers on unmount', () => {
+      it('cleans up polling timers and ws subscription on unmount', () => {
         const clearIntervalSpy = vi.spyOn(window, 'clearInterval')
+        const unsubscribe = vi.fn()
+        mockWsOnMessage.mockReturnValue(unsubscribe)
 
         const store = createTestStore()
         const { unmount } = renderWithStore(<BackgroundSessions />, store)
 
+        // b8ke fence-heal (fix b): detached terminals have no mounted
+        // TerminalView, so the background rows subscribe to ws frames
+        // themselves to consume typed kill refusals — the component now
+        // registers a ws message handler.
+        expect(mockWsOnMessage).toHaveBeenCalled()
+
         unmount()
 
+        // Unmount hygiene: everything registered is torn down — the
+        // polling interval AND the ws message-handler subscription.
         expect(clearIntervalSpy).toHaveBeenCalled()
-        expect(mockWsOnMessage).not.toHaveBeenCalled()
+        expect(unsubscribe).toHaveBeenCalled()
 
         clearIntervalSpy.mockRestore()
       })

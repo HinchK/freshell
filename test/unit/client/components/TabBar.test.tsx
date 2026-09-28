@@ -1115,6 +1115,102 @@ describe('TabBar', () => {
       })).toEqual({ epoch: 12, generation: 35 })
     })
 
+    // b8ke fence-heal (fix b): a typed-refused close-tab kill carries the
+    // coordinator's CURRENT pair on the correlated terminal.killed ack —
+    // the caller (which holds the sessionRef identity) folds it, so the
+    // NEXT close attempt sends the fresh pair instead of looping on the
+    // refused stale one.
+    it('a typed-refused close-tab kill folds the fresh pair and the next close sends it (fix b)', async () => {
+      const tab = createTab({
+        id: 'tab-1',
+        title: 'Tab 1',
+      })
+
+      const store = createStore(
+        { tabs: [tab], activeTabId: 'tab-1' },
+        {},
+        {
+          layouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'terminal',
+                mode: 'codex',
+                shell: 'system',
+                status: 'running',
+                createRequestId: 'req-pane-1',
+                terminalId: 'term-refold-1',
+                sessionRef: { provider: 'codex', sessionId: 'codex-refold-ses' },
+              },
+            },
+          },
+          activePane: { 'tab-1': 'pane-1' },
+        },
+      )
+      // The record the first shift-close observed at decision time: (12, 34).
+      store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'codex',
+        sessionId: 'codex-refold-ses',
+        epoch: 12,
+        generation: 34,
+        ownerKind: 'terminal',
+        operationId: 'handoff-1',
+        transition: 'handoff-committed',
+      }))
+
+      renderWithStore(<TabBar />, store)
+
+      // First close attempt: the kill carries the observed (stale) pair.
+      const closeButton = screen.getByTitle('Close (Shift+Click to kill)')
+      fireEvent.click(closeButton, { shiftKey: true })
+      const firstKill = mockSend.mock.calls
+        .map(([msg]) => msg as Record<string, unknown>)
+        .find((msg) => msg?.type === 'terminal.kill')
+      expect(firstKill).toMatchObject({
+        type: 'terminal.kill',
+        terminalId: 'term-refold-1',
+        observedEpoch: 12,
+        observedGeneration: 34,
+      })
+
+      // The server refuses the stale pair typed — the correlated ack
+      // carries the coordinator's CURRENT pair.
+      emitWsMessage({
+        type: 'terminal.killed',
+        requestId: firstKill?.requestId as string,
+        terminalId: 'term-refold-1',
+        success: false,
+        error: 'ownership moved to a newer runtime; refresh and retry',
+        ownerKind: 'terminal',
+        ownerEpoch: 12,
+        ownerGeneration: 40,
+      })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+
+      // The refused close never dropped the tab…
+      expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['tab-1'])
+      // …and the caller folded the fresh pair onto the session record.
+      const folded = store.getState().freshAgent.runtimeOwners['codex:codex-refold-ses']
+      expect(folded.generation).toBe(40)
+      expect(folded.ownerKind).toBe('terminal')
+
+      // The NEXT close attempt sends the fresh pair.
+      const closeButtonAgain = screen.getByTitle('Close (Shift+Click to kill)')
+      fireEvent.click(closeButtonAgain, { shiftKey: true })
+      const kills = mockSend.mock.calls
+        .map(([msg]) => msg as Record<string, unknown>)
+        .filter((msg) => msg?.type === 'terminal.kill')
+      expect(kills).toHaveLength(2)
+      expect(kills[1]).toMatchObject({
+        type: 'terminal.kill',
+        terminalId: 'term-refold-1',
+        observedEpoch: 12,
+        observedGeneration: 40,
+      })
+    })
+
     it('shift close sends terminal.kill and no terminal.detach', () => {
       const tab = createTab({
         id: 'tab-1',

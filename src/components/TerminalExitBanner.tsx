@@ -1,6 +1,10 @@
 // Lane D1: loud exited-pane presentation for coding-agent terminals.
 // - recovering notice (server-driven auto-resume in flight) + cancel
 // - error bar + Relaunch after the pane settles exited (non-zero exit)
+// - killed-session recovery bar: a clean exit (code 0) whose canonical
+//   runtime-owner record folded VACANT (the cross-device-kill shape)
+//   surfaces the user-driven Reopen action (the-usual focused fix 2 —
+//   never an automatic relaunch)
 // - persistent, dismissible crash trace after a successful auto-resume
 //   (kata znhn item 1 — replaces the ephemeral 'resumed' strip).
 // Pure presentational: props in, callbacks out — TerminalView owns the render
@@ -14,6 +18,12 @@ export interface TerminalExitBannerProps {
   notice: AutoResumeNotice | null
   crashTrace: CrashTrace | null
   settledDead: boolean
+  /** The killed-session recovery shape (the-usual focused fix 2): the pane's
+   * canonical runtime-owner record folded VACANT after a clean (code 0)
+   * terminal exit — the session is durably stopped (typically killed from
+   * another device). The pane surfaces the user-driven reopen action;
+   * nothing relaunches automatically. */
+  vacantRecovery?: boolean
   /** Flap-circuit-breaker settles only (znhn item 2): successful auto-resumes
    * inside the rolling window, from the settle frame's TYPED field. */
   resumeCycles: number | null
@@ -31,6 +41,7 @@ export function TerminalExitBanner({
   notice,
   crashTrace,
   settledDead,
+  vacantRecovery,
   resumeCycles,
   canResume,
   onRelaunch,
@@ -53,6 +64,35 @@ export function TerminalExitBanner({
           onClick={onCancelAutoResume}
         >
           Stop
+        </button>
+      </div>
+    )
+  }
+  if (vacantRecovery) {
+    return (
+      <div
+        role="status"
+        data-testid="terminal-vacant-recovery-bar"
+        className="flex items-center justify-between gap-2 border-t border-border/60 bg-muted/60 px-3 py-1.5 text-sm text-muted-foreground"
+      >
+        <span>
+          {`${mode} session was stopped${exitCode !== null ? ` (code ${exitCode})` : ''} — ${
+            canResume
+              ? 'reopen it to resume this conversation'
+              // the-usual delta round 6 (rider): with no resumable sessionRef
+              // (provider mismatch), resetPaneForReconcileCreate degrades the
+              // respawn to a fresh conversation — the sentence must not
+              // promise resumption the button's own label already omits.
+              : 'reopen it to start a new conversation'
+          }`}
+        </span>
+        <button
+          type="button"
+          aria-label={`Reopen ${mode} session`}
+          className="shrink-0 rounded border border-border/70 px-2 py-0.5 text-xs font-medium hover:bg-muted"
+          onClick={onRelaunch}
+        >
+          {canResume ? 'Reopen — resumes this conversation' : 'Reopen'}
         </button>
       </div>
     )

@@ -462,6 +462,24 @@ pub struct TerminalKilled {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// kata b8ke fence-heal (Task 4): stale-claim refusals only — the
+    /// incumbent owner's kind ("terminal" | "fresh-agent"). Additive and
+    /// omitted everywhere else, so every non-stale kill answer stays
+    /// byte-identical on the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_kind: Option<String>,
+    /// kata b8ke fence-heal (Task 4): the coordinator's generation at
+    /// refusal time — with `owner_epoch`, lets the client refresh its
+    /// observed fence from the refusal itself (the killed ack is the ONLY
+    /// frame the client's correlated kill await resolves). Additive and
+    /// omitted everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_generation: Option<u64>,
+    /// kata b8ke fence-heal (Task 4): the emitting server's boot epoch for
+    /// the owner fields (a fence pair from a different epoch is always
+    /// stale). Additive and omitted everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_epoch: Option<u64>,
 }
 
 /// The correlated `pane.closed` answer (delta-r7-round-3, focused-episode-7
@@ -1342,6 +1360,17 @@ pub struct TerminalCreated {
     /// Additive optional.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name_ref: Option<SessionNameRef>,
+    /// b8ke fence-heal: the committed owner pair when THIS create's claim
+    /// committed Live{Terminal} under a wired coordinator (additive,
+    /// skip-None frozen-client parity — omitted fields keep the frame
+    /// byte-identical to the pre-feature shape). Lets the creating client
+    /// fold the fresh fence before its queued attach fires.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_epoch: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1928,6 +1957,118 @@ mod tests {
         assert!(
             !json.contains(r#""fenced""#),
             "a non-fenced frame omits the marker (additive wire): {json}"
+        );
+    }
+
+    /// b8ke fence-heal (fix c): `terminal.created` carries the create's
+    /// committed owner pair additively — camelCase, omitted when None so
+    /// legacy frames stay byte-identical on the wire (frozen-client
+    /// parity, the Error-frame owner-triple discipline).
+    #[test]
+    fn terminal_created_round_trips_the_additive_owner_pair_and_omits_it_when_none() {
+        let with_owner = ServerMessage::TerminalCreated(TerminalCreated {
+            created_at: 1_700_000_000_000,
+            request_id: "req-fenceheal-1".into(),
+            terminal_id: "t-91".into(),
+            clear_codex_durability: None,
+            cwd: Some("/tmp".into()),
+            notice: None,
+            restore_error: None,
+            session_ref: None,
+            session_name: None,
+            name_ref: None,
+            owner_kind: Some("terminal".into()),
+            owner_epoch: Some(7),
+            owner_generation: Some(3),
+        });
+        let json = serde_json::to_string(&with_owner).expect("serialize");
+        assert!(
+            json.contains(r#""type":"terminal.created""#),
+            "wire tag must be exact: {json}"
+        );
+        assert!(json.contains(r#""ownerKind":"terminal""#), "{json}");
+        assert!(json.contains(r#""ownerEpoch":7"#), "{json}");
+        assert!(json.contains(r#""ownerGeneration":3"#), "{json}");
+        let back: ServerMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, with_owner);
+
+        let legacy = ServerMessage::TerminalCreated(TerminalCreated {
+            created_at: 1_700_000_000_000,
+            request_id: "req-fenceheal-1".into(),
+            terminal_id: "t-91".into(),
+            clear_codex_durability: None,
+            cwd: None,
+            notice: None,
+            restore_error: None,
+            session_ref: None,
+            session_name: None,
+            name_ref: None,
+            owner_kind: None,
+            owner_epoch: None,
+            owner_generation: None,
+        });
+        let legacy_json = serde_json::to_string(&legacy).expect("serialize");
+        assert!(
+            !legacy_json.contains("ownerKind"),
+            "omit-when-absent keeps legacy created frames byte-identical: {legacy_json}"
+        );
+        assert!(
+            !legacy_json.contains("ownerEpoch"),
+            "omit-when-absent keeps legacy created frames byte-identical: {legacy_json}"
+        );
+        assert!(
+            !legacy_json.contains("ownerGeneration"),
+            "omit-when-absent keeps legacy created frames byte-identical: {legacy_json}"
+        );
+    }
+
+    /// b8ke fence-heal (Task 4, review N-1): `terminal.killed`'s additive
+    /// stale-claim trio round-trips — camelCase, present when Some, omitted
+    /// when None so every non-stale kill answer stays byte-identical on the
+    /// wire (frozen-client parity, the created-frame pair discipline).
+    #[test]
+    fn terminal_killed_round_trips_the_additive_owner_trio_and_omits_it_when_none() {
+        let with_trio = ServerMessage::TerminalKilled(TerminalKilled {
+            request_id: "req-fenceheal-kill-1".into(),
+            terminal_id: "t-91".into(),
+            success: false,
+            error: Some("stale claim".into()),
+            owner_kind: Some("terminal".into()),
+            owner_epoch: Some(7),
+            owner_generation: Some(3),
+        });
+        let json = serde_json::to_string(&with_trio).expect("serialize");
+        assert!(
+            json.contains(r#""type":"terminal.killed""#),
+            "wire tag must be exact: {json}"
+        );
+        assert!(json.contains(r#""ownerKind":"terminal""#), "{json}");
+        assert!(json.contains(r#""ownerEpoch":7"#), "{json}");
+        assert!(json.contains(r#""ownerGeneration":3"#), "{json}");
+        let back: ServerMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, with_trio);
+
+        let legacy = ServerMessage::TerminalKilled(TerminalKilled {
+            request_id: "req-fenceheal-kill-1".into(),
+            terminal_id: "t-91".into(),
+            success: true,
+            error: None,
+            owner_kind: None,
+            owner_epoch: None,
+            owner_generation: None,
+        });
+        let legacy_json = serde_json::to_string(&legacy).expect("serialize");
+        assert!(
+            !legacy_json.contains("ownerKind"),
+            "omit-when-absent keeps legacy killed frames byte-identical: {legacy_json}"
+        );
+        assert!(
+            !legacy_json.contains("ownerEpoch"),
+            "omit-when-absent keeps legacy killed frames byte-identical: {legacy_json}"
+        );
+        assert!(
+            !legacy_json.contains("ownerGeneration"),
+            "omit-when-absent keeps legacy killed frames byte-identical: {legacy_json}"
         );
     }
 

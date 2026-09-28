@@ -883,6 +883,145 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     }
   })
 
+  // the-usual ownership-fence-fix Task 7 Test A
+  // (docs/plans/2026-09-21-ownership-fence-fix.md): the single-page incident
+  // core. A terminal-lane resume-create commits a new ownership generation at
+  // the create settle point. Pre-fix that commit was silent (no
+  // session.runtimeOwner broadcast, no owner pair on terminal.created), so a
+  // pane reopened after a KILL -- the kill's r18 vacant broadcast leaves the
+  // client holding the PRE-create pair -- had its queued attach refused
+  // typed forever: no PTY output reached the pane until a page reload.
+  // Post-fix the settle broadcasts its own committed pair AND
+  // terminal.created carries it (folded before the queued attach), so the
+  // reopened pane attaches and round-trips input with NO reload.
+  test('codex terminal: resume-create attaches without a reload, and a kill→reopen cycle converges', async ({ browser }) => {
+    const CODEX_SESSION_ID = '21000000-aaaa-4bbb-8ccc-000000000001'
+    const SESSION_TITLE = 'wall fence-heal codex session'
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-fence-heal-'))
+    const projectDir = path.join(sharedRoot, 'project')
+    await fs.mkdir(projectDir, { recursive: true })
+    const argLogPath = path.join(sharedRoot, 'codex-argv.jsonl')
+    // Dual-role: the Rust server's codex terminal lane boots a `codex
+    // app-server` sidecar FIRST (PTY_SPAWN_FAILED otherwise), so the fake
+    // must answer both app-server argv and terminal argv (same shim as the
+    // :797 sibling).
+    const fakeCodexPath = await installDualRoleCodex(path.join(sharedRoot, 'bin'), argLogPath)
+
+    const { server, harness, context, page } = await bootWall(browser, {
+      env: { CODEX_CMD: fakeCodexPath, FAKE_CODEX_ARGV_LOG: argLogPath },
+      setupHome: seedCodexHome(CODEX_SESSION_ID, SESSION_TITLE, projectDir),
+    })
+    try {
+      await selectShellIfPickerShowing(page)
+
+      const sessionList = page.getByTestId('sidebar-session-list')
+      await expect(sessionList).toBeVisible({ timeout: 15_000 })
+      const sessionRow = sessionList.locator(`[data-session-id="${CODEX_SESSION_ID}"]`)
+      await expect(sessionRow).toBeVisible({ timeout: 15_000 })
+
+      // 1. Open the seeded historical session from the sidebar (the
+      //    terminal-lane resume create): the pane must ATTACH with no
+      //    reload -- the fake's resumed marker can only arrive through the
+      //    attach stream.
+      const tabCountBefore = await harness.getTabCount()
+      await sessionRow.click()
+      await expect(async () => {
+        expect(await harness.getTabCount()).toBe(tabCountBefore + 1)
+      }).toPass({ timeout: 15_000 })
+      const firstTabId = (await harness.getActiveTabId())!
+
+      const firstTerminalId: string = await expect
+        .poll(async () => (await harness.getPaneLayout(firstTabId))?.content?.terminalId ?? null, {
+          timeout: 20_000,
+        })
+        .not.toBeNull()
+        .then(async () => (await harness.getPaneLayout(firstTabId))?.content?.terminalId)
+      expect((await harness.getPaneLayout(firstTabId))?.content?.sessionRef?.sessionId).toBe(
+        CODEX_SESSION_ID,
+      )
+      await expect
+        .poll(async () => {
+          const buffer = await harness.getTerminalBuffer(firstTerminalId)
+          const unwrapped = typeof buffer === 'string' ? buffer.replace(/\n/g, '') : ''
+          return unwrapped.includes(`codex: resumed session ${CODEX_SESSION_ID}`)
+        }, { timeout: 30_000 })
+        .toBe(true)
+
+      // The session row reports the running terminal, and the no-reload
+      // sentinel arms: a page reload mints a fresh window object, so the
+      // sentinel surviving the whole cycle proves no leg needed one.
+      await expect(sessionRow).toHaveAttribute('data-is-running', 'true', { timeout: 30_000 })
+      await page.evaluate(() => {
+        ;(window as any).__fenceHealNoReloadSentinel = 'wall'
+      })
+
+      // 2. KILL the terminal via the REAL kill affordance: shift-click the
+      //    tab's CLOSE button (plain close is DETACH-ONLY; TabBar decides
+      //    kill vs detach from e.shiftKey on the CLOSE-BUTTON event).
+      await page
+        .locator(`[data-context="tab"][data-tab-id="${firstTabId}"]`)
+        .getByRole('button', { name: /close/i })
+        .click({ modifiers: ['Shift'] })
+      // The kill commits: the tab closes after the durable-close ack, and
+      // the session row returns to not-running.
+      await expect(async () => {
+        expect(await harness.getTabCount()).toBe(tabCountBefore)
+      }).toPass({ timeout: 15_000 })
+      await expect(sessionRow).toHaveAttribute('data-is-running', 'false', { timeout: 15_000 })
+
+      // 3. Reopen THE SAME session from the sidebar -- a NEW resume-create
+      //    that commits ANOTHER ownership generation. Post-fix the reopened
+      //    pane attaches and round-trips input with NO page reload;
+      //    pre-fix it wedged behind the stale fence (the incident: the
+      //    queued attach answers typed, nothing restamps, the buffer never
+      //    fills).
+      await sessionRow.click()
+      await expect(async () => {
+        expect(await harness.getTabCount()).toBe(tabCountBefore + 1)
+      }).toPass({ timeout: 15_000 })
+      const secondTabId = (await harness.getActiveTabId())!
+      expect(secondTabId).not.toBe(firstTabId)
+
+      const secondTerminalId: string = await expect
+        .poll(async () => (await harness.getPaneLayout(secondTabId))?.content?.terminalId ?? null, {
+          timeout: 20_000,
+        })
+        .not.toBeNull()
+        .then(async () => (await harness.getPaneLayout(secondTabId))?.content?.terminalId)
+      expect(secondTerminalId).not.toBe(firstTerminalId) // correct after a TRUE kill
+      await expect
+        .poll(async () => {
+          const buffer = await harness.getTerminalBuffer(secondTerminalId)
+          const unwrapped = typeof buffer === 'string' ? buffer.replace(/\n/g, '') : ''
+          return unwrapped.includes(`codex: resumed session ${CODEX_SESSION_ID}`)
+        }, { timeout: 30_000 })
+        .toBe(true)
+
+      // The input round-trip: keystrokes reach the reopened PTY and echo
+      // back (canonical-mode line discipline; the fake never touches
+      // termios -- the reconnect-revive:613-624 proven idiom).
+      await page
+        .locator(`[data-context="terminal"][data-tab-id="${secondTabId}"] .xterm`)
+        .first()
+        .click()
+      await page.keyboard.type('echo fence-heal-e2e')
+      await expect
+        .poll(async () => {
+          const buffer = await harness.getTerminalBuffer(secondTerminalId)
+          const unwrapped = typeof buffer === 'string' ? buffer.replace(/\n/g, '') : ''
+          return unwrapped.includes('fence-heal-e2e')
+        }, { timeout: 30_000 })
+        .toBe(true)
+
+      // No reload anywhere in the cycle.
+      expect(await page.evaluate(() => (window as any).__fenceHealNoReloadSentinel)).toBe('wall')
+    } finally {
+      await context.close().catch(() => {})
+      await server.stop()
+      await fs.rm(sharedRoot, { recursive: true, force: true })
+    }
+  })
+
   test('opencode terminal: locator-resolved session resumes with --session after SIGKILL', async ({ browser }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-opencode-term-'))
     const argLogPath = path.join(sharedRoot, 'opencode-argv.jsonl')
@@ -1761,9 +1900,21 @@ test.describe('Restore Contract Wall (P0.1)', () => {
             timeout: 45_000,
           })
           .toBe(expectedId)
+        // Settle-poll the status (not an immediate assertion): the durable
+        // identity fold can land while the runtime is still hydrating after
+        // the server-restart restore -- status 'creating' lags the identity
+        // fold under load, and the immediate form flaked twice at exactly
+        // this line. "Not wedged" means the status eventually leaves
+        // 'creating' (a pane stuck there still fails via the poll timeout)
+        // and never lands 'error'.
+        await expect
+          .poll(async () => {
+            const status = findFreshAgentLeaf(await harness.getPaneLayout(tabIdX))?.content?.status
+            return status !== 'creating' && status !== 'error'
+          }, { timeout: 45_000 })
+          .toBe(true)
         const leafX = findFreshAgentLeaf(await harness.getPaneLayout(tabIdX))
         expect(leafX?.content?.status).not.toBe('error')
-        expect(leafX?.content?.status).not.toBe('creating')
       }
 
       // Quiet client: no alerts, no noisy error text (donor: restore-sync05).

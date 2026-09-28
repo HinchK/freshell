@@ -88,4 +88,59 @@ describe('TerminalExitBanner', () => {
     // Relaunch stays available — bounded and loud, never dead-ended.
     expect(screen.getByRole('button', { name: 'Relaunch claude session' })).toBeInTheDocument()
   })
+
+  // the-usual ownership-fence-fix focused review 2 (Major): the killed-session
+  // recovery affordance. A clean exit (code 0 — the terminal.kill wire
+  // contract) on a pane whose canonical runtime-owner record folded VACANT is
+  // the cross-device-kill shape: the pane must surface the user-driven
+  // reopen action (never an automatic relaunch). Ordinary clean exits (the
+  // record still Live, or no record) stay quiet.
+  it('surfaces the reopen affordance for a clean-exit killed session whose owner record is vacant', () => {
+    const onRelaunch = vi.fn()
+    render(
+      <TerminalExitBanner
+        {...baseProps} mode="codex" exitCode={0} notice={null} settledDead={false}
+        vacantRecovery onRelaunch={onRelaunch}
+      />,
+    )
+    const bar = screen.getByTestId('terminal-vacant-recovery-bar')
+    expect(bar).toHaveTextContent('codex session was stopped (code 0)')
+    // the-usual delta round 6 (rider): honest recovery copy — with NO
+    // resumable sessionRef the sentence must NOT promise resumption (the
+    // reopen degrades to a fresh conversation in the pane's mode).
+    expect(bar).toHaveTextContent('reopen it to start a new conversation')
+    expect(bar).not.toHaveTextContent('resume this conversation')
+    const btn = screen.getByRole('button', { name: 'Reopen codex session' })
+    fireEvent.click(btn)
+    // The banner is pure presentational: the recovery-create dispatch is the
+    // caller's onRelaunch wiring (TerminalView relays it to the respawn
+    // create flow).
+    expect(onRelaunch).toHaveBeenCalledTimes(1)
+  })
+
+  it('labels Reopen honestly when the sessionRef can resume the conversation', () => {
+    render(
+      <TerminalExitBanner
+        {...baseProps} mode="codex" exitCode={0} notice={null} settledDead={false}
+        vacantRecovery canResume
+      />,
+    )
+    // the-usual delta round 6 (rider): the recovery sentence keeps its
+    // resume promise ONLY when the sessionRef can actually resume.
+    const bar = screen.getByTestId('terminal-vacant-recovery-bar')
+    expect(bar).toHaveTextContent('reopen it to resume this conversation')
+    expect(bar).not.toHaveTextContent('start a new conversation')
+    expect(screen.getByRole('button', { name: 'Reopen codex session' }))
+      .toHaveTextContent('Reopen — resumes this conversation')
+  })
+
+  it('stays quiet for a clean exit whose session record is still live (a deliberate exit)', () => {
+    // exit code 0 WITHOUT the vacant-owner shape (the record still names a
+    // live owner, or the pane holds no durable session record at all): no
+    // banner, no action — the deliberate clean exit stays quiet.
+    const { container } = render(
+      <TerminalExitBanner {...baseProps} mode="codex" exitCode={0} notice={null} settledDead={false} />,
+    )
+    expect(container).toBeEmptyDOMElement()
+  })
 })

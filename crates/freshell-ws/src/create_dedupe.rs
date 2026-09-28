@@ -976,6 +976,9 @@ mod tests {
             // replayed frames carry their original projection.
             session_name: None,
             name_ref: None,
+            owner_kind: None,
+            owner_epoch: None,
+            owner_generation: None,
         })
     }
 }

@@ -16,6 +16,7 @@ import { updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import {
   applyReconcileAttach,
   applyReattachToLiveTerminal,
+  bumpPaneReconcileEpoch,
   clearPaneCloseError,
   clearPaneReconcileNotice,
   clearReconcilePendingPane,
@@ -31,7 +32,7 @@ import {
   updatePaneTitle,
 } from '@/store/panesSlice'
 import { buildReconcileRequestForPanes, foldVerdicts } from '@/lib/pane-reconcile'
-import type { PaneReconcileRequest } from '@shared/ws-protocol'
+import type { PaneReconcileRequest, SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import {
   derivePaneOwnerDivergence,
   deriveTerminalOwnerConvergence,
@@ -40,6 +41,7 @@ import {
   selectSessionRuntimeOwner,
 } from '@/store/selectors/runtimeOwner'
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
+import { applyRuntimeOwner } from '@/store/freshAgentSlice'
 import { recordPaneTabActivity } from '@/store/tabRecencySlice'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 import { clearPaneRuntimeActivity } from '@/store/paneRuntimeActivitySlice'
@@ -70,6 +72,8 @@ import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
 import { resolveTerminalKillFence, sendTerminalKill } from '@/lib/terminal-kill'
+import { foldRefusalFencePair, hasRefusalFencePair, STALE_REFUSAL_MESSAGE_PREFIX } from '@/lib/owner-fence-heal'
+import type { RefusalFencePair } from '@/lib/owner-fence-heal'
 import { sendTerminalKillAndAwait, type KillAck } from '@/lib/kill-ack'
 import { getTerminalTheme } from '@/lib/terminal-themes'
 import {
@@ -935,9 +939,25 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // id yet and the ordinary lifecycle flow owns it; a RUNNING pane is never
   // stolen off its own live terminal.
   const ownTerminalDeadOrAbsent = isTerminal && terminalContent?.status === 'exited'
+  // b8ke delta F1: the exit fold CLEARS the stored terminal id, but the
+  // convergence's own-terminal gate must still recognize the pane's OWN
+  // dead terminal. The kill's wire order (terminal.exit first, the stop
+  // commit's VACANT owner frame moments later) leaves the record still
+  // naming the pane's own dead terminal as the terminal-Live owner in the
+  // window between the two folds; converging onto it re-attached the dead
+  // handle, drew INVALID_TERMINAL_ID, and the reconnect recovery
+  // AUTO-RESUMED the killed session (the exact delta F1 hazard, racy on
+  // the render between the exit fold and the vacant fold).
+  // lastKnownTerminalIdRef (Ledger A2 — never cleared by recovery) carries
+  // the dead id here; a pane that never acquired a terminal keeps
+  // undefined and converges normally (a genuinely NEW authoritative
+  // terminal is never the pane's own dead one).
   const terminalOwnerConvergence = ownTerminalDeadOrAbsent
     && freshAgentOwnerDivergence === null
-    ? deriveTerminalOwnerConvergence(terminalRuntimeOwner, terminalContent?.terminalId)
+    ? deriveTerminalOwnerConvergence(
+      terminalRuntimeOwner,
+      terminalContent?.terminalId ?? lastKnownTerminalIdRef.current,
+    )
     : null
   const terminalOwnerConvergenceRef = useRef(terminalOwnerConvergence)
   terminalOwnerConvergenceRef.current = terminalOwnerConvergence
@@ -4374,6 +4394,64 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         }, delay)
       }
 
+      // b8ke fence-heal (fix b): fold a typed refusal's CURRENT pair into
+      // THIS pane's runtimeOwners fence (canonicalized inside the helper —
+      // the same key the pane's next claim's fence read resolves).
+      const foldRefusalFence = (refusal: RefusalFencePair) => {
+        foldRefusalFencePair(dispatch, appStore.getState(), contentRef.current ?? {}, refusal)
+      }
+
+      // b8ke fence-heal (Task 7 follow-up): the recovery-create lane shared
+      // by the INVALID_TERMINAL_ID reconnect recovery (focused review 1
+      // removed the pane-terminal-scoped refused-arm routing — a refused
+      // attach/kill never auto-relaunches the killed session): mint a NEW
+      // createRequestId
+      // (the r35 NEXT-decision fresh capture at send time), mark it restore
+      // (the rate-limit exemption), clear the dead terminal's handles, and
+      // let the lifecycle effect's createRequestId dependency re-fire the
+      // resume create.
+      const resumeRecoveryCreate = (deadTerminalId?: string) => {
+        writeLocalXtermNotice(term, '\r\n[Reconnecting...]\r\n')
+        const newRequestId = nanoid()
+        if (debugRef.current) log.debug('[TRACE resumeSessionId] recovery-create', {
+          paneId: paneIdRef.current,
+          oldRequestId: requestIdRef.current,
+          newRequestId,
+          resumeSessionId: contentRef.current?.resumeSessionId,
+        })
+        clearTerminalRestoreRequestId(requestIdRef.current)
+        addTerminalRestoreRequestId(newRequestId)
+        requestIdRef.current = newRequestId
+        reviveAttemptedRef.current = null
+        clearQuarantineRepair()
+        currentAttachRef.current = null
+        if (deadTerminalId) {
+          clearTerminalCursor(deadTerminalId)
+          forgetSentViewport(deadTerminalId)
+        }
+        resetParserAppliedSurface()
+        lastSentViewportRef.current = null
+        terminalIdRef.current = undefined
+        deferredAttachStateRef.current = {
+          mode: 'none',
+          pendingIntent: null,
+          pendingSinceSeq: 0,
+          pendingReason: 'initial_hydrate',
+        }
+        applySeqState(createAttachSeqState())
+        updateContent({
+          terminalId: undefined,
+          serverInstanceId: undefined,
+          streamId: undefined,
+          createRequestId: newRequestId,
+          status: 'creating',
+        })
+        const currentTab = tabRef.current
+        if (currentTab) {
+          dispatch(updateTab({ id: currentTab.id, updates: { status: 'creating' } }))
+        }
+      }
+
       // F9: the server no longer knows the terminal this still-launching pane
       // points at. Pump bounded same-requestId re-creates instead of minting a
       // fresh recovery identity for a pane that never finished launching.
@@ -5607,6 +5685,28 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               syncContentRefWithSessionAssociation(createdSessionRef)
             }
           }
+          // b8ke fence-heal (fix c): the create's OWN committed pair, folded
+          // BEFORE the queued attach fires — the first attach is born fresh
+          // even when the store still holds a stale pre-create record. The
+          // frame omits the trio on legacy servers and identity-less spawns.
+          if (
+            msg.sessionRef
+            && msg.ownerKind
+            && typeof msg.ownerEpoch === 'number'
+            && typeof msg.ownerGeneration === 'number'
+          ) {
+            appStore.dispatch(applyRuntimeOwner({
+              type: 'session.runtimeOwner',
+              provider: msg.sessionRef.provider,
+              sessionId: msg.sessionRef.sessionId,
+              epoch: msg.ownerEpoch,
+              generation: msg.ownerGeneration,
+              ownerKind: msg.ownerKind,
+              terminalId: msg.terminalId,
+              operationId: `terminal-created:${msg.terminalId}`,
+              transition: 'handoff-committed',
+            } as SessionRuntimeOwnerMessage))
+          }
           // Kata dtfn anchor 1 (ledger A11): flush buffered keystrokes AFTER
           // the created sessionRef is folded into contentRef above, so each
           // rebuilt frame snapshots the NEW identity (invariant 2/3).
@@ -6073,11 +6173,80 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               },
             }))
           }
+          // b8ke fence-heal (fix b): fold the refusal's CURRENT (epoch,
+          // generation) into the pane's runtimeOwners fence (merge-only —
+          // the record's owner identity is preserved). The NEXT decision
+          // (the card's user Retry / a reconcile re-materialization) then
+          // re-captures the fresh pair; the r35 automatic re-drive keeps
+          // its captured per-request pair.
+          foldRefusalFence(msg)
+          // b8ke fence-heal fast path (plan-review round 1, finding 4): a
+          // stale-observed-generation refusal carrying the pair PROVES the
+          // request's own pair can never win a re-drive — abandon the
+          // request to the reconcile flow (resolveReserveExhaustionViaReconcile
+          // sends one pane.reconcile.request; its re-materialized request
+          // re-captures the FRESH pair from the folded store) instead of
+          // looping the bounded re-drive. Refusals WITHOUT the pair (legacy
+          // servers; the r35-pinned frame models no owner fields) keep the
+          // existing bounded re-drive — the in-flight-lifecycle refusals
+          // (different frozen message) keep it too.
+          if (
+            hasRefusalFencePair(msg)
+            && (msg.message ?? '').startsWith(STALE_REFUSAL_MESSAGE_PREFIX)
+          ) {
+            resolveReserveExhaustionViaReconcile()
+            return
+          }
           // Another create holds this sessionRef's lease. Re-drive the SAME
           // terminal.create after the server's hint (floored), bounded by a
           // wall-clock window; on exhaustion, auto-resolve via a single-pane
           // reconcile instead of surfacing a dead-end error.
           redriveAfterSessionReserved(reqId, msg.retryAfterMs)
+          return
+        }
+
+        // b8ke fence-heal (fix b): the pane-terminal-scoped typed refusal
+        // (no requestId, the pane's own terminalId — a refused attach or a
+        // fire-and-forget kill, identical frame shape) previously matched
+        // NO branch: the pane silently never attached and refused kills
+        // went unfelt (the wedge). Fold the refusal's CURRENT pair so the
+        // next attach/kill claim — each re-reads the fence at send time —
+        // is fresh. The pair presence keys the branch: only typed
+        // ownership refusals carry it, so INVALID_TERMINAL_ID and other
+        // no-requestId frames keep their own handling below.
+        if (
+          msg.type === 'error'
+          && !msg.requestId
+          && msg.terminalId
+          && msg.terminalId === tid
+          && hasRefusalFencePair(msg)
+        ) {
+          foldRefusalFence(msg)
+          // b8ke fence-heal (Task 7 follow-up, focused review 1): the fold
+          // heals the store the NEXT decision reads — but nothing re-drives
+          // the pane's attach after a refused attach: the pane's one-shot
+          // attach can race the owner-frame fold (the cross-device kill's
+          // terminal.meta retirement broadcast re-fires the attach lifecycle
+          // BEFORE the vacant frame folds) and then wedge "Recovering
+          // terminal output" behind the single refused attempt. The
+          // stale-observed-generation arm bumps the pane's reconcileEpoch —
+          // the lifecycle effect's ONLY re-fire signal — so the attach
+          // re-drives with the healed pair at send time (the r35
+          // NEXT-decision re-capture; it re-attaches the pane to a LIVE
+          // terminal under a newer generation — the sanctioned next-attempt
+          // self-heal, never a relaunch). The refused/foreign-owner arm
+          // does NOTHING else automatically (focused review 1): the record
+          // can read VACANT while the exit fan is still in flight
+          // (terminal-exit, vacant-owner, and refusal frames use
+          // independently scheduled delivery paths), so an automatic
+          // recovery-create here RELAUNCHED the killed session. The refusal
+          // folds the fresh pair only; the exit fold lands the honest
+          // exited state with the user-driven recovery affordance, and the
+          // user's own reopen converges without a reload (the folds make
+          // the attempt born fresh).
+          if ((msg.message ?? '').startsWith(STALE_REFUSAL_MESSAGE_PREFIX)) {
+            dispatch(bumpPaneReconcileEpoch({ tabId, paneId }))
+          }
           return
         }
 
@@ -6366,49 +6535,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             if (tabSessionRefFallback) {
               updateContent({ sessionRef: tabSessionRefFallback })
             }
-            writeLocalXtermNotice(term, '\r\n[Reconnecting...]\r\n')
-            const newRequestId = nanoid()
-            if (debugRef.current) log.debug('[TRACE resumeSessionId] INVALID_TERMINAL_ID reconnecting', {
-              paneId: paneIdRef.current,
-              oldRequestId: requestIdRef.current,
-              newRequestId,
-              resumeSessionId: current?.resumeSessionId,
-            })
-            // Any INVALID_TERMINAL_ID reconnect is restoring a terminal that existed
-            // before the server lost state. Always mark it as restore so the
-            // subsequent terminal.create bypasses the server's rate limit.
-            // Clear the old ID's flag (if any) to resolve/clean up the set, but
-            // mark the new request regardless — non-restore terminals also need
-            // rate-limit bypass when burst-reconnecting after a server restart.
-            clearTerminalRestoreRequestId(requestIdRef.current)
-            addTerminalRestoreRequestId(newRequestId)
-            requestIdRef.current = newRequestId
-            reviveAttemptedRef.current = null
-            clearQuarantineRepair()
-            currentAttachRef.current = null
-            clearTerminalCursor(currentTerminalId)
-            resetParserAppliedSurface()
-            forgetSentViewport(currentTerminalId)
-            lastSentViewportRef.current = null
-            terminalIdRef.current = undefined
-            deferredAttachStateRef.current = {
-              mode: 'none',
-              pendingIntent: null,
-              pendingSinceSeq: 0,
-              pendingReason: 'initial_hydrate',
-            }
-            applySeqState(createAttachSeqState())
-            updateContent({
-              terminalId: undefined,
-              serverInstanceId: undefined,
-              streamId: undefined,
-              createRequestId: newRequestId,
-              status: 'creating',
-            })
-            const currentTab = tabRef.current
-            if (currentTab) {
-              dispatch(updateTab({ id: currentTab.id, updates: { status: 'creating' } }))
-            }
+            // b8ke fence-heal (Task 7 follow-up): extracted into
+            // resumeRecoveryCreate (shared with the pane-terminal-scoped
+            // refused-arm refusal routing).
+            resumeRecoveryCreate(currentTerminalId)
           } else if (current?.status === 'exited') {
             writeLocalXtermNotice(term, '\r\n[Terminal exited - use the + button or split to start a new session]\r\n')
           }
@@ -6941,6 +7071,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // - settled 'exited' with a non-zero exit record → alert + Relaunch
   // - settled 'exited' with NO record (post-reload — the ephemeral slice is
   //   empty) → codeless alert + Relaunch
+  // - settled 'exited' with a CLEAN (code 0) record whose canonical owner
+  //   record is VACANT (the killed-session shape, the-usual focused fix 2)
+  //   → quiet recovery bar + Reopen (the user-driven path; never automatic)
   // - settled 'error' WITH a recorded non-zero exit: a crash BEFORE
   //   terminal.attach.ready settles via failLaunch as 'error', not 'exited' —
   //   the dominant timing for a fast-crashing CLI. Same user situation
@@ -6950,8 +7083,23 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   const settledDead =
     (terminalContent.status === 'exited' && (exitRecord ? exitRecord.exitCode !== 0 : true)) ||
     (terminalContent.status === 'error' && Boolean(exitRecord && exitRecord.exitCode !== 0))
+  // the-usual focused fix 2 (Major): the killed-session recovery affordance.
+  // A clean exit (code 0 — the terminal.kill wire contract) whose canonical
+  // runtime-owner record folds VACANT is the cross-device-kill shape: the
+  // session is durably stopped and the pane must surface the user-driven
+  // reopen action (never an automatic relaunch). Deliberate clean exits stay
+  // quiet: a session whose record is still Live (or absent) exited on
+  // purpose, and the fenced/in-progress/divergent owner states own their own
+  // typed cards — the affordance renders only when no owner card does.
+  const killedSessionVacant = Boolean(
+    isAgentPane
+    && terminalContent.status === 'exited'
+    && exitRecord?.exitCode === 0
+    && freshAgentOwnerDivergence === null
+    && terminalRuntimeOwner?.ownerKind === 'vacant'
+  )
   const showExitBanner = Boolean(
-    isAgentPane && (activeNotice || terminalContent.crashTrace || settledDead)
+    isAgentPane && (activeNotice || terminalContent.crashTrace || settledDead || killedSessionVacant)
   )
 
   // ── kata b8ke: typed recovery surfaces ──
@@ -7284,6 +7432,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             notice={activeNotice ?? null}
             crashTrace={terminalContent.crashTrace ?? null}
             settledDead={settledDead}
+            vacantRecovery={killedSessionVacant}
             resumeCycles={resumeCycles}
             canResume={Boolean(
               terminalContent.sessionRef && terminalContent.sessionRef.provider === terminalContent.mode
