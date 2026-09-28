@@ -55,6 +55,7 @@ import {
   recordAutoResumeSettled,
   recordTerminalExit,
   selectActiveNotice,
+  selectAutoResumeSettle,
   selectExitRecord,
   selectLastTerminalIdFrom,
   selectResumeCycles,
@@ -722,6 +723,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // apparatus (selector filter + expiry re-render timer) is deleted. A
   // missed frame is corrected by the reconnect backstop (D-3) below.
   const activeNotice = useAppSelector((s) => selectActiveNotice(s, paneId))
+  const autoResumeSettle = useAppSelector((s) => selectAutoResumeSettle(s, paneId))
   // Flap-circuit-breaker settle count (znhn item 2) — typed field, feeds the
   // "crashed N times — auto-resume paused" alert copy.
   const resumeCycles = useAppSelector((s) => selectResumeCycles(s, paneId)) ?? null
@@ -5841,7 +5843,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             dispatch(
               recordAutoResumeSettled({
                 paneId: paneIdRef.current,
+                terminalId: msg.terminalId,
+                exitCode: msg.exitCode,
                 resumeCycles: msg.resumeCycles,
+                at: Date.now(),
               })
             )
           }
@@ -7117,7 +7122,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   const isAgentPane = Boolean(terminalContent.mode && terminalContent.mode !== 'shell')
   const settledDead =
     (terminalContent.status === 'exited' && (exitRecord ? exitRecord.exitCode !== 0 : true)) ||
-    (terminalContent.status === 'error' && Boolean(exitRecord && exitRecord.exitCode !== 0))
+    (terminalContent.status === 'error' && Boolean(exitRecord && exitRecord.exitCode !== 0)) ||
+    // The replacement can die before this client attaches; in that case
+    // terminal.exit had no subscriber. The server's final status frame still
+    // carries the retained exit code and settles this pane loudly.
+    (typeof autoResumeSettle?.exitCode === 'number'
+      && autoResumeSettle.exitCode !== 0
+      && (!terminalContent.terminalId || terminalContent.terminalId === autoResumeSettle.terminalId))
   // the-usual focused fix 2 (Major): the killed-session recovery affordance.
   // A clean exit (code 0 — the terminal.kill wire contract) whose canonical
   // runtime-owner record folds VACANT is the cross-device-kill shape: the

@@ -1404,7 +1404,7 @@ pub(crate) fn broadcast_settled_frame(
         terminal_id: terminal_id.to_string(),
         attempt: None,
         max_attempts: None,
-        exit_code: None,
+        exit_code: state.registry.exit_code_of(terminal_id),
         reason: Some(reason.to_string()),
         resume_cycles: resume_cycles.map(i64::from),
     });

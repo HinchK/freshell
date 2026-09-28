@@ -581,6 +581,56 @@ describe('TerminalView exited-pane error banner', () => {
       .toHaveTextContent('Relaunch — resumes this conversation')
   })
 
+  it('shows the final crash alert when a replacement exits before terminal.attach delivers terminal.exit', async () => {
+    const { store, paneContent } = makeStore({
+      mode: 'claude',
+      status: 'running',
+      lifecycle: { lastTerminalId: 'term-previous' },
+    })
+    await renderPane(store, paneContent)
+
+    await act(async () => {
+      messageHandler!({
+        type: 'terminal.replaced',
+        oldTerminalId: 'term-previous',
+        newTerminalId: 'term-final',
+        exitCode: 1,
+        attempt: 2,
+        maxAttempts: 2,
+      })
+      // The final replacement dies before this client has an attach stream,
+      // so no terminal.exit arrives; the server settles by broadcast.
+      messageHandler!({
+        type: 'terminal.status',
+        terminalId: 'term-final',
+        status: 'exited',
+        exitCode: 1,
+        reason: 'retries_exhausted',
+      })
+    })
+
+    expect(screen.getByRole('alert')).toHaveTextContent('process exited (code 1)')
+    expect(screen.getByRole('button', { name: 'Relaunch claude session' })).toBeInTheDocument()
+  })
+
+  it('keeps a clean settle quiet when terminal.exit was not delivered', async () => {
+    const { store, paneContent } = makeStore({
+      mode: 'claude',
+      status: 'running',
+      lifecycle: { lastTerminalId: 'term-clean' },
+    })
+    await renderPane(store, paneContent)
+
+    await act(async () => {
+      messageHandler!({
+        type: 'terminal.status', terminalId: 'term-clean',
+        status: 'exited', exitCode: 0, reason: 'clean_exit',
+      })
+    })
+
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
   it('renders the recovering notice from the frame FIELDS — prose is presentational, never parsed', async () => {
     // Council MEDIUM fix (7w4h/xkhx review): the client must read
     // attempt/maxAttempts/exitCode from the terminal.status frame's typed

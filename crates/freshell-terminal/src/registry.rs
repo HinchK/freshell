@@ -5113,6 +5113,20 @@ impl TerminalRegistry {
         })
     }
 
+    /// Exit code retained with a naturally exited terminal. The auto-resume
+    /// settle broadcast uses this when the replacement died before any
+    /// client attached, so no subscriber received `terminal.exit`.
+    pub fn exit_code_of(&self, terminal_id: &str) -> Option<i64> {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|h| Arc::clone(&h.shared))
+        };
+        shared.and_then(|shared| shared.lock().expect("terminal lock").exit_code)
+    }
+
     /// A terminal's stamped `createRequestId`, if any.
     pub fn probe_create_request_id(&self, terminal_id: &str) -> Option<String> {
         let shared = {
@@ -7017,6 +7031,16 @@ mod tests {
             exited.fields.get("exit_code").map(String::as_str),
             Some("3")
         );
+    }
+
+    #[test]
+    fn retained_exit_code_is_available_for_final_auto_resume_status() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T-settled", "S-settled");
+        assert_eq!(reg.exit_code_of("T-settled"), None);
+        assert!(reg.finish_pty_exit("T-settled", 7));
+        assert_eq!(reg.exit_code_of("T-settled"), Some(7));
+        assert_eq!(reg.exit_code_of("unknown"), None);
     }
 
     /// kata b8ke Task 6: the handoff runner's terminal-reap probe. A Running
