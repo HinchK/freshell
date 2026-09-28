@@ -10,7 +10,8 @@ use freshell_freshagent::hosted_rest::{
 };
 use freshell_protocol::{
     AgentProvider, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent, FreshAgentForked,
-    FreshAgentKilled, ServerMessage, SessionLocator, SessionType, StringOrNumber,
+    FreshAgentKilled, FreshAgentRecoveryStopped, ServerMessage, SessionLocator, SessionType,
+    StringOrNumber,
 };
 use freshell_runtime_client::RuntimeClient;
 use freshell_runtime_protocol::{
@@ -178,6 +179,21 @@ impl HostedFreshAgentProxy {
                     code: None,
                     message: None,
                 }));
+            }
+            HostedFreshAgentCommand::RecoveryStop(message) => {
+                self.send(ServerMessage::FreshAgentRecoveryStopped(
+                    FreshAgentRecoveryStopped {
+                        request_id: message.request_id,
+                        provider: provider_wire(&message.provider),
+                        session_id: message.session_id,
+                        session_type: session_type_wire(message.session_type),
+                        success: false,
+                        code: Some("UNSUPPORTED_CAPABILITY".to_string()),
+                        message: Some(
+                            "managed fresh-agent recovery stop is unavailable".to_string(),
+                        ),
+                    },
+                ));
             }
             HostedFreshAgentCommand::Approval(message) => {
                 self.resolve_decision(

@@ -2060,6 +2060,14 @@ async fn handle_client_text(
             }
             true
         }
+        ClientMessage::FreshAgentRecoveryStop(stop) => {
+            let fresh_codex = state.fresh_codex.clone();
+            tokio::spawn(
+                async move { fresh_codex.handle_recovery_stop(stop).await }
+                    .instrument(tracing::Span::current()),
+            );
+            true
+        }
         // freshAgent.approval.respond / question.respond / compact (approval-respond
         // Task 2): the refusal table already answered every unsupported provider x op
         // cell before this match; the remaining cells route to real handlers.

@@ -74,6 +74,8 @@ pub enum ServerMessage {
     FreshAgentForked(FreshAgentForked),
     #[serde(rename = "freshAgent.killed")]
     FreshAgentKilled(FreshAgentKilled),
+    #[serde(rename = "freshAgent.recovery.stopped")]
+    FreshAgentRecoveryStopped(FreshAgentRecoveryStopped),
     #[serde(rename = "freshAgent.send.accepted")]
     FreshAgentSendAccepted(FreshAgentSendAccepted),
     #[serde(rename = "freshAgent.session.materialized")]
@@ -376,7 +378,8 @@ pub struct RuntimeViewChanged {
 /// consumer, add the Zod schema to `shared/ws-protocol.ts`, run
 /// `pnpm run contract:generate`, and promote this into
 /// [`SERVER_MESSAGE_TYPES`]. Shape pinned by `tests/activity_extension.rs`.
-pub const EXTENSION_SERVER_MESSAGE_TYPES: [&str; 1] = ["durability.degraded"];
+pub const EXTENSION_SERVER_MESSAGE_TYPES: [&str; 2] =
+    ["durability.degraded", "freshAgent.recovery.stopped"];
 
 // ---------------------------------------------------------------------------
 // Server-only enums.
@@ -1018,6 +1021,20 @@ pub struct FreshAgentKilled {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     /// The typed refusal's human-readable message (rides with `code`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentRecoveryStopped {
+    pub request_id: String,
+    pub provider: String,
+    pub session_id: String,
+    pub session_type: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }

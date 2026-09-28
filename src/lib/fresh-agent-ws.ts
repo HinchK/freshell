@@ -1,7 +1,7 @@
 import type { AppDispatch } from '@/store/store'
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
 import type { SessionRef } from '@shared/session-contract'
-import type { ReadyMessage, SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
+import type { FreshAgentRecoveryStoppedMessage, ReadyMessage, SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import { createLogger } from '@/lib/client-logger'
 import { consumeCancelledCreate, consumeCreateRoute, rememberCreateRoute } from '@/lib/create-cancellation'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
@@ -90,6 +90,7 @@ type FreshAgentClientMessage =
   | FreshAgentCreateFailedMessage
   | FreshAgentSessionMaterializedMessage
   | FreshAgentKilledMessage
+  | FreshAgentRecoveryStoppedMessage
 
 interface FreshAgentMessageSink {
   send: (msg: unknown) => void
@@ -255,6 +256,17 @@ export function handleFreshAgentMessage(
         sessionType: killed.sessionType,
         provider: killed.provider,
       }, killed.success, killed.code, killed.message)
+      return true
+    }
+    case 'freshAgent.recovery.stopped': {
+      const stopped = msg as FreshAgentRecoveryStoppedMessage
+      if (stopped.success) {
+        dispatch(removeSession({
+          sessionId: stopped.sessionId,
+          sessionType: stopped.sessionType,
+          provider: stopped.provider,
+        }))
+      }
       return true
     }
     case 'freshAgent.event':

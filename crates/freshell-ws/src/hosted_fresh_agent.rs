@@ -7,7 +7,8 @@
 use freshell_protocol::{
     ClientMessage, FreshAgentApprovalRespond, FreshAgentAttach, FreshAgentCompact,
     FreshAgentCreate, FreshAgentFork, FreshAgentInterrupt, FreshAgentKill,
-    FreshAgentQuestionRespond, FreshAgentRedo, FreshAgentSend, FreshAgentUndo,
+    FreshAgentQuestionRespond, FreshAgentRecoveryStop, FreshAgentRedo, FreshAgentSend,
+    FreshAgentUndo,
 };
 use futures::future::BoxFuture;
 use std::sync::{Arc, OnceLock};
@@ -19,6 +20,7 @@ pub enum HostedFreshAgentCommand {
     Send(FreshAgentSend),
     Interrupt(FreshAgentInterrupt),
     Kill(FreshAgentKill),
+    RecoveryStop(FreshAgentRecoveryStop),
     Approval(FreshAgentApprovalRespond),
     Question(FreshAgentQuestionRespond),
     Compact(FreshAgentCompact),
@@ -35,6 +37,7 @@ impl HostedFreshAgentCommand {
             ClientMessage::FreshAgentSend(value) => Some(Self::Send(value.clone())),
             ClientMessage::FreshAgentInterrupt(value) => Some(Self::Interrupt(value.clone())),
             ClientMessage::FreshAgentKill(value) => Some(Self::Kill(value.clone())),
+            ClientMessage::FreshAgentRecoveryStop(value) => Some(Self::RecoveryStop(value.clone())),
             ClientMessage::FreshAgentApprovalRespond(value) => Some(Self::Approval(value.clone())),
             ClientMessage::FreshAgentQuestionRespond(value) => Some(Self::Question(value.clone())),
             ClientMessage::FreshAgentCompact(value) => Some(Self::Compact(value.clone())),

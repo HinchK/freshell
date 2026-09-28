@@ -17,7 +17,7 @@ import type { AppStore } from '@/store/store'
 import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
 import { sendSuppressedAwareFreshAgentFrame } from '@/lib/fresh-agent-configure'
-import { KILL_ACK_TIMEOUT_MESSAGE, KILL_FAILED_MESSAGE, sendFreshAgentKillAndAwait } from '@/lib/kill-ack'
+import { KILL_ACK_TIMEOUT_MESSAGE, KILL_FAILED_MESSAGE, sendFreshAgentKillAndAwait, sendFreshAgentRecoveryStopAndAwait } from '@/lib/kill-ack'
 import { createLogger } from '@/lib/client-logger'
 import { api, getFreshAgentModelCapabilities, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
 import { clearReconcilePendingPane, consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
@@ -1885,10 +1885,11 @@ export function FreshAgentView({
     }))
   }, [claudeSession, dispatch, paneId, tabId])
 
-  // Stuck-card recovery: kill the wedged sidecar (same kill-frame shape as
-  // startNewConversation), then re-mint the pane through the existing
-  // triggerRecovery path so the canonical resume id keeps the durable thread.
+  // A recovery stop must finish before the pane attempts to resume. The
+  // ordinary kill closes the durable session; Codex uses a process-only stop.
+  const recoveryStopPendingRef = useRef(false)
   const restartStuckSidecar = useCallback(() => {
+    if (recoveryStopPendingRef.current) return
     const current = paneContentRef.current
     // b8ke ext F2: the kill target is the pane's DURABLE session —
     // content.sessionId OR the restored pane's sessionRef.sessionId
@@ -1898,11 +1899,10 @@ export function FreshAgentView({
       ?? (current.sessionRef?.provider === current.provider
         ? current.sessionRef.sessionId
         : undefined)
-    if (killSessionId) {
-      const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
-      // kata b8ke (round-3 F6): the kill carries the observed
-      // (epoch, generation) fence like every lifecycle producer.
-      const fence = selectPaneOwnerFence(appStore.getState(), current)
+    if (!killSessionId) return
+    const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
+    const fence = selectPaneOwnerFence(appStore.getState(), current)
+    if (current.provider !== 'codex' || current.sessionType !== 'freshcodex') {
       sendFreshAgentMessage({
         type: 'freshAgent.kill',
         sessionId: killSessionId,
@@ -1911,9 +1911,34 @@ export function FreshAgentView({
         ...(cwd ? { cwd } : {}),
         ...(fence ? { observedEpoch: fence.epoch, observedGeneration: fence.generation } : {}),
       })
+      triggerRecovery()
+      return
     }
-    triggerRecovery()
-  }, [appStore, sendFreshAgentMessage, triggerRecovery])
+    recoveryStopPendingRef.current = true
+    void sendFreshAgentRecoveryStopAndAwait({
+      sessionId: killSessionId,
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      ...(fence ? { observedEpoch: fence.epoch, observedGeneration: fence.generation } : {}),
+    }, { send: (message) => sendFreshAgentMessage(message as Record<string, unknown>) })
+      .then((ack) => {
+        if (!isMountedRef.current || paneContentRef.current.createRequestId !== current.createRequestId) return
+        if (ack.ok) {
+          triggerRecovery()
+          return
+        }
+        dispatch(sessionError({
+          sessionId: killSessionId,
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          code: ack.error ?? 'RECOVERY_STOP_FAILED',
+          message: ack.timedOut
+            ? 'The sidecar stop was not confirmed in time. Try again.'
+            : 'The sidecar could not be stopped safely. Try again.',
+        }))
+      })
+      .finally(() => { recoveryStopPendingRef.current = false })
+  }, [appStore, dispatch, sendFreshAgentMessage, triggerRecovery])
 
   // Capability-gated .lost resolution (paneReconcileFreshAgentV1): a lost
   // session asks the SERVER for the pane's true state via a single-pane

@@ -7234,7 +7234,13 @@ describe('freshcodex wedged-sidecar notice', () => {
     expect(screen.getByRole('button', { name: /start new conversation/i })).toBeInTheDocument()
   })
 
-  it('Restart sidecar kills the wedged session then re-mints a creating pane on the canonical resume id', async () => {
+  it('Restart sidecar confirms the process stop before resuming the same durable thread', async () => {
+    const handlers: Array<(message: Record<string, unknown>) => void> = []
+    wsMock.onMessage.mockReset()
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      handlers.push(handler)
+      return () => {}
+    })
     const { store } = renderFocusPane({ sessionId: 'thread-stuck-1', status: 'running' })
     // Install the spy BEFORE the stuck fold re-renders: the click closure
     // captures `dispatch` at render time (react-redux useDispatch), so a spy
@@ -7243,16 +7249,27 @@ describe('freshcodex wedged-sidecar notice', () => {
     dispatchStuck(store)
     await screen.findByRole('alert')
     fireEvent.click(screen.getByRole('button', { name: /restart sidecar and resume session/i }))
-    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'freshAgent.kill',
+    const sent = wsMock.send.mock.calls.find(([message]) => message.type === 'freshAgent.recovery.stop')?.[0]
+    expect(sent).toMatchObject({
       sessionId: 'thread-stuck-1',
       sessionType: 'freshcodex',
       provider: 'codex',
-    }))
-    const remints = dispatchSpy.mock.calls
+    })
+    const creatingActions = () => dispatchSpy.mock.calls
       .map(([action]) => action)
       .filter((action: any) => action?.type === 'panes/updatePaneContent'
         && action.payload?.content?.status === 'creating')
+    expect(creatingActions()).toHaveLength(0)
+    for (const handler of handlers) handler({
+      type: 'freshAgent.recovery.stopped',
+      requestId: sent.requestId,
+      sessionId: 'thread-stuck-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      success: true,
+    })
+    await waitFor(() => expect(creatingActions()).toHaveLength(1))
+    const remints = creatingActions()
     expect(remints).toHaveLength(1)
     expect(remints[0].payload.content.resumeSessionId).toBe('thread-stuck-1')
     expect(remints[0].payload.content.sessionId).toBeUndefined()
@@ -10204,6 +10221,12 @@ describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement
   })
 
   it('restartStuckSidecar kills the sessionRef session before re-driving creation', async () => {
+    const handlers: Array<(msg: Record<string, unknown>) => void> = []
+    wsMock.onMessage.mockReset()
+    wsMock.onMessage.mockImplementation((listener: (msg: Record<string, unknown>) => void) => {
+      handlers.push(listener)
+      return () => {}
+    })
     const store = createStore()
     const dispatchSpy = vi.spyOn(store, 'dispatch')
 
@@ -10228,20 +10251,85 @@ describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement
     wsMock.send.mockClear()
     fireEvent.click(screen.getByRole('button', { name: /restart sidecar and resume session/i }))
 
-    // THE F2 CONTRACT: the restart's kill targets the durable sessionRef
-    // session — pre-ext a sessionRef-only pane sent NO kill and the
-    // recovery re-drove creation over the live wedged runtime.
-    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'freshAgent.kill',
+    // The recovery stop targets the durable sessionRef and waits for a
+    // correlated confirmation before any new runtime starts.
+    const sent = wsMock.send.mock.calls.find(([message]) => message.type === 'freshAgent.recovery.stop')?.[0]
+    expect(sent).toMatchObject({
       sessionId: 'thread-ref-stuck',
       sessionType: 'freshcodex',
       provider: 'codex',
-    }))
+    })
+    const remintsBeforeAck = dispatchSpy.mock.calls
+      .map(([action]) => action)
+      .filter((action: any) => action?.type === 'panes/updatePaneContent'
+        && action.payload?.content?.status === 'creating')
+    expect(remintsBeforeAck).toHaveLength(0)
+    for (const handler of handlers) {
+      handler({
+        type: 'freshAgent.recovery.stopped',
+        requestId: sent.requestId,
+        sessionId: 'thread-ref-stuck',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        success: true,
+      })
+    }
+    await waitFor(() => {
+      const remints = dispatchSpy.mock.calls
+        .map(([action]) => action)
+        .filter((action: any) => action?.type === 'panes/updatePaneContent'
+          && action.payload?.content?.status === 'creating')
+      expect(remints).toHaveLength(1)
+    })
+  })
+
+  it('does not resume a wedged Codex session after a refused recovery stop', async () => {
+    const handlers: Array<(msg: Record<string, unknown>) => void> = []
+    wsMock.onMessage.mockReset()
+    wsMock.onMessage.mockImplementation((listener: (msg: Record<string, unknown>) => void) => {
+      handlers.push(listener)
+      return () => {}
+    })
+    const store = createStore()
+    const dispatchSpy = vi.spyOn(store, 'dispatch')
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            createRequestId: 'req-ref-stuck-failed',
+            sessionRef: { provider: 'codex', sessionId: 'thread-ref-stuck-failed' },
+            status: 'stuck',
+          }}
+        />
+      </Provider>,
+    )
+    await screen.findByRole('alert')
+    wsMock.send.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: /restart sidecar and resume session/i }))
+    const sent = wsMock.send.mock.calls.find(([message]) => message.type === 'freshAgent.recovery.stop')?.[0]
+    expect(sent?.requestId).toEqual(expect.any(String))
+    for (const handler of handlers) {
+      handler({
+        type: 'freshAgent.recovery.stopped',
+        requestId: sent.requestId,
+        sessionId: 'thread-ref-stuck-failed',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        success: false,
+        code: 'TEARDOWN_NOT_CONFIRMED',
+      })
+    }
+    await waitFor(() => expect(store.getState().freshAgent.sessions['freshcodex:codex:thread-ref-stuck-failed']?.lastErrorCode).toBe('TEARDOWN_NOT_CONFIRMED'))
     const remints = dispatchSpy.mock.calls
       .map(([action]) => action)
       .filter((action: any) => action?.type === 'panes/updatePaneContent'
         && action.payload?.content?.status === 'creating')
-    expect(remints).toHaveLength(1)
+    expect(remints).toHaveLength(0)
   })
 })
 

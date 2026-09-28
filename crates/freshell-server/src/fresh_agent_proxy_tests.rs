@@ -1,10 +1,55 @@
 use super::*;
-use freshell_protocol::FreshAgentFork;
+use freshell_protocol::{FreshAgentFork, FreshAgentRecoveryStop};
 use freshell_runtime_protocol::{
     read_frame, write_frame, AdminCommand, AdminReply, AdminResult, ControlRole, Envelope,
     FreshAgentForkResult, InstallationId, RuntimeErrorCode,
 };
 use tokio::net::UnixListener;
+
+#[tokio::test]
+async fn managed_recovery_stop_refuses_without_contacting_the_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("supervisor.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let soul = SoulId::parse("managed-codex-soul").unwrap();
+    let (broadcast, mut receiver) = broadcast::channel(16);
+    let proxy = Arc::new(HostedFreshAgentProxy {
+        client: RuntimeClient::new(&socket, "0123456789abcdef"),
+        broadcast: Arc::new(broadcast),
+        aliases: Mutex::new(HashMap::from([(("codex".into(), "thread-1".into()), soul)])),
+        presentation_ids: Mutex::new(HashMap::new()),
+        pollers: Mutex::new(HashSet::new()),
+        fixture_modes: HashSet::new(),
+    });
+
+    proxy
+        .handle(HostedFreshAgentCommand::RecoveryStop(
+            FreshAgentRecoveryStop {
+                request_id: "stop-123".into(),
+                provider: AgentProvider::Codex,
+                session_id: "thread-1".into(),
+                session_type: SessionType::Freshcodex,
+                observed_epoch: None,
+                observed_generation: None,
+            },
+        ))
+        .await;
+
+    let frame = receiver.try_recv().unwrap();
+    let ServerMessage::FreshAgentRecoveryStopped(stopped) = serde_json::from_str(&frame).unwrap()
+    else {
+        panic!("expected recovery refusal")
+    };
+    assert_eq!(stopped.request_id, "stop-123");
+    assert_eq!(stopped.code.as_deref(), Some("UNSUPPORTED_CAPABILITY"));
+    assert!(!stopped.success);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "recovery refusal must not contact the host"
+    );
+}
 
 #[test]
 fn presentation_rewrite_keeps_materialized_native_identity() {

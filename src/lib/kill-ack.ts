@@ -85,6 +85,7 @@ type FrameVerdict = { ok: boolean; error?: string; grace?: number; ownerEpoch?: 
 function awaitCloseFrame(
   match: (msg: unknown) => FrameVerdict | null,
   timeoutMs: number,
+  start?: () => void,
 ): Promise<KillAck> {
   return new Promise((resolve) => {
     let settled = false
@@ -121,6 +122,11 @@ function awaitCloseFrame(
           })
     })
     timer = setTimeout(() => finish({ ok: false, timedOut: true }), timeoutMs)
+    try {
+      start?.()
+    } catch (error) {
+      finish({ ok: false, error: String(error) })
+    }
   })
 }
 
@@ -611,4 +617,35 @@ export function sendFreshAgentKillAndAwait(
     }
     return ack
   })
+}
+
+/** Stop a wedged Codex writer while preserving its durable thread for resume.
+ * Unlike a close, this requires the acknowledgement for this exact request:
+ * another device closing the same session cannot satisfy a restart. */
+export function sendFreshAgentRecoveryStopAndAwait(
+  req: Omit<FreshAgentKillRequest, 'cwd'> & { sessionType: 'freshcodex'; provider: 'codex' },
+  opts?: { timeoutMs?: number; send?: (msg: unknown) => void },
+): Promise<KillAck> {
+  const requestId = nanoid()
+  const send = opts?.send ?? ((message: unknown) => getWsClient().send(message))
+  return awaitCloseFrame((message) => {
+    const response = message as Record<string, unknown>
+    if (response.type !== 'freshAgent.recovery.stopped'
+      || response.requestId !== requestId
+      || response.sessionId !== req.sessionId
+      || response.provider !== req.provider) return null
+    return {
+      ok: response.success === true,
+      error: typeof response.code === 'string' ? response.code : undefined,
+    }
+  }, opts?.timeoutMs ?? KILL_ACK_TIMEOUT_MS, () => send({
+    type: 'freshAgent.recovery.stop',
+    requestId,
+    sessionId: req.sessionId,
+    sessionType: req.sessionType,
+    provider: req.provider,
+    ...(req.observedEpoch !== undefined && req.observedGeneration !== undefined
+      ? { observedEpoch: req.observedEpoch, observedGeneration: req.observedGeneration }
+      : {}),
+  }))
 }

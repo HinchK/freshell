@@ -71,7 +71,8 @@ use freshell_codex::{
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentConfigure,
     FreshAgentCreate, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent, FreshAgentFork,
-    FreshAgentForked, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled, FreshAgentSend,
+    FreshAgentForked, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled,
+    FreshAgentRecoveryStop, FreshAgentRecoveryStopped, FreshAgentSend,
     FreshAgentSessionMaterialized, ServerMessage, SessionLocator, SessionRuntimeOwner,
 };
 use freshell_terminal::FrameSink;
@@ -186,6 +187,11 @@ fn locate_thread_rollout(
 const SESSION_TYPE: &str = "freshcodex";
 /// The runtime provider (`AGENT_SESSION_TYPES.codex.provider`).
 const PROVIDER: &str = "codex";
+
+enum CodexStopMode {
+    Close,
+    Recovery { request_id: String },
+}
 
 /// b8ke ext r22 F1: the pane-scoped PROVISIONAL identity for a fresh
 /// create's pre-spawn claim — the createRequestId the caller already
@@ -5010,6 +5016,76 @@ impl FreshCodexState {
     /// unconditional `return true`, adapter.ts:1211-1215) — `ws-handler.ts:3607-3626` always
     /// sends `success:true`. Never touches a process this session did not itself spawn.
     pub async fn handle_kill(&self, msg: FreshAgentKill) {
+        self.handle_stop(msg, CodexStopMode::Close).await;
+    }
+
+    /// Stop only the owned writer so the persisted Codex thread can be resumed.
+    pub async fn handle_recovery_stop(&self, msg: FreshAgentRecoveryStop) {
+        if msg.provider != freshell_protocol::AgentProvider::Codex
+            || msg.session_type != freshell_protocol::SessionType::Freshcodex
+        {
+            self.broadcast(&ServerMessage::FreshAgentRecoveryStopped(
+                FreshAgentRecoveryStopped {
+                    request_id: msg.request_id,
+                    provider: PROVIDER.to_string(),
+                    session_id: msg.session_id,
+                    session_type: SESSION_TYPE.to_string(),
+                    success: false,
+                    code: Some("UNSUPPORTED_PROVIDER".to_string()),
+                    message: Some("recovery stop is available for Codex sessions".to_string()),
+                },
+            ));
+            return;
+        }
+        let mode = CodexStopMode::Recovery {
+            request_id: msg.request_id,
+        };
+        self.handle_stop(
+            FreshAgentKill {
+                provider: msg.provider,
+                session_id: msg.session_id,
+                session_type: msg.session_type,
+                cwd: None,
+                observed_epoch: msg.observed_epoch,
+                observed_generation: msg.observed_generation,
+            },
+            mode,
+        )
+        .await;
+    }
+
+    fn broadcast_stop_result(&self, mode: &CodexStopMode, frame: &ServerMessage) {
+        match mode {
+            CodexStopMode::Close => self.broadcast(frame),
+            CodexStopMode::Recovery { request_id } => {
+                let ServerMessage::FreshAgentKilled(killed) = frame else {
+                    unreachable!("Codex stop responses must be freshAgent.killed")
+                };
+                tracing::info!(
+                    target: "freshell_freshagent::codex",
+                    event = "fresh_agent.recovery_stop.settled",
+                    request_id = %request_id,
+                    session_id = %killed.session_id,
+                    success = killed.success,
+                    code = ?killed.code,
+                    "Codex recovery stop settled"
+                );
+                self.broadcast(&ServerMessage::FreshAgentRecoveryStopped(
+                    FreshAgentRecoveryStopped {
+                        request_id: request_id.clone(),
+                        provider: killed.provider.clone(),
+                        session_id: killed.session_id.clone(),
+                        session_type: killed.session_type.clone(),
+                        success: killed.success,
+                        code: killed.code.clone(),
+                        message: killed.message.clone(),
+                    },
+                ));
+            }
+        }
+    }
+
+    async fn handle_stop(&self, msg: FreshAgentKill, mode: CodexStopMode) {
         let session_id = msg.session_id.clone();
 
         // b8ke delta review F7: a half-sent observed pair (exactly one of
@@ -5023,14 +5099,17 @@ impl FreshCodexState {
                     tracing::warn!(target: "freshell_freshagent::codex",
                     session_id = %session_id, code = err.code(),
                     "fresh_agent_kill_refused: the observed fence is half-sent (invalid)");
-                    self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
-                        provider: PROVIDER.to_string(),
-                        session_id: msg.session_id.clone(),
-                        session_type: SESSION_TYPE.to_string(),
-                        success: false,
-                        code: Some(err.code().to_string()),
-                        message: Some(err.message().to_string()),
-                    }));
+                    self.broadcast_stop_result(
+                        &mode,
+                        &ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                            provider: PROVIDER.to_string(),
+                            session_id: msg.session_id.clone(),
+                            session_type: SESSION_TYPE.to_string(),
+                            success: false,
+                            code: Some(err.code().to_string()),
+                            message: Some(err.message().to_string()),
+                        }),
+                    );
                     return;
                 }
             };
@@ -5137,14 +5216,17 @@ impl FreshCodexState {
                         "fresh_agent_kill_refused: the ownership coordinator refused the \
                          stop (kata b8ke) — nothing is killed"
                     );
-                    self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
-                        provider: PROVIDER.to_string(),
-                        session_id,
-                        session_type: SESSION_TYPE.to_string(),
-                        success: false,
-                        code: Some(refusal_code.to_string()),
-                        message: Some(refusal_message),
-                    }));
+                    self.broadcast_stop_result(
+                        &mode,
+                        &ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                            provider: PROVIDER.to_string(),
+                            session_id,
+                            session_type: SESSION_TYPE.to_string(),
+                            success: false,
+                            code: Some(refusal_code.to_string()),
+                            message: Some(refusal_message),
+                        }),
+                    );
                     return;
                 }
             } else {
@@ -5170,18 +5252,21 @@ impl FreshCodexState {
                                  owner is NOT this lane's Fresh Agent runtime — a delayed \
                                  kill never fabricates a foreign-kind claim"
                             );
-                            self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
-                                provider: PROVIDER.to_string(),
-                                session_id,
-                                session_type: SESSION_TYPE.to_string(),
-                                success: false,
-                                code: Some("FOREIGN_OWNER".to_string()),
-                                message: Some(
-                                    "the session's live owner is not this agent runtime; \
+                            self.broadcast_stop_result(
+                                &mode,
+                                &ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                                    provider: PROVIDER.to_string(),
+                                    session_id,
+                                    session_type: SESSION_TYPE.to_string(),
+                                    success: false,
+                                    code: Some("FOREIGN_OWNER".to_string()),
+                                    message: Some(
+                                        "the session's live owner is not this agent runtime; \
                                      refresh and retry"
-                                        .to_string(),
-                                ),
-                            }));
+                                            .to_string(),
+                                    ),
+                                }),
+                            );
                             return;
                         }
                         let claim = freshell_ownership::StopClaim {
@@ -5271,16 +5356,17 @@ impl FreshCodexState {
                                      coordinator refused the observed-owner stop — nothing \
                                      is killed, nothing durable is touched"
                                 );
-                                self.broadcast(&ServerMessage::FreshAgentKilled(
-                                    FreshAgentKilled {
+                                self.broadcast_stop_result(
+                                    &mode,
+                                    &ServerMessage::FreshAgentKilled(FreshAgentKilled {
                                         provider: PROVIDER.to_string(),
                                         session_id,
                                         session_type: SESSION_TYPE.to_string(),
                                         success: false,
                                         code: Some(refusal_code.to_string()),
                                         message: Some(refusal_message),
-                                    },
-                                ));
+                                    }),
+                                );
                                 return;
                             }
                         }
@@ -5295,7 +5381,7 @@ impl FreshCodexState {
                             "fresh_agent_kill_refused_no_stamp: a handoff owns this \
                              session's transition — the kill is refused typed"
                         );
-                        self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                        self.broadcast_stop_result(&mode, &ServerMessage::FreshAgentKilled(FreshAgentKilled {
                             provider: PROVIDER.to_string(),
                             session_id,
                             session_type: SESSION_TYPE.to_string(),
@@ -5315,17 +5401,20 @@ impl FreshCodexState {
                             "fresh_agent_kill_refused_no_stamp: a lifecycle operation is \
                              in flight — the kill is refused typed"
                         );
-                        self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
-                            provider: PROVIDER.to_string(),
-                            session_id,
-                            session_type: SESSION_TYPE.to_string(),
-                            success: false,
-                            code: Some("LIFECYCLE_IN_FLIGHT".to_string()),
-                            message: Some(
-                                "a lifecycle operation is in flight; retry after it settles"
-                                    .to_string(),
-                            ),
-                        }));
+                        self.broadcast_stop_result(
+                            &mode,
+                            &ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                                provider: PROVIDER.to_string(),
+                                session_id,
+                                session_type: SESSION_TYPE.to_string(),
+                                success: false,
+                                code: Some("LIFECYCLE_IN_FLIGHT".to_string()),
+                                message: Some(
+                                    "a lifecycle operation is in flight; retry after it settles"
+                                        .to_string(),
+                                ),
+                            }),
+                        );
                         return;
                     }
                     freshell_ownership::OwnershipState::Fenced { .. } => {
@@ -5334,18 +5423,21 @@ impl FreshCodexState {
                             "fresh_agent_kill_refused_no_stamp: the key is FENCED — the \
                              kill is refused typed"
                         );
-                        self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
-                            provider: PROVIDER.to_string(),
-                            session_id,
-                            session_type: SESSION_TYPE.to_string(),
-                            success: false,
-                            code: Some("SESSION_FENCED".to_string()),
-                            message: Some(
-                                "the session is fenced pending recovery; retry with the \
+                        self.broadcast_stop_result(
+                            &mode,
+                            &ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                                provider: PROVIDER.to_string(),
+                                session_id,
+                                session_type: SESSION_TYPE.to_string(),
+                                success: false,
+                                code: Some("SESSION_FENCED".to_string()),
+                                message: Some(
+                                    "the session is fenced pending recovery; retry with the \
                                  acknowledged force-clear or after the fence clears"
-                                    .to_string(),
-                            ),
-                        }));
+                                        .to_string(),
+                                ),
+                            }),
+                        );
                         return;
                     }
                     _ => {
@@ -5361,10 +5453,14 @@ impl FreshCodexState {
         // the deferred confirmation keeps this exact identity fenced.
         let condemned_ownership_id = self.record_condemned_prior(&session_id).await;
 
-        // Durable close first (see the comment block above): retire the
-        // pane-ledger row before any teardown; a Failed close fails the kill
-        // and runs nothing below.
-        let close_answer = self.retire_closed_row(&session_id).await;
+        // Ordinary close retires the pane-ledger row before teardown. Recovery
+        // keeps that durable binding so a new writer can resume this thread.
+        // A failed ordinary close stops before touching the live process.
+        let close_answer = if matches!(mode, CodexStopMode::Recovery { .. }) {
+            crate::identity_sink::CloseAnswer::Recorded
+        } else {
+            self.retire_closed_row(&session_id).await
+        };
         if close_answer == crate::identity_sink::CloseAnswer::Failed {
             // b8ke e3r2 F4 + e3r3 F2/F8: THE LIVENESS VERDICT COMES FIRST —
             // exactly ONE mutation path follows from it (pre-e3r3 the
@@ -5430,16 +5526,19 @@ impl FreshCodexState {
             if let Some(ownership_id) = condemned_ownership_id.as_deref() {
                 self.clear_condemned_prior_if_matching(&session_id, ownership_id);
             }
-            self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
-                provider: PROVIDER.to_string(),
-                session_id,
-                session_type: SESSION_TYPE.to_string(),
-                success: false,
-                code: Some("DURABLE_CLOSE_FAILED".to_string()),
-                message: Some(
-                    "the pane-ledger close failed; nothing was killed — retry".to_string(),
-                ),
-            }));
+            self.broadcast_stop_result(
+                &mode,
+                &ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                    provider: PROVIDER.to_string(),
+                    session_id,
+                    session_type: SESSION_TYPE.to_string(),
+                    success: false,
+                    code: Some("DURABLE_CLOSE_FAILED".to_string()),
+                    message: Some(
+                        "the pane-ledger close failed; nothing was killed — retry".to_string(),
+                    ),
+                }),
+            );
             return;
         }
         let close_reported_failure = close_answer == crate::identity_sink::CloseAnswer::Persisted;
@@ -5612,17 +5711,20 @@ impl FreshCodexState {
             .clear_for_session(|record| record.session_id == session_id)
             .await;
 
-        self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
-            provider: PROVIDER.to_string(),
-            session_id,
-            session_type: SESSION_TYPE.to_string(),
-            // A persisted-despite-error close ends the session (consistent
-            // with the durable close) but the kill visibly fails
-            // (delta-r6-r4, focused-episode-6 round 3 Finding 3).
-            success: !close_reported_failure && kill_failure.is_none(),
-            code: kill_failure.as_ref().map(|(code, _)| code.to_string()),
-            message: kill_failure.map(|(_, message)| message),
-        }));
+        self.broadcast_stop_result(
+            &mode,
+            &ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                provider: PROVIDER.to_string(),
+                session_id,
+                session_type: SESSION_TYPE.to_string(),
+                // A persisted-despite-error close ends the session (consistent
+                // with the durable close) but the kill visibly fails
+                // (delta-r6-r4, focused-episode-6 round 3 Finding 3).
+                success: !close_reported_failure && kill_failure.is_none(),
+                code: kill_failure.as_ref().map(|(code, _)| code.to_string()),
+                message: kill_failure.map(|(_, message)| message),
+            }),
+        );
     }
 
     /// The kill-side lane of `retire_closed` (delta-review round 5):
@@ -13304,6 +13406,46 @@ pub(crate) mod tests {
             !st.sessions.lock().await.contains_key("thread-1"),
             "session removed"
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_stop_reaps_the_writer_without_retiring_the_durable_thread() {
+        let (transport, _peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let (st, mut rx, sink) = state_with_sink();
+        let child = spawn_sleeper();
+        let pid = child.id().expect("pid");
+        insert_fake_session(
+            &st,
+            "thread-recover",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            child,
+            "codex-sidecar-test-recovery-stop",
+        )
+        .await;
+
+        st.handle_recovery_stop(freshell_protocol::FreshAgentRecoveryStop {
+            request_id: "recover-1".to_string(),
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: "thread-recover".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            observed_epoch: None,
+            observed_generation: None,
+        })
+        .await;
+
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        assert!(
+            sink.retires.lock().unwrap().is_empty(),
+            "recovery must keep the durable row open"
+        );
+        assert!(!st.sessions.lock().await.contains_key("thread-recover"));
+        let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["type"], "freshAgent.recovery.stopped");
+        assert_eq!(frame["requestId"], "recover-1");
+        assert_eq!(frame["sessionId"], "thread-recover");
+        assert_eq!(frame["success"], true);
     }
 
     #[tokio::test]

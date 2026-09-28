@@ -24,6 +24,7 @@ import {
   hasOpenReassertFailure,
   reassertAllOpenPanes,
   sendFreshAgentKillAndAwait,
+  sendFreshAgentRecoveryStopAndAwait,
   sendPaneClosedAndAwait,
   sendPaneOpened,
   sendPanesClosedAndAwait,
@@ -311,6 +312,43 @@ describe('kill-ack', () => {
       })
       emit({ type: 'freshAgent.killed', sessionId: 'ses-fence', sessionType: 'freshopencode', provider: 'opencode', success: true })
       await expect(pending).resolves.toEqual({ ok: true })
+    })
+  })
+
+  describe('sendFreshAgentRecoveryStopAndAwait', () => {
+    it('waits for the matching recovery stop rather than another session close', async () => {
+      const pending = sendFreshAgentRecoveryStopAndAwait({
+        sessionId: 'thread-1',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+      })
+      const sent = mockSend.mock.calls[0]?.[0]
+      expect(sent).toMatchObject({
+        type: 'freshAgent.recovery.stop',
+        sessionId: 'thread-1',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+      })
+      expect(sent.requestId).toEqual(expect.any(String))
+      const settled = vi.fn()
+      void pending.then(settled)
+      emit({ type: 'freshAgent.killed', sessionId: 'thread-1', provider: 'codex', success: true })
+      emit({ type: 'freshAgent.recovery.stopped', requestId: 'another-request', sessionId: 'thread-1', provider: 'codex', success: true })
+      await Promise.resolve()
+      expect(settled).not.toHaveBeenCalled()
+      emit({ type: 'freshAgent.recovery.stopped', requestId: sent.requestId, sessionId: 'thread-1', provider: 'codex', success: true })
+      await expect(pending).resolves.toEqual({ ok: true })
+    })
+
+    it('keeps a refused recovery stop as a failure', async () => {
+      const pending = sendFreshAgentRecoveryStopAndAwait({
+        sessionId: 'thread-2',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+      })
+      const requestId = mockSend.mock.calls[0][0].requestId
+      emit({ type: 'freshAgent.recovery.stopped', requestId, sessionId: 'thread-2', provider: 'codex', success: false, code: 'TEARDOWN_NOT_CONFIRMED' })
+      await expect(pending).resolves.toEqual({ ok: false, error: 'TEARDOWN_NOT_CONFIRMED' })
     })
   })
 

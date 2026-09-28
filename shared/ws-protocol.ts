@@ -1002,6 +1002,32 @@ export const FreshAgentKillSchema = z.object({
   observedGeneration: z.number().int().nonnegative().optional(),
 })
 
+/** Codex-only process stop used by the stuck card. This extension stays
+ * separate from the frozen client-message inventory; an ordinary kill closes
+ * the durable session, while recovery preserves it for the next attach. */
+export const FreshAgentRecoveryStopSchema = z.object({
+  type: z.literal('freshAgent.recovery.stop'),
+  requestId: z.string().min(1),
+  sessionId: z.string().min(1),
+  sessionType: z.literal('freshcodex'),
+  provider: z.literal('codex'),
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
+})
+export type FreshAgentRecoveryStopMessage = z.infer<typeof FreshAgentRecoveryStopSchema>
+
+export const FreshAgentRecoveryStoppedSchema = z.object({
+  type: z.literal('freshAgent.recovery.stopped'),
+  requestId: z.string().min(1),
+  sessionId: z.string().min(1),
+  sessionType: z.literal('freshcodex'),
+  provider: z.literal('codex'),
+  success: z.boolean(),
+  code: z.string().optional(),
+  message: z.string().optional(),
+})
+export type FreshAgentRecoveryStoppedMessage = z.infer<typeof FreshAgentRecoveryStoppedSchema>
+
 export const FreshAgentForkSchema = z.object({
   type: z.literal('freshAgent.fork'),
   requestId: z.string().min(1).optional(),
@@ -1495,7 +1521,7 @@ export type TerminalStatusMessage = {
    * client renders attempt/maxAttempts from these FIELDS — `reason` prose is
    * purely presentational and must never be parsed (council 7w4h/xkhx). */
   maxAttempts?: number
-  /** Auto-resume 'recovering' frames only: the crashed generation's exit code. */
+  /** Auto-resume recovery and settled crash frames: the crashed generation's exit code. */
   exitCode?: number
   /** Flap-circuit-breaker settle frames ('exited') only: successful
    * auto-resumes inside the rolling window — the typed source for the
