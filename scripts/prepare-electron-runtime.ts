@@ -93,6 +93,7 @@ export const RUNTIME_LAYOUT = Object.freeze({
   launchChooser: 'launch-chooser',
   trayAssets: 'assets',
   macIcon: 'icon.icns',
+  linuxAppArmorProfile: 'apparmor-profile',
   windowsElevate: 'elevate.exe',
 })
 
@@ -154,6 +155,7 @@ export function getRuntimeAllowlist(
       RUNTIME_LAYOUT.receipt,
       RUNTIME_LAYOUT.electronArchive,
       ...(platform === 'darwin' ? [RUNTIME_LAYOUT.macIcon] : []),
+      ...(platform === 'linux' ? [RUNTIME_LAYOUT.linuxAppArmorProfile] : []),
       ...(platform === 'win32' ? [RUNTIME_LAYOUT.windowsElevate] : []),
     ]),
     recursiveDirectories: Object.freeze([
