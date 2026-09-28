@@ -19,10 +19,13 @@ import * as path from 'node:path'
  *    inventory fold owns its title — so binding the shell pane to a
  *    seeded Claude session row must NOT overwrite the folded terminal
  *    rename.
- * 2. The session-directory title mirror lands in a harness-dispatched
- *    fresh-agent pane whose provider+sessionId match a seeded, NON-RUNNING
- *    Claude session row — the MCP/REST-created-pane symptom Task 6 fixes —
- *    with setByUser:false so user renames keep precedence.
+ * 2. (Unified agent names, Task 5) A harness-dispatched FRESHCLAUDE pane is
+ *    a scoped pane: the session-directory title mirror NEVER writes its
+ *    paneTitles locally (the mirror is excluded for scoped panes), and the
+ *    canonical session name — delivered by the server through the
+ *    `session.name.updated` broadcast (modeled here by dispatching the same
+ *    fold action the App's broadcast handler dispatches) — owns the DISPLAY
+ *    on the pane header and the tab label while paneTitles stays untouched.
  *
  * Cloud-runnable by construction: no external coding-CLI binaries
  * (Scenario A's pane is a default shell; Scenario B's pane is a
@@ -226,7 +229,7 @@ test.describe('pane-title delivery folds', () => {
     }
   })
 
-  test('the session-directory title mirrors into a harness-dispatched fresh-agent pane', async ({ page }) => {
+  test('a scoped freshclaude pane never mirrors directory titles locally; the canonical name owns the display', async ({ page }) => {
     test.setTimeout(300_000)
     const SEED_SESSION_ID = 'sess-t8-b'
     const SEED_PROJECT = 't8-mirror-probe'
@@ -276,7 +279,8 @@ test.describe('pane-title delivery folds', () => {
       // an initLayout for a tab id that was never added would orphan the
       // layout — then panes/initLayout with the normalized fresh-agent
       // content shape whose provider+sessionId match the seeded row. The
-      // mirror fires on the pane-binding action with the row already landed.
+      // pane is a SCOPED freshclaude pane: no local mirror may fire on the
+      // pane-binding action, so paneTitles keeps the derived default.
       await page.evaluate((sessionId) => {
         window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'tabs/addTab', payload: { id: 'tab-mirror', title: 'Mirror probe' } })
         window.__FRESHELL_TEST_HARNESS__?.dispatch({
@@ -291,11 +295,10 @@ test.describe('pane-title delivery folds', () => {
         })
       }, SEED_SESSION_ID)
 
-      // One atomic state read (the mirror's fold is synchronous on the
-      // pane-binding dispatch): assert the pane title mirrors the row's
-      // actual directory title — read, not hard-coded — and that the fold
-      // never set the user flag.
-      const mirrored = await page.evaluate((sessionId) => {
+      // One atomic state read: the directory row is titled, but the scoped
+      // pane NEVER mirrored it — paneTitles keeps the derived default and
+      // the user flag was never set.
+      const unmirrored = await page.evaluate((sessionId) => {
         const state = window.__FRESHELL_TEST_HARNESS__?.getState()
         let rowTitle: unknown
         for (const project of state?.sessions?.windows?.sidebar?.projects ?? []) {
@@ -311,9 +314,49 @@ test.describe('pane-title delivery folds', () => {
           setByUser: state?.panes?.paneTitleSetByUser?.['tab-mirror']?.['pane-mirror'] ?? false,
         }
       }, SEED_SESSION_ID)
-      expect(mirrored.rowTitle, 'the seeded session row is titled in the sidebar window').toBeTruthy()
-      expect(mirrored.paneTitle).toBe(mirrored.rowTitle)
-      expect(mirrored.setByUser).toBeFalsy()
+      expect(unmirrored.rowTitle, 'the seeded session row is titled in the sidebar window').toBeTruthy()
+      expect(unmirrored.paneTitle).not.toBe(unmirrored.rowTitle)
+      expect(unmirrored.setByUser).toBeFalsy()
+
+      // Canonical delivery: the server broadcasts session.name.updated and
+      // the App folds it through the same action modeled here. The canonical
+      // record then owns the DISPLAY — pane header and tab label converge on
+      // it — while paneTitles stays untouched (the display is computed from
+      // the canonical cache, never stored locally).
+      await page.evaluate((sessionId) => {
+        window.__FRESHELL_TEST_HARNESS__?.dispatch({
+          type: 'sessionNames/receiveSessionNames',
+          payload: [{
+            record: {
+              ref: { kind: 'session', provider: 'claude', sessionId },
+              name: 'Canonical freshclaude name',
+              source: 'first_message',
+              revision: 3,
+            },
+            documentGeneration: 4,
+            redirects: [],
+            changed: true,
+          }],
+        })
+      }, SEED_SESSION_ID)
+
+      const canonical = await page.evaluate(() => {
+        const state = window.__FRESHELL_TEST_HARNESS__?.getState()
+        return {
+          paneTitle: state?.panes?.paneTitles?.['tab-mirror']?.['pane-mirror'],
+          recordName: state?.sessionNames?.records?.[JSON.stringify(['session', 'claude', 'sess-t8-b'])]?.name,
+        }
+      })
+      expect(canonical.recordName).toBe('Canonical freshclaude name')
+      // The stored paneTitles entry is STILL the derived default — the
+      // display comes from the cache, not a local write.
+      expect(canonical.paneTitle).toBe(unmirrored.paneTitle)
+
+      // The rendered surfaces converge on the canonical name.
+      await expect(page.locator('[data-context="pane-header"]:visible').first()).toContainText('Canonical freshclaude name', { timeout: 10_000 })
+      await expect(
+        page.locator('[data-context="tab"][data-tab-id="tab-mirror"]').getByText('Canonical freshclaude name'),
+      ).toBeVisible({ timeout: 10_000 })
     } finally {
       await server.stop()
     }

@@ -110,6 +110,38 @@ async fn route_proxy_event(state: &WsState, tagged: TerminalProxyEvent) {
                 hub.note_codex_approval(&terminal_id, None, &request_id, false);
             }
         }
+        RemoteProxyEvent::NativeNameObserved { thread_id, name } => {
+            // Unified agent names (Task 3): a native thread rename the CLI
+            // performed (TUI `/rename` or a tool) is an AUTOMATIC observation
+            // — the public request carries no reliable human provenance. It
+            // targets the terminal's naming record (durable or pending) and
+            // never blocks the relay, which already happened.
+            let sink = state.identity.naming();
+            let target = state
+                .identity
+                .named_session_ref_of("codex", &thread_id)
+                .or_else(|| state.identity.name_ref_for(&terminal_id));
+            if let Some(target) = target {
+                let _ = freshell_freshagent::naming::observe_native_live(
+                    &sink,
+                    target,
+                    &name,
+                    freshell_freshagent::naming::NativeNameOrigin::Snapshot,
+                    None,
+                )
+                .await;
+            }
+        }
+        RemoteProxyEvent::UpstreamInitialized {
+            conn_id: _,
+            codex_home,
+        } => {
+            // T2-M6 (Task 3): capture the proxied connection's initialized
+            // root BEFORE any candidate can adopt — the naming bind lane's
+            // rollout walk and the native-name adapter correlate against this
+            // captured home instead of ambient env.
+            state.identity.record_codex_home(&terminal_id, &codex_home);
+        }
     }
 }
 
@@ -676,5 +708,189 @@ mod tests {
         .await;
         // Minimal handling: no identity write, no panic.
         assert!(state.identity.get("term-e").is_none());
+    }
+
+    // ── unified agent names (T2-M6 wiring pin, Task 3 fix round I5c) ──────
+
+    /// A naming sink that records every `bind_pending` acquisition verbatim
+    /// and answers the transferred target record (the identity.rs
+    /// `BindRecordingSink` shape, extended to retain the acquisition so the
+    /// adoption's NativeLocation is assertable).
+    #[derive(Default)]
+    struct BindAcquisitionSink {
+        binds: StdArc<std::sync::Mutex<Vec<freshell_protocol::native_location::NativeAcquisition>>>,
+    }
+
+    impl freshell_freshagent::naming::SessionNaming for BindAcquisitionSink {
+        fn get(
+            &self,
+            _refs: Vec<freshell_protocol::session_names::SessionNameRef>,
+        ) -> freshell_freshagent::naming::NameFuture<
+            Vec<freshell_protocol::session_names::SessionNameUpdate>,
+        > {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn ensure_pending(
+            &self,
+            _input: freshell_freshagent::naming::PendingNameInput,
+        ) -> freshell_freshagent::naming::NameFuture<
+            freshell_protocol::session_names::SessionNameUpdate,
+        > {
+            Box::pin(async move {
+                Err(freshell_freshagent::naming::NameError::NotFound(
+                    "not needed here".to_string(),
+                ))
+            })
+        }
+
+        fn bind_pending(
+            &self,
+            input: freshell_freshagent::naming::BindNameInput,
+        ) -> freshell_freshagent::naming::NameFuture<
+            freshell_protocol::session_names::SessionNameUpdate,
+        > {
+            self.binds.lock().unwrap().push(input.acquisition.clone());
+            let record = freshell_protocol::session_names::SessionNameRecord {
+                name_ref: input.target,
+                name: "bound".to_string(),
+                source: freshell_protocol::session_names::NameSource::Directory,
+                revision: 2,
+                manual_revision: None,
+                renamed_at: None,
+                legacy_origin: None,
+            };
+            Box::pin(async move {
+                Ok(freshell_protocol::session_names::SessionNameUpdate {
+                    redirects: Vec::new(),
+                    record,
+                    document_generation: 1,
+                    changed: true,
+                    native_sync: None,
+                })
+            })
+        }
+
+        fn rename(
+            &self,
+            _input: freshell_freshagent::naming::RenameNameInput,
+        ) -> freshell_freshagent::naming::NameFuture<
+            freshell_protocol::session_names::SessionNameUpdate,
+        > {
+            Box::pin(async move {
+                Err(freshell_freshagent::naming::NameError::NotFound(
+                    "not needed here".to_string(),
+                ))
+            })
+        }
+
+        fn activity(
+            &self,
+            _input: freshell_freshagent::naming::NameActivity,
+        ) -> freshell_freshagent::naming::NameFuture<
+            freshell_protocol::session_names::SessionNameUpdate,
+        > {
+            Box::pin(async move {
+                Err(freshell_freshagent::naming::NameError::NotFound(
+                    "not needed here".to_string(),
+                ))
+            })
+        }
+
+        fn observe_native(
+            &self,
+            _input: freshell_freshagent::naming::NativeNameObservation,
+        ) -> freshell_freshagent::naming::NameFuture<
+            freshell_protocol::session_names::SessionNameUpdate,
+        > {
+            Box::pin(async move {
+                Err(freshell_freshagent::naming::NameError::NotFound(
+                    "not needed here".to_string(),
+                ))
+            })
+        }
+
+        fn record_acquisition(
+            &self,
+            _target: freshell_protocol::session_names::SessionNameRef,
+            _acquisition: freshell_protocol::native_location::NativeAcquisition,
+        ) -> freshell_freshagent::naming::NameFuture<
+            freshell_protocol::session_names::SessionNameUpdate,
+        > {
+            Box::pin(async move {
+                Err(freshell_freshagent::naming::NameError::NotFound(
+                    "not needed here".to_string(),
+                ))
+            })
+        }
+    }
+
+    /// T2-M6 wiring pin (Task 3 fix round I5c): a proxied initialize's
+    /// captured `codexHome` flows through `route_proxy_event` into the
+    /// registry (`record_codex_home`), and the CLI codex adoption's naming
+    /// bind PREFERS that captured home in its `NativeLocation` over ambient
+    /// env — the full capture→registry→adoption chain.
+    #[tokio::test]
+    async fn a_proxied_initialize_capture_feeds_the_cli_codex_adoption_location() {
+        let state = test_state();
+        let sink = StdArc::new(BindAcquisitionSink::default());
+        state.identity.set_session_naming(sink.clone());
+        // Stage the pane's pre-durable pending naming state (a CLI codex
+        // pane's create carries a pending handle before its rollout verifies).
+        state.identity.set_name_binding(
+            "term-captured",
+            Some(freshell_protocol::session_names::SessionNameRef::Pending {
+                id: "handle-captured".to_string(),
+            }),
+            Some("handle-captured".to_string()),
+        );
+
+        // The proxied upstream reports its initialized root BEFORE any
+        // candidate can adopt — the router captures it in the registry.
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-captured",
+                RemoteProxyEvent::UpstreamInitialized {
+                    conn_id: 1,
+                    codex_home: "/captured/codex-home".to_string(),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(
+            state.identity.codex_home_of("term-captured").as_deref(),
+            Some("/captured/codex-home"),
+            "the router captures the proxied initialize's codexHome"
+        );
+
+        // The thread-start candidate adopts through the CLI lane: the naming
+        // bind's NativeLocation must PREFER the captured home.
+        route_proxy_event(
+            &state,
+            tagged(
+                "term-captured",
+                candidate(
+                    CandidateSource::ThreadStartResponse,
+                    "sess-captured",
+                    Some("/captured/codex-home/sessions/2026/09/16/rollout-sess-captured.jsonl"),
+                    false,
+                ),
+            ),
+        )
+        .await;
+        let binds = sink.binds.lock().unwrap();
+        let acquisition = binds
+            .last()
+            .expect("the adoption bound the pending naming record");
+        match &acquisition.location {
+            freshell_protocol::native_location::NativeLocation::Codex { codex_home, .. } => {
+                assert_eq!(
+                    codex_home, "/captured/codex-home",
+                    "the CLI codex adoption prefers the captured proxied home in its NativeLocation"
+                );
+            }
+            other => panic!("the CLI codex adoption carries a codex location, got {other:?}"),
+        }
     }
 }

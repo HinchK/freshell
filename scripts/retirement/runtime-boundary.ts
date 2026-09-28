@@ -33,6 +33,7 @@ const PACKAGE_SCRIPTS_PATH = 'package.json:scripts'
 const ignoredDirectoryNames = new Set([
   '.git',
   '.claude',
+  '.tmp-native-smoke',
   '.worktrees',
   'dist',
   'electron-runtime',
@@ -65,7 +66,15 @@ const sourceExtensions = new Set(['.cjs', '.js', '.jsx', '.mjs', '.ts', '.tsx'])
  */
 export const NON_BACKEND_LISTENER_PATHS = [
   'scripts/testing/coordinator-endpoint.ts',
+  // The native session-names contract runner: its pickFreePort binds
+  // loopback :0 transiently (probe-and-close) to hand a free port to the
+  // CHILD freshell-server / provider CLI processes it launches inside the
+  // disposable sandbox. Test coordination, not a backend.
+  'scripts/testing/native-session-names.mjs',
   'test/e2e-browser/helpers/echo-ws-fixture.ts',
+  // The unified-agent-names e2e helper's startFakeGemini: a local fake
+  // Gemini answering the FRESHELL_GEMINI_BASE_URL seam (auto-title specs).
+  'test/e2e-browser/helpers/unified-agent-names.ts',
   'test/e2e-browser/helpers/harness-06/target-server.ts',
   'test/e2e-browser/helpers/harness-06/update-feed.ts',
   'test/e2e-browser/helpers/harness-06/fake-ai.ts',

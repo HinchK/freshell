@@ -78,7 +78,7 @@ export function classifyCommand(input: CoordinatorInput): CommandDisposition {
     if (args.some((arg) => isRetiredServerConfigSelector(arg))) {
       return {
         kind: 'rejected',
-        reason: 'The Node server Vitest config was retired. Use npm run test:server for the Rust cargo lane.',
+        reason: 'The Node server Vitest config was retired. Use pnpm run test:server for the Rust cargo lane.',
       }
     }
     const explicitConfig = hasExplicitConfigOverride(args)
@@ -91,7 +91,7 @@ export function classifyCommand(input: CoordinatorInput): CommandDisposition {
   if (hasExplicitConfigOverride(args)) {
     return {
       kind: 'rejected',
-      reason: 'Public test commands do not accept --config overrides. Use npm run test:vitest -- ... for direct Vitest config control.',
+      reason: 'Public test commands do not accept --config overrides. Use pnpm run test:vitest ... for direct Vitest config control.',
     }
   }
 
@@ -140,7 +140,7 @@ function classifyCompositeCommand(commandKey: CommandKey, args: string[]): Comma
     if (hasRustTarget) {
       return {
         kind: 'rejected',
-        reason: 'Rust/path selectors are not supported by composite commands because Cargo treats file paths as test-name filters. Use npm run test:server or npm run test:integration for a Rust lane.',
+        reason: 'Rust/path selectors are not supported by composite commands because Cargo treats file paths as test-name filters. Use pnpm run test:server or pnpm run test:integration for a Rust lane.',
       }
     }
     return delegated([vitestPhase('default', ['run', '--config', DEFAULT_VITEST_CONFIG, ...filtered])])

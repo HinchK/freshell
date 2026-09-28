@@ -4,7 +4,11 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { resolveNpmCommand } from './coordinator-upstream.js'
+import {
+  buildRunScriptArgs,
+  detectProjectManager,
+  resolveManagerCommand,
+} from '../lib/package-manager.js'
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
 const PROJECT_ROOT = path.resolve(SCRIPT_DIR, '../..')
@@ -15,20 +19,47 @@ function log(severity: 'info' | 'error', event: string, fields: Record<string, u
   stream.write(`${JSON.stringify({ severity, event, timestamp: new Date().toISOString(), ...fields })}\n`)
 }
 
-export function buildSourceRuntimePhases(npm?: string): Array<{ command: string; args: string[] }> {
-  const runNpm = (args: string[]) => npm ? { command: npm, args } : resolveNpmCommand(args)
+export interface SourceRuntimePhase {
+  command: string
+  args: string[]
+  viaShell?: boolean
+}
+
+export function buildSourceRuntimePhases(managerCommand?: string): SourceRuntimePhase[] {
+  if (managerCommand !== undefined) {
+    const runOverride = (script: string): SourceRuntimePhase => ({ command: managerCommand, args: ['run', script] })
+    return [
+      runOverride('prebuild'),
+      runOverride('build:client'),
+      runOverride('build:tools'),
+      { command: 'cargo', args: ['build', '--release', '-p', 'freshell-server', '--locked'] },
+    ]
+  }
+  const manager = detectProjectManager(PROJECT_ROOT).manager
+  const runScript = (script: string): SourceRuntimePhase => {
+    const resolved = resolveManagerCommand({
+      manager,
+      args: buildRunScriptArgs(manager, script, []),
+      env: process.env,
+    })
+    return {
+      command: resolved.command,
+      args: resolved.args,
+      ...(resolved.viaShell === true ? { viaShell: true } : {}),
+    }
+  }
   return [
     // build:client/build:tools write the artifacts served by Freshell. Run the
     // shared guard first so a direct source-runtime invocation is safe on a
     // normal checkout with the production Rust server running.
-    runNpm(['run', 'prebuild']),
-    runNpm(['run', 'build:client']),
-    runNpm(['run', 'build:tools']),
+    runScript('prebuild'),
+    runScript('build:client'),
+    runScript('build:tools'),
     { command: 'cargo', args: ['build', '--release', '-p', 'freshell-server', '--locked'] },
   ]
 }
 
-function runChild(command: string, args: string[], env: NodeJS.ProcessEnv): Promise<number> {
+function runChild(command: string, args: string[], env: NodeJS.ProcessEnv, viaShell = false): Promise<number> {
   return new Promise((resolve) => {
     log('info', 'source_runtime_phase_started', { command, args })
     let child: ChildProcess
@@ -38,6 +69,7 @@ function runChild(command: string, args: string[], env: NodeJS.ProcessEnv): Prom
         env,
         stdio: 'inherit',
         windowsHide: true,
+        shell: viaShell,
       })
     } catch (error) {
       log('error', 'source_runtime_phase_spawn_failed', {
@@ -91,7 +123,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   }
 
   for (const phase of buildSourceRuntimePhases()) {
-    const exitCode = await runChild(phase.command, phase.args, process.env)
+    const exitCode = await runChild(phase.command, phase.args, process.env, phase.viaShell ?? false)
     if (exitCode !== 0) return exitCode
   }
 

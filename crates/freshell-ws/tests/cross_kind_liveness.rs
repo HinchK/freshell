@@ -3718,6 +3718,7 @@ async fn a_superseded_handoffs_stale_authoritative_write_is_refused_end_to_end()
     };
     let err = sink
         .record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "claude".into(),
             session_id: sid.clone(),
             mode: "freshclaude".into(),
@@ -3900,6 +3901,7 @@ async fn the_failed_transition_repair_fences_and_reverts_end_to_end() {
         .load_binding("claude", &sid)
         .expect("the row before the late write");
     sink.record_binding(FreshAgentBindingUpsert {
+        name_transition: None,
         provider: "claude".into(),
         session_id: sid.clone(),
         mode: "freshclaude".into(),

@@ -115,8 +115,8 @@ fi
 
 if [[ "$SKIP_BUILD" != 1 ]]; then
   echo "Building client (typecheck + vite)..."
-  npm run typecheck:client
-  npm run build:client
+  pnpm run typecheck:client
+  pnpm run build:client
   if [[ "$CLIENT_ONLY" == 1 ]]; then
     echo ""
     echo "Client rebuilt at dist/client. The running server serves it from disk --"
@@ -131,7 +131,7 @@ fi
 # its locked dependency tree available for every launcher startup, including
 # --skip-build runs from a clean checkout.
 echo "Preparing Rust runtime prerequisites..."
-npm run --silent prepare:rust-runtime
+pnpm run --silent prepare:rust-runtime
 
 [[ -x "$BINARY" ]] || { echo "Missing binary: $BINARY (build first)" >&2; exit 1; }
 

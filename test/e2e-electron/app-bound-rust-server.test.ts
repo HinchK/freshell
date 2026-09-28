@@ -48,7 +48,7 @@ const OWNERSHIP_COMMAND_TIMEOUT_MS = 1_000
 function requireElectronE2eBuildId(): string {
   const buildId = process.env.FRESHELL_ELECTRON_E2E_BUILD_ID
   if (!buildId || !/^[0-9a-f]{40}$/.test(buildId)) {
-    throw new Error('Electron E2E requires the exact-client-build preflight; run npm run test:e2e:electron')
+    throw new Error('Electron E2E requires the exact-client-build preflight; run pnpm run test:e2e:electron')
   }
   return buildId
 }

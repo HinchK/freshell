@@ -127,4 +127,25 @@ describe('deriveTabName', () => {
 
     expect(deriveTabName(layout, mockExtensions)).toBe('Codex CLI')
   })
+
+  /**
+   * Unified agent names (Task 5): the legacy derivation stays the IMMEDIATE
+   * SAFE FALLBACK for scoped agent panes — the canonical display selector
+   * uses exactly this value until a cached canonical record lands (pinned in
+   * UnifiedAgentRename.test.tsx). The derivation itself is unchanged.
+   */
+  it('remains the immediate fallback for scoped CLI panes (pre-cache display)', () => {
+    const layout: PaneNode = {
+      type: 'leaf',
+      id: 'pane-1',
+      content: {
+        kind: 'terminal',
+        mode: 'claude',
+        status: 'running',
+        createRequestId: 'req-1',
+        initialCwd: '/home/dan/code/freshell',
+      },
+    }
+    expect(deriveTabName(layout)).toBe('freshell')
+  })
 })

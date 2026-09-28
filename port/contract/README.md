@@ -71,20 +71,23 @@ unschematized), or changing a schema without regenerating, makes the tests fail.
 ## Regenerating
 
 The contract regenerates only when the **authoring** source
-(`shared/ws-protocol.ts` and its imports) legitimately changes:
+(`shared/ws-protocol.ts` and its imports) legitimately changes. The
+package-manager migration changed only the invocation commands below; the
+wire contract, the freeze guarantee, and the generator's semantics are
+unchanged:
 
 ```bash
-npm run contract:generate      # tsx port/contract/generate-ws-contract.ts
+pnpm run contract:generate      # tsx port/contract/generate-ws-contract.ts
 ```
 
-Run the drift guard with `npm run test:port`. The local default suite
-(`npm test`) also runs it on every local test run, so the TS side of the
+Run the drift guard with `pnpm run test:port`. The local default suite
+(`pnpm run test`) also runs it on every local test run, so the TS side of the
 contract is checked before every PR. The drift guard regenerates the contract
 in-memory and asserts byte-equality with the committed files, subsuming the
-`npm run contract:generate` idempotency check. Run
+`pnpm run contract:generate` idempotency check. Run
 `cargo test -p freshell-protocol` separately to verify the Rust T0 surface
 moves in lockstep. When you change `shared/ws-protocol.ts`: run
-`npm run contract:generate`, update `crates/freshell-protocol` (arrays +
+`pnpm run contract:generate`, update `crates/freshell-protocol` (arrays +
 inventory-test counts), and commit the regenerated `port/contract/*.json` in
 the same PR.
 

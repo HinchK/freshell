@@ -3,21 +3,36 @@
 //! the thread-status normalization (`adapter.ts:246-264`) and the strictly-monotonic
 //! turn-complete clock (`server/fresh-agent/turn-complete-clock.ts`).
 //!
-//! ## The status guard (the crown jewel — `adapter.ts:911-928`)
+//! ## The unified status guard (the crown jewel — `adapter.ts:911-928`)
 //!
-//! `turn/completed` fires for interrupts and failures too
-//! (`CodexTurnStatusSchema = completed|interrupted|failed|inProgress`, `protocol.ts:104`),
-//! so the adapter emits the positive `sdk.turn.complete` edge ONLY when
-//! `params.turn?.status ?? params.status === 'completed'` (`adapter.ts:922-924`). On EVERY
-//! `turn/completed` for the subscribed thread it FIRST emits an idle snapshot so the client
-//! re-fetches the committed transcript (`adapter.ts:906-914`); the chime is additional and
-//! gated. A crash/disconnect (`onExit`) or `thread_closed` clears the pane to `exited`
-//! WITHOUT a chime (`adapter.ts:887-896,935-946`).
+//! `turn/completed` fires for every terminal status
+//! (`CodexTurnStatusSchema = completed|interrupted|failed|inProgress`, `protocol.ts:104`).
+//! The UNIFIED "needs attention" edge rings for every turn END the user may not have
+//! witnessed: `completed`, `failed`, an absent status (the turn ended, outcome
+//! unknown), and a NON-user `interrupted` (automation- or rollback-forced — opencode's
+//! `turn_aborted` precedent). Only a USER-initiated interrupt — the interrupt control
+//! lane arms the per-session `user_interrupt_pending` marker before issuing
+//! `turn/interrupt`, and the guard's `interrupted` branch consumes it — and the
+//! non-terminal `inProgress` status stay silent. The marker is bounded to the
+//! CURRENT turn: the consumer clears it at every new turn's `turn/started`
+//! (the full opencode discipline — opencode clears `turn_aborted` at every turn
+//! dispatch), so an armed marker whose `interrupted` completion never arrived
+//! cannot cross a turn boundary and silence a later non-user `interrupted`; and
+//! a SUPERSEDED stale completion the consumer discards never consumes it
+//! ([`CodexSubscription::on_superseded_turn_completed`]). On EVERY
+//! `turn/completed` for the subscribed thread the guard FIRST emits an idle
+//! snapshot so the client re-fetches the committed transcript
+//! (`adapter.ts:906-914`); the attention edge is additional and routed. A
+//! crash/disconnect (`onExit`) or `thread_closed` clears the pane to `exited`
+//! WITHOUT an edge (`adapter.ts:887-896,935-946`).
 //!
 //! The completion `at` is per-session strictly-monotonic
 //! ([`next_monotonic_turn_complete_at`]) so two turns in the same millisecond — or a
 //! backwards NTP step — never collide or regress within the process
 //! (`turn-complete-clock.ts:19-21`).
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
@@ -90,9 +105,10 @@ pub enum CodexAdapterEvent {
         status: CodexStatus,
         revision: Option<f64>,
     },
-    /// `sdk.turn.complete { at }` — the POSITIVE completion chime, emitted only on a
-    /// `completed` status (`adapter.ts:927`). This is the T2 `provider.emits-completion-signal`
-    /// edge.
+    /// `sdk.turn.complete { at }` — the UNIFIED "needs attention" edge, emitted for
+    /// every turn END except a USER-initiated interrupt (the marker-armed
+    /// `interrupted` the interrupt lane owns) and the non-terminal `inProgress`.
+    /// This is the T2 `provider.emits-completion-signal` edge.
     TurnComplete { session_id: String, at: i64 },
     /// `sdk.status { status: 'exited' }` — a terminal clear with NO chime, emitted on
     /// `thread_closed` (`adapter.ts:891-896`) and `onExit` crash/disconnect
@@ -105,30 +121,95 @@ pub enum CodexAdapterEvent {
 
 /// One codex thread subscription's completion/status reducer. Holds the per-thread
 /// monotonic clock and active-turn tracking that the reference keeps in
-/// `lastTurnCompleteAtByThread` / `activeTurnByThread` (`adapter.ts:794-800`).
+/// `lastTurnCompleteAtByThread` / `activeTurnByThread` (`adapter.ts:794-800`), plus
+/// the per-session user-interrupt marker the interrupt control lane arms.
+///
+/// The monotonic clock lives behind ONE shared `Arc<Mutex<Option<i64>>>` per
+/// session: the freshagent lane threads the session's clock into this
+/// subscription (ordinary consumer edges) AND into the synthesized-edge
+/// minters outside the consumer (the crash self-heal, the wedged-sidecar quiet
+/// deadman), so ordinary and synthesized `at`s share a single
+/// strictly-monotonic timeline and can never collide or regress.
 #[derive(Clone, Debug)]
 pub struct CodexSubscription {
     session_id: String,
-    last_turn_complete_at: Option<i64>,
+    last_turn_complete_at: Arc<Mutex<Option<i64>>>,
     active_turn_id: Option<String>,
+    /// The per-session USER-interrupt marker (opencode's `turn_aborted`
+    /// precedent): the interrupt control lane arms it BEFORE issuing
+    /// `turn/interrupt`, and [`Self::on_turn_completed`]'s `interrupted` branch
+    /// consumes it (load + clear). Only a USER-initiated interrupt is silent —
+    /// a non-user `interrupted` (automation/rollback-forced) is a turn end the
+    /// user didn't witness and rings. Shared by `Arc` so the session record the
+    /// interrupt lane reads and the reducer the consumer drives stay one flag.
+    /// Bounded to the current turn: the consumer clears it at every new
+    /// turn's `turn/started` ([`Self::clear_user_interrupt`]), and a
+    /// superseded stale completion never consumes it
+    /// ([`Self::on_superseded_turn_completed`]).
+    user_interrupt_pending: Arc<AtomicBool>,
 }
 
 impl CodexSubscription {
     pub fn new(session_id: impl Into<String>) -> Self {
         Self {
             session_id: session_id.into(),
-            last_turn_complete_at: None,
+            last_turn_complete_at: Arc::new(Mutex::new(None)),
             active_turn_id: None,
+            user_interrupt_pending: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Adopt the session's shared monotonic turn-complete clock. The freshagent
+    /// lane threads ONE clock per session into both the consumer's subscription
+    /// (ordinary completion edges) and the crash/deadman synthesized-edge
+    /// minters; constructing the subscription with this builder keeps them on
+    /// the same strictly-monotonic `at` timeline instead of fresh defaults.
+    pub fn with_last_turn_complete_at(mut self, clock: Arc<Mutex<Option<i64>>>) -> Self {
+        self.last_turn_complete_at = clock;
+        self
+    }
+
+    /// Adopt the session's shared user-interrupt marker. The freshagent lane
+    /// threads ONE flag per session into both the interrupt control lane (which
+    /// arms it) and the notification consumer's subscription (which consumes
+    /// it); constructing the subscription with this builder keeps them the same
+    /// flag instead of the fresh default.
+    pub fn with_user_interrupt_pending(mut self, pending: Arc<AtomicBool>) -> Self {
+        self.user_interrupt_pending = pending;
+        self
+    }
+
+    /// Arm the user-interrupt marker: the next `interrupted` completion is
+    /// USER-initiated and stays silent (the guard consumes the marker on it).
+    /// The subscription-level arm handle the interrupt control lane (and the
+    /// low-level RPC-seam tests) use.
+    pub fn arm_user_interrupt(&self) {
+        self.user_interrupt_pending.store(true, Ordering::SeqCst);
+    }
+
+    /// Clear the user-interrupt marker WITHOUT consuming it: a NEW turn
+    /// started on this thread, so a marker armed for a PREVIOUS turn's
+    /// interrupt is stale. The full opencode `turn_aborted` discipline
+    /// (opencode clears its marker at every turn dispatch) bounds the
+    /// marker to the current turn: an interrupt whose completion never
+    /// arrived as `interrupted` (e.g. the app-server completed the turn
+    /// as `completed`) can never cross the turn boundary and silence a
+    /// later NON-user `interrupted` (a missed bell). The consumer calls
+    /// this from its `turn/started` handling.
+    pub fn clear_user_interrupt(&self) {
+        self.user_interrupt_pending.store(false, Ordering::SeqCst);
     }
 
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
 
-    /// The last positive-completion `at` this session emitted (for assertions / persistence).
+    /// The last turn-complete `at` this session emitted (for assertions / persistence).
     pub fn last_turn_complete_at(&self) -> Option<i64> {
-        self.last_turn_complete_at
+        *self
+            .last_turn_complete_at
+            .lock()
+            .expect("last_turn_complete_at mutex")
     }
 
     /// Record the active provider turn id from a `send`/`turn/started`
@@ -141,17 +222,62 @@ impl CodexSubscription {
         self.active_turn_id.as_deref()
     }
 
-    /// `onTurnCompleted` handler (`adapter.ts:911-928`) — the STATUS GUARD.
+    /// `onTurnCompleted` handler (`adapter.ts:911-928`) — the UNIFIED STATUS GUARD.
     ///
     /// For a `turn/completed` on THIS thread: clear the active turn, emit an idle snapshot
-    /// (always, so the client re-fetches the committed transcript), then emit the positive
-    /// `sdk.turn.complete` chime ONLY if `params.turn?.status ?? params.status === 'completed'`.
-    /// `interrupted` / `failed` / `inProgress` / absent statuses yield the snapshot but NO
-    /// chime. A `turn/completed` for a DIFFERENT thread yields nothing.
+    /// (always, so the client re-fetches the committed transcript), then emit the unified
+    /// `sdk.turn.complete` attention edge for every turn END the user may not have
+    /// witnessed: `completed`, `failed`, an absent status, and a NON-user `interrupted`
+    /// (automation/rollback-forced). Only a USER-initiated interrupt — the interrupt
+    /// control lane armed the `user_interrupt_pending` marker, CONSUMED here — and the
+    /// non-terminal `inProgress` stay snapshot-only. A `turn/completed` for a DIFFERENT
+    /// thread yields nothing.
     pub fn on_turn_completed(
         &mut self,
         event: &CodexTurnEvent,
         now: i64,
+    ) -> Vec<CodexAdapterEvent> {
+        self.turn_completed(event, now, true)
+    }
+
+    /// The bookkeeping-only variant for SUPERSEDED stale completions: the
+    /// consumer's superseded branch (freshell-freshagent's
+    /// `reduce_notification`) keeps this subscription's per-session
+    /// bookkeeping (active-turn clear, snapshot, monotonic clock) but
+    /// DISCARDS the output, replacing it with a busy `running` snapshot.
+    /// Because the output is discarded, a stale `interrupted` here must NOT
+    /// consume the user-interrupt marker: it can only be racing a marker
+    /// armed for a NEWER turn's user interrupt, and consuming it would make
+    /// that interrupt's own completion ring (a false-positive bell for a
+    /// USER-initiated interrupt). Identical guard decisions — the marker is
+    /// PEEKED, never taken.
+    pub fn on_superseded_turn_completed(
+        &mut self,
+        event: &CodexTurnEvent,
+        now: i64,
+    ) -> Vec<CodexAdapterEvent> {
+        self.turn_completed(event, now, false)
+    }
+
+    /// Read the user-interrupt marker for the `interrupted` guard: SWAP it
+    /// (load + clear) on the live consuming path, PEEK on the
+    /// bookkeeping-only superseded path — a stale `interrupted` for an
+    /// already-superseded turn must leave a marker armed for a NEWER turn's
+    /// interrupt intact.
+    fn user_interrupt_armed(&self, consume: bool) -> bool {
+        if consume {
+            self.user_interrupt_pending.swap(false, Ordering::SeqCst)
+        } else {
+            self.user_interrupt_pending.load(Ordering::SeqCst)
+        }
+    }
+
+    /// The shared guard core; see the two public variants' docs.
+    fn turn_completed(
+        &mut self,
+        event: &CodexTurnEvent,
+        now: i64,
+        consume_interrupt_marker: bool,
     ) -> Vec<CodexAdapterEvent> {
         // adapter.ts:912 — ignore completions for other threads.
         if event.thread_id != self.session_id {
@@ -169,14 +295,41 @@ impl CodexSubscription {
             revision: None,
         });
 
-        // adapter.ts:922-924 — the status guard. turn.status ?? status; chime only on 'completed'.
-        if turn_status(&event.params).as_deref() != Some("completed") {
-            return out;
+        // Unified "needs attention": every turn/completed that ENDED the turn rings
+        // except a USER-initiated interrupt (the interrupt lane arms the
+        // user_interrupt_pending marker; consume it here) and the non-terminal
+        // `inProgress` status. `completed`, `failed`, an absent status (the turn
+        // ended, outcome unknown), and a NON-user `interrupted` (automation- or
+        // rollback-forced) all ring identically — the user didn't witness any of
+        // them.
+        let status = turn_status(&event.params);
+        match status.as_deref() {
+            Some("inProgress") => return out,
+            // Consume the marker (load + clear) on the live path: only a
+            // USER-initiated interrupt is silent — a non-user `interrupted`
+            // falls through and rings below. The bookkeeping-only
+            // (superseded) path PEEKS instead: its stale `interrupted` can
+            // only be racing a marker armed for a NEWER turn's interrupt.
+            Some("interrupted") if self.user_interrupt_armed(consume_interrupt_marker) => {
+                return out;
+            }
+            _ => {}
         }
 
-        // adapter.ts:925-927 — monotonic `at`, then the positive chime.
-        let at = next_monotonic_turn_complete_at(self.last_turn_complete_at, now);
-        self.last_turn_complete_at = Some(at);
+        // adapter.ts:925-927 — monotonic `at`, then the unified attention edge. The clock
+        // is the session's SHARED mutex-guarded clock (see the struct doc): a
+        // synthesized edge minted outside this consumer (crash self-heal, quiet
+        // deadman) takes the same lock and can never collide with or regress
+        // below this `at`.
+        let at = {
+            let mut guard = self
+                .last_turn_complete_at
+                .lock()
+                .expect("last_turn_complete_at mutex");
+            let at = next_monotonic_turn_complete_at(*guard, now);
+            *guard = Some(at);
+            at
+        };
         out.push(CodexAdapterEvent::TurnComplete {
             session_id: self.session_id.clone(),
             at,
@@ -238,8 +391,9 @@ impl CodexSubscription {
     }
 
     /// `onExit` handler (`adapter.ts:935-946`): a crash/disconnect clears the pane to `exited`
-    /// with NO chime (a crash is not a positive completion). The runtime is intentionally left
-    /// mapped for lazy restart (`adapter.ts:936-944`).
+    /// with NO edge of its own (the freshell-freshagent exit watcher rings the unified
+    /// crash-while-busy attention edge when a turn was in flight). The runtime is intentionally
+    /// left mapped for lazy restart (`adapter.ts:936-944`).
     pub fn on_exit(&self) -> CodexAdapterEvent {
         CodexAdapterEvent::Status {
             session_id: self.session_id.clone(),
@@ -316,8 +470,11 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_status_emits_snapshot_but_never_chimes() {
+    fn interrupted_status_with_a_user_interrupt_marker_emits_snapshot_only() {
+        // The interrupt control lane arms the user-interrupt marker BEFORE
+        // issuing `turn/interrupt`; the guard consumes it here.
         let mut sub = CodexSubscription::new("thread-1");
+        sub.arm_user_interrupt();
         let out = sub.on_turn_completed(
             &turn_event(
                 "thread-1",
@@ -325,7 +482,7 @@ mod tests {
             ),
             1000,
         );
-        assert_eq!(out.len(), 1, "idle snapshot only, no chime");
+        assert_eq!(out.len(), 1, "idle snapshot only, no unified edge");
         assert!(matches!(
             out[0],
             CodexAdapterEvent::StatusSnapshot {
@@ -337,10 +494,143 @@ mod tests {
             .iter()
             .any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })));
         assert_eq!(sub.last_turn_complete_at(), None, "no completion recorded");
+        // The marker is CONSUMED by the matching interrupted completion: a
+        // second `interrupted` without a fresh user interrupt rings.
+        let second = sub.on_turn_completed(
+            &turn_event(
+                "thread-1",
+                json!({ "threadId": "thread-1", "turn": { "id": "t2", "status": "interrupted" } }),
+            ),
+            1001,
+        );
+        assert!(
+            second
+                .iter()
+                .any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })),
+            "the user-interrupt marker is one-shot: a later non-user interrupted rings"
+        );
     }
 
     #[test]
-    fn failed_status_never_chimes() {
+    fn interrupted_status_without_a_marker_emits_the_unified_edge() {
+        // A NON-user `interrupted` (automation/rollback-forced) is a turn end
+        // the user didn't witness — it rings identically to a completion.
+        let mut sub = CodexSubscription::new("thread-1");
+        let out = sub.on_turn_completed(
+            &turn_event(
+                "thread-1",
+                json!({ "threadId": "thread-1", "turn": { "id": "t", "status": "interrupted" } }),
+            ),
+            1000,
+        );
+        assert_eq!(out.len(), 2, "idle snapshot + the unified edge: {out:?}");
+        assert!(matches!(
+            out[0],
+            CodexAdapterEvent::StatusSnapshot {
+                status: CodexStatus::Idle,
+                ..
+            }
+        ));
+        assert!(matches!(
+            out[1],
+            CodexAdapterEvent::TurnComplete { at: 1000, .. }
+        ));
+        assert_eq!(
+            sub.last_turn_complete_at(),
+            Some(1000),
+            "a non-user interrupted records the completion"
+        );
+    }
+
+    #[test]
+    fn clear_user_interrupt_bounds_the_marker_to_the_current_turn() {
+        // The full opencode `turn_aborted` discipline: a NEW turn's start
+        // clears any stale armed marker, so an interrupt whose completion
+        // never arrived as `interrupted` can never cross the turn boundary
+        // and silence a later NON-user `interrupted` (a missed bell).
+        let mut sub = CodexSubscription::new("thread-1");
+        sub.arm_user_interrupt();
+        sub.clear_user_interrupt();
+        let out = sub.on_turn_completed(
+            &turn_event(
+                "thread-1",
+                json!({ "threadId": "thread-1", "turn": { "id": "t2", "status": "interrupted" } }),
+            ),
+            1000,
+        );
+        assert_eq!(
+            out.len(),
+            2,
+            "the stale marker must not survive the new turn's start: {out:?}"
+        );
+        assert!(matches!(
+            out[1],
+            CodexAdapterEvent::TurnComplete { at: 1000, .. }
+        ));
+    }
+
+    #[test]
+    fn a_superseded_interrupted_completion_leaves_the_armed_marker_for_a_newer_turn() {
+        // The bookkeeping-only variant the consumer's superseded branch
+        // calls: the guard PEEKS the marker instead of consuming it — a
+        // stale `interrupted` for a superseded turn must not take the marker
+        // armed for a NEWER turn's user interrupt.
+        let mut sub = CodexSubscription::new("thread-1");
+        sub.arm_user_interrupt();
+        let out = sub.on_superseded_turn_completed(
+            &turn_event(
+                "thread-1",
+                json!({ "threadId": "thread-1", "turn": { "id": "t1", "status": "interrupted" } }),
+            ),
+            1000,
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "the armed marker still suppresses the discarded output's edge: {out:?}"
+        );
+        assert!(
+            sub.user_interrupt_pending.load(Ordering::SeqCst),
+            "the marker stays armed for the newer turn's interrupt"
+        );
+        // The surviving marker then silences the turn it was armed for: the
+        // newer turn's own user-interrupt completion consumes it.
+        let out = sub.on_turn_completed(
+            &turn_event(
+                "thread-1",
+                json!({ "threadId": "thread-1", "turn": { "id": "t2", "status": "interrupted" } }),
+            ),
+            1001,
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "the newer turn's user interrupt stays silent on the surviving marker: {out:?}"
+        );
+        assert!(
+            !sub.user_interrupt_pending.load(Ordering::SeqCst),
+            "the live consuming path still consumes the marker one-shot"
+        );
+        // Without a marker, the superseded bookkeeping call makes the same
+        // decision the live guard would: a NON-user `interrupted` rings (the
+        // consumer discards this output; only the marker treatment differs).
+        let out = sub.on_superseded_turn_completed(
+            &turn_event(
+                "thread-1",
+                json!({ "threadId": "thread-1", "turn": { "id": "t3", "status": "interrupted" } }),
+            ),
+            1002,
+        );
+        assert_eq!(
+            out.len(),
+            2,
+            "the bookkeeping-only variant is not an all-silent path: {out:?}"
+        );
+    }
+
+    #[test]
+    fn failed_status_emits_the_unified_edge() {
+        // A failed turn ENDED — the user didn't witness it — one identical edge.
         let mut sub = CodexSubscription::new("thread-1");
         let out = sub.on_turn_completed(
             &turn_event(
@@ -349,9 +639,13 @@ mod tests {
             ),
             1000,
         );
-        assert!(!out
-            .iter()
-            .any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })));
+        assert!(matches!(
+            out.as_slice(),
+            [
+                CodexAdapterEvent::StatusSnapshot { .. },
+                CodexAdapterEvent::TurnComplete { at: 1000, .. }
+            ]
+        ));
     }
 
     #[test]
@@ -370,18 +664,25 @@ mod tests {
     }
 
     #[test]
-    fn absent_status_never_chimes_but_still_snapshots() {
-        // codex-adapter.test.ts:1180 — params:{} still emits the idle snapshot, no chime.
+    fn absent_status_emits_the_unified_edge_and_still_snapshots() {
+        // codex-adapter.test.ts:1180 — params:{} still emits the idle snapshot;
+        // an absent status means the turn ENDED with the outcome unknown → the
+        // unified edge rings too.
         let mut sub = CodexSubscription::new("thread-1");
         let out = sub.on_turn_completed(&turn_event("thread-1", json!({})), 1000);
-        assert_eq!(out.len(), 1);
+        assert_eq!(out.len(), 2);
         assert!(matches!(out[0], CodexAdapterEvent::StatusSnapshot { .. }));
+        assert!(matches!(out[1], CodexAdapterEvent::TurnComplete { .. }));
     }
 
     #[test]
     fn inline_turn_status_wins_over_flat_status() {
         // `turn.status ?? status`: an inline 'interrupted' must suppress a flat 'completed'.
+        // The user-interrupt marker is armed so the inline 'interrupted' is the
+        // USER-initiated kind (silent under the unified guard); if the FLAT
+        // 'completed' won instead, the edge would ring even with the marker armed.
         let mut sub = CodexSubscription::new("thread-1");
+        sub.arm_user_interrupt();
         let out = sub.on_turn_completed(
             &turn_event(
                 "thread-1",

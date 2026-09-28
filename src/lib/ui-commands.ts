@@ -3,6 +3,13 @@ import { initLayout, splitPane, setActivePane, nudgePaneFocus, updatePaneContent
 import { captureUiScreenshot } from '@/lib/ui-screenshot'
 import type { RootState } from '@/store/store'
 import { applyPaneRename, applyTabRename } from '@/store/titleSync'
+import { receiveSessionNames } from '@/store/sessionNamesSlice'
+import { bootstrapSessionNames, parseSessionNameUpdate, parseSessionNameRef } from '@/lib/session-names'
+import type { SessionNameRef } from '@shared/session-names'
+import {
+  isScopedPaneContent,
+  selectTabNameSourcePaneId,
+} from '@/store/selectors/sessionNameSelectors'
 import { forceLayoutResync } from '@/store/layoutMirrorMiddleware'
 
 type DispatchFn = (action: any) => any
@@ -18,6 +25,101 @@ function resolveRuntime(input: UiCommandRuntime | DispatchFn): UiCommandRuntime 
     return { dispatch: input }
   }
   return input
+}
+
+/**
+ * Unified agent names (Task 5): a scoped agent pane/tab never takes a sticky
+ * ui.command title alias — a server that routes its rename canonically
+ * publishes `session.name.updated` instead, so any legacy rename receipt that
+ * still names a scoped target is consumed through the canonical cache: an
+ * embedded `sessionName` update folds directly, otherwise the resolved name
+ * is refetched (never a local manual flag, never a second PATCH).
+ */
+function consumeScopedRenameReceipt(
+  runtime: UiCommandRuntime,
+  tabId: string | undefined,
+  paneId: string | undefined,
+  payload: Record<string, unknown>,
+): boolean {
+  const state = runtime.getState?.()
+  if (!state) return false
+  let scoped = false
+  if (paneId) {
+    for (const layout of Object.values(state.panes?.layouts ?? {})) {
+      const walk = (node: unknown): void => {
+        if (!node || typeof node !== 'object') return
+        const n = node as { type?: string; id?: string; content?: { kind?: string }; children?: unknown[] }
+        if (n.type === 'leaf') {
+          if (n.id === paneId && n.content && isScopedPaneContent(n.content as never)) scoped = true
+          return
+        }
+        for (const child of n.children ?? []) walk(child)
+      }
+      walk(layout)
+    }
+  }
+  if (!scoped && tabId && selectTabNameSourcePaneId(state, tabId)) scoped = true
+  if (!scoped) return false
+
+  const update = parseSessionNameUpdate(payload.sessionName)
+  if (update) {
+    runtime.dispatch(receiveSessionNames([update]))
+    return true
+  }
+  // No embedded record: refetch the resolved names for the pane's naming refs
+  // (best effort — the session.name.updated push remains the live authority).
+  const refs = collectRefsForScopedTarget(state, tabId, paneId)
+  if (refs.length > 0) {
+    void bootstrapSessionNames(refs)
+      .then((updates) => {
+        if (updates.length > 0) runtime.dispatch(receiveSessionNames(updates))
+      })
+      .catch(() => { /* the broadcast converges this later */ })
+  }
+  return true
+}
+
+function collectRefsForScopedTarget(
+  state: RootState,
+  tabId: string | undefined,
+  paneId: string | undefined,
+): SessionNameRef[] {
+  const refs: SessionNameRef[] = []
+  const layouts = state.panes?.layouts ?? {}
+  const layout = tabId ? layouts[tabId] : undefined
+  if (layout) {
+    const walk = (node: unknown): void => {
+      if (!node || typeof node !== 'object') return
+      const n = node as {
+        type?: string
+        id?: string
+        content?: { kind?: string; nameRef?: unknown; namingHandle?: unknown; sessionRef?: { provider?: unknown; sessionId?: unknown } }
+        children?: unknown[]
+      }
+      if (n.type === 'leaf') {
+        if (n.id === paneId || !paneId) {
+          const content = n.content
+          const parsedRef = content ? parseSessionNameRef(content.nameRef) : undefined
+          if (parsedRef) refs.push(parsedRef)
+          if (typeof content?.namingHandle === 'string' && content.namingHandle.length > 0) {
+            refs.push({ kind: 'pending', id: content.namingHandle })
+          }
+          if (
+            typeof content?.sessionRef?.provider === 'string'
+            && typeof content?.sessionRef?.sessionId === 'string'
+            && content.sessionRef.sessionId.length > 0
+            && (content.sessionRef.provider === 'claude' || content.sessionRef.provider === 'codex' || content.sessionRef.provider === 'opencode')
+          ) {
+            refs.push({ kind: 'session', provider: content.sessionRef.provider, sessionId: content.sessionRef.sessionId })
+          }
+        }
+        return
+      }
+      for (const child of n.children ?? []) walk(child)
+    }
+    walk(layout)
+  }
+  return refs
 }
 
 async function handleScreenshotCapture(msg: any, runtime: UiCommandRuntime): Promise<void> {
@@ -117,8 +219,11 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
       // active pane) was already Redux-active there is no eligibility
       // transition, so nudge the pane focus epoch as the DOM-focus signal.
       return dispatch(nudgePaneFocus({ tabId: msg.payload.id }))
-    case 'tab.rename':
+    case 'tab.rename': {
+      const payload = (msg.payload ?? {}) as Record<string, unknown>
+      if (consumeScopedRenameReceipt(runtime, msg.payload?.id, undefined, payload)) return
       return dispatch(applyTabRename({ tabId: msg.payload.id, title: msg.payload.title }))
+    }
     case 'tab.close':
       return dispatch(closeTab(msg.payload.id))
     case 'pane.split':
@@ -138,12 +243,15 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
       // already Redux-active (no eligibility transition exists to re-run
       // focus effects) — the epoch bump is that signal.
       return dispatch(setActivePane({ tabId: msg.payload.tabId, paneId: msg.payload.paneId, focusNudge: true }))
-    case 'pane.rename':
+    case 'pane.rename': {
+      const payload = (msg.payload ?? {}) as Record<string, unknown>
+      if (consumeScopedRenameReceipt(runtime, msg.payload.tabId, msg.payload.paneId, payload)) return
       return dispatch(applyPaneRename({
         tabId: msg.payload.tabId,
         paneId: msg.payload.paneId,
         title: msg.payload.title,
       }))
+    }
     case 'pane.attach':
       return dispatch(updatePaneContent({ tabId: msg.payload.tabId, paneId: msg.payload.paneId, content: msg.payload.content }))
     case 'pane.resize':

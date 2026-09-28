@@ -138,12 +138,17 @@ pub struct ClaudeTranscriptHit {
 /// The opencode by-id fallback's answer (hardened Node: the full sqlite row
 /// from `opencode-by-id-query.ts`, archived + child sessions included).
 /// `last_activity_at` is already floored to integer ms by the producer.
+/// `database` (Task 3) is the RETAINED exact-ID database the row was found
+/// in — carried through the locator/by-ID conversion rather than recomputed
+/// from the row's directory, so native-name routing can verify the serve's
+/// effective database against the indexed one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpencodeByIdHit {
     pub session_id: String,
     pub cwd: Option<String>,
     pub title: Option<String>,
     pub last_activity_at: Option<i64>,
+    pub database: Option<String>,
 }
 
 /// Dependencies for one resolve call (`ResolveResumeDeps`). Fallbacks return

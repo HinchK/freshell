@@ -1,0 +1,5 @@
+packages: ['.']
+packageManagerStrictVersion: true
+managePackageManagerVersions: false
+allowBuilds:
+  esbuild: true

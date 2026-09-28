@@ -1000,6 +1000,7 @@ fn task10_ui_layout_sync_with_status(
 ) -> freshell_protocol::UiLayoutSync {
     freshell_protocol::UiLayoutSync {
         tabs: vec![freshell_protocol::UiLayoutTab {
+            name_source: None,
             id: tab_id.to_string(),
             title: Some("Task 10".to_string()),
             fallback_session_ref: None,
@@ -1201,6 +1202,7 @@ fn r21_browser_content_ui_layout_sync(
 ) -> freshell_protocol::UiLayoutSync {
     freshell_protocol::UiLayoutSync {
         tabs: vec![freshell_protocol::UiLayoutTab {
+            name_source: None,
             id: tab_id.to_string(),
             title: Some("R21".to_string()),
             fallback_session_ref: None,

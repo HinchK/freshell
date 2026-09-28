@@ -6212,3 +6212,62 @@ fn device_tabs_preserve_the_union_record_order() {
         .collect();
     assert_eq!(keys, vec!["k2", "k1"]);
 }
+
+/// Unified agent names (Task 6): the tab's stable naming-source relationship
+/// forwards additively into the recovery inventory so the client's recovery
+/// builder can remap it through its old→new pane-id map; a record without one
+/// (pre-Task-6) yields no field at all.
+#[test]
+fn the_inventory_forwards_the_tab_name_source_additively() {
+    let mut d = DeviceUnion {
+        device_id: "dev1".into(),
+        union_doc: union_doc_with_tab_key(
+            "dev1",
+            1000,
+            "dev1:t1",
+            json!([{ "paneId": "p-agent", "kind": "terminal",
+                     "payload": { "mode": "claude", "shell": "system",
+                                  "createRequestId": "req-agent",
+                                  "namingHandle": "nh-inv-1",
+                                  "nameRef": { "kind": "pending", "id": "nh-inv-1" } } }]),
+        ),
+    };
+    // The union record itself carries the pointer (the client registry push
+    // stamps it); splice it into the fixture's record.
+    d.union_doc["records"][0]["nameSource"] = json!({ "kind": "session", "paneId": "p-agent" });
+
+    let out = build_inventory(vec![d], vec![], no_live(), &no_evidence(), &no_closes());
+    let tab = &out["device"]["tabs"][0];
+    assert_eq!(
+        tab["nameSource"],
+        json!({ "kind": "session", "paneId": "p-agent" }),
+        "the recorded pointer forwards verbatim: {tab}"
+    );
+    // The pane payload keeps the naming identity too (recovery preserves the
+    // provisional handle while reminting createRequestId).
+    assert_eq!(
+        tab["panes"][0]["payload"]["namingHandle"],
+        json!("nh-inv-1")
+    );
+    assert_eq!(
+        tab["panes"][0]["payload"]["nameRef"],
+        json!({ "kind": "pending", "id": "nh-inv-1" })
+    );
+
+    // A record without a pointer yields NO field (never a fabricated owner).
+    let d2 = DeviceUnion {
+        device_id: "dev2".into(),
+        union_doc: union_doc(
+            "dev2",
+            1000,
+            json!([{ "paneId": "p1", "kind": "terminal",
+                     "payload": { "mode": "shell", "shell": "system", "createRequestId": "r" } }]),
+        ),
+    };
+    let out2 = build_inventory(vec![d2], vec![], no_live(), &no_evidence(), &no_closes());
+    assert!(
+        out2["device"]["tabs"][0].get("nameSource").is_none(),
+        "an unresolved record forwards no pointer: {}",
+        out2["device"]["tabs"][0]
+    );
+}

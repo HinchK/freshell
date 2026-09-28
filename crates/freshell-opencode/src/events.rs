@@ -52,6 +52,10 @@ pub enum SdkProviderEvent {
     },
     /// A `session.error` surfaced during the turn.
     Error { session_id: String, message: String },
+    /// Unified agent names (Task 3): a native title observation from
+    /// `session.updated.properties.info` — automatic provider metadata,
+    /// never an intent claim.
+    TitleObserved { session_id: String, title: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,7 +138,12 @@ pub fn parse_serve_event(event: &Value) -> Option<ParsedServeEvent> {
     };
     let session_id = string_property(Some(&Value::Object(props.clone())), "sessionID")
         .or_else(|| string_property(props.get("part"), "sessionID"))
-        .or_else(|| string_property(props.get("info"), "sessionID"));
+        .or_else(|| string_property(props.get("info"), "sessionID"))
+        // Unified agent names (Task 3): the REAL `session.updated` shape
+        // carries the session id at `properties.info.id` (the same info
+        // object that carries the title). Resolved last so the documented
+        // sessionID spellings keep precedence.
+        .or_else(|| string_property(props.get("info"), "id"));
     Some(ParsedServeEvent {
         kind,
         session_id,
@@ -176,6 +185,28 @@ pub fn event_shows_running_status_activity(event: &ParsedServeEvent) -> bool {
         return false;
     };
     is_running_status_type(status.get("type"))
+}
+
+/// Unified agent names (Task 3): the native title observation a
+/// `session.updated` event carries — the session's own title at
+/// `properties.info.title`, with the session id at `properties.info.id`.
+/// The event's `info.time.updated` bump is NOT rename recency: a native
+/// title change touches it the same as any other session mutation, so the
+/// observation exposes only the title (the naming pipeline classifies it
+/// as an automatic provider observation; only declared Freshell user
+/// intent promotes a record to manual).
+pub fn session_title_observation(event: &ParsedServeEvent) -> Option<(String, String)> {
+    if event.kind != "session.updated" {
+        return None;
+    }
+    let info = event.properties.get("info")?.as_object()?;
+    let id = info.get("id")?.as_str()?.to_string();
+    let title = info
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|title| !title.trim().is_empty())?
+        .to_string();
+    Some((id, title))
 }
 
 /// The completion IDLE edge the serve client surfaces: `session.idle` OR
@@ -235,6 +266,10 @@ pub fn serve_event_to_sdk(
             session_id: subscribed_id.to_string(),
             reason: ChangedReason::OpencodeMessage,
         }),
+        // Unified agent names (Task 3): a native title observation — the
+        // event's OWN `info.id` is the real session the title belongs to.
+        "session.updated" => session_title_observation(parsed)
+            .map(|(session_id, title)| SdkProviderEvent::TitleObserved { session_id, title }),
         _ => None,
     }
 }

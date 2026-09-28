@@ -1,6 +1,6 @@
 {
   "clientToServer": {
-    "count": 41,
+    "count": 42,
     "types": [
       "amplifier.activity.list",
       "claude.activity.list",
@@ -40,15 +40,16 @@
       "terminal.input",
       "terminal.interest",
       "terminal.kill",
+      "terminal.replay.credit",
       "terminal.resize",
       "ui.layout.sync",
       "ui.screenshot.result"
     ]
   },
-  "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. `type` discriminants for every message in each direction, resolved from the ClientMessage and ServerMessage union types via the TypeScript type checker.",
+  "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `pnpm run contract:generate`. `type` discriminants for every message in each direction, resolved from the ClientMessage and ServerMessage union types via the TypeScript type checker.",
   "generator": "port/contract/generate-ws-contract.ts",
   "serverToClient": {
-    "count": 65,
+    "count": 67,
     "types": [
       "amplifier.activity.list.response",
       "amplifier.activity.updated",
@@ -86,6 +87,7 @@
       "perf.logging",
       "pong",
       "ready",
+      "session.name.updated",
       "session.repair.activity",
       "session.runtimeOwner",
       "session.status",
@@ -111,6 +113,7 @@
       "terminal.session.associated",
       "terminal.status",
       "terminal.stream.changed",
+      "terminal.stuck",
       "terminal.title.updated",
       "terminal.turn.complete",
       "terminals.changed",

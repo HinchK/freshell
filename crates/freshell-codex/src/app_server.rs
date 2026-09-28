@@ -57,6 +57,15 @@ pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 5_000;
 /// fast). But it also shouldn't hang forever, so this is capped rather than unbounded: 30s.
 pub const SNAPSHOT_READ_TIMEOUT_MS: u64 = 30_000;
 
+/// Unified agent names (Task 3): the per-request bound for the NATIVE-NAMES
+/// metadata read (`thread/read` with `includeTurns:false`) — the plan's
+/// 20-second native request budget. Deliberately NOT the 30s snapshot budget
+/// above (that exists for full-thread reads whose parse can take seconds; a
+/// metadata-only read has no such latency profile and must never pin the
+/// serial native worker for 30s), and not the 5s interactive budget either —
+/// the plan bounds every native request to 20s.
+pub const NATIVE_METADATA_READ_TIMEOUT_MS: u64 = 20_000;
+
 /// A boxed, `Send` future — the object-safe async return used by [`WsTransport`] (keeps it
 /// `dyn`-compatible without an `async-trait` dependency; same pattern as `freshell-opencode`).
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -200,6 +209,12 @@ pub struct CodexAppServerClient {
     /// Single-flight initialize cache: `Some(result)` once the handshake completed
     /// (`initializePromise`, `client.ts:126,144-166`).
     init: TokioMutex<Option<Value>>,
+    /// Unified agent names (Task 2): the `codexHome` captured from the
+    /// `initialize` result BEFORE any `Ok(_)`/`StartedThread` reduction —
+    /// the initialized root the app-server itself reported (the authority
+    /// for where rollouts live, never re-derived from ambient env). Read by
+    /// [`Self::codex_home`].
+    codex_home: TokioMutex<Option<String>>,
     read_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -256,6 +271,7 @@ impl CodexAppServerClient {
             request_timeout,
             read_timeout,
             init: TokioMutex::new(None),
+            codex_home: TokioMutex::new(None),
             read_handle,
         };
         (client, notify_rx)
@@ -281,8 +297,24 @@ impl CodexAppServerClient {
             .await?;
         // client.ts:158 — the initialized notification follows a successful initialize.
         self.notify("initialized", None).await?;
+        // Unified agent names (Task 2): capture the app-server's own
+        // `codexHome` from the initialize result BEFORE the `Ok(_)`
+        // reduction — the initialized root later StartedThread results are
+        // correlated against (never re-derived from ambient env).
+        if let Some(home) = result.get("codexHome").and_then(Value::as_str) {
+            if !home.is_empty() {
+                *self.codex_home.lock().await = Some(home.to_string());
+            }
+        }
         *guard = Some(result.clone());
         Ok(result)
+    }
+
+    /// Unified agent names (Task 2): the `codexHome` the app-server reported
+    /// at initialize — the initialized root rollouts are written under.
+    /// `None` before the first successful `initialize`.
+    pub async fn codex_home(&self) -> Option<String> {
+        self.codex_home.lock().await.clone()
     }
 
     /// `thread/start` (`client.ts:168-186`) — the stable-from-create codex thread.
@@ -512,6 +544,47 @@ impl CodexAppServerClient {
             self.read_timeout,
         )
         .await
+    }
+
+    /// Unified agent names (Task 3): the native-names METADATA read —
+    /// `thread/read` with `includeTurns:false`, bounded to the plan's
+    /// 20-second native request budget
+    /// ([`NATIVE_METADATA_READ_TIMEOUT_MS`]) instead of this client's 30s
+    /// snapshot budget: a name-synchronization read never parses a huge
+    /// thread's turns, and the serial native worker must not park on it
+    /// past the plan's per-request bound.
+    pub async fn read_thread_metadata(
+        &self,
+        thread_id: &str,
+    ) -> Result<Value, CodexAppServerError> {
+        self.request_with_timeout(
+            "thread/read",
+            json!({ "threadId": thread_id, "includeTurns": false }),
+            Duration::from_millis(NATIVE_METADATA_READ_TIMEOUT_MS),
+        )
+        .await
+    }
+
+    /// Unified agent names (Task 3): `thread/name/set` — set the native name
+    /// of a thread this connection can address (loaded threads and persisted
+    /// rollouts alike — the official API supports name/set for both, so an
+    /// existing management connection can name a CLOSED session without
+    /// resuming it or claiming its execution lease). The CALLER owns the
+    /// root-match policy: only a connection whose initialized `codexHome`
+    /// ([`Self::codex_home`]) matches the retained location may dispatch
+    /// management writes. Errors preserve the caller's pending/durable name —
+    /// this RPC never rolls a canonical name back.
+    pub async fn set_thread_name(
+        &self,
+        thread_id: &str,
+        name: &str,
+    ) -> Result<(), CodexAppServerError> {
+        self.request(
+            "thread/name/set",
+            json!({ "threadId": thread_id, "name": name }),
+        )
+        .await?;
+        Ok(())
     }
 
     /// `thread/loaded/list` — the ids of threads this app-server currently

@@ -103,32 +103,66 @@ All release preparation happens on a release branch in a worktree from `origin/m
 git fetch origin
 git worktree add .worktrees/release-vX.Y.Z -b release/vX.Y.Z origin/main
 cd .worktrees/release-vX.Y.Z
-npm install
+pnpm install --frozen-lockfile
 ```
+
+pnpm 10.34.5 is the repo's pinned package manager. If the machine does not
+have it yet, install it once with `npm install --global pnpm@10.34.5` (npm is
+only the bootstrap). Never run `npm ci`/`npm install` in a pnpm-era tree.
 
 ### 2. Verify from a clean install
 
 ```bash
-# In the worktree — start from a clean slate to catch peer dep issues
+# In the worktree — start from a clean slate to catch dependency issues
 rm -rf node_modules
-npm install
+pnpm install --frozen-lockfile
 
 # Type-check AND build (catches errors vitest misses because it transpiles with esbuild)
-npm run build
+pnpm run build
 
 # Run the full test suite
-npm test
+pnpm run test
 ```
 
-All three commands must succeed. `npm install` must complete without `--force` or `--legacy-peer-deps`. `npm run build` catches TypeScript errors that `npm test` alone does not (vitest uses esbuild for transpilation, skipping type checking). If any step fails, fix the issue on the release branch before proceeding.
+All three commands must succeed. The frozen install must complete exactly as
+written — no `--force`, no `--fix-lockfile`, no un-freezing the lockfile.
+`pnpm run build` catches TypeScript errors that `pnpm run test` alone does not
+(vitest uses esbuild for transpilation, skipping type checking). If any step
+fails, fix the issue on the release branch before proceeding.
+
+If the release includes the desktop app, `pnpm run electron:build` (or
+`electron:build:win` on native Windows) must also pass. The desktop runtime is
+staged from pnpm-deploy trees, and the build ends with artifact verification
+against the staging receipt (`electron-runtime/.electron-runtime-receipt.json`),
+which records the pnpm version and the workspace-lock fingerprint the runtime
+was built from — the receipt verification is the release's proof that the
+packaged runtime matches the locked workspace.
+
+For dependency and lock maintenance on the release branch: intentional
+dependency changes use `pnpm add` / `pnpm update`, and the release PR reviews
+`package.json` and `pnpm-lock.yaml` diffs together. A pure version bump does
+not modify `pnpm-lock.yaml` — the lock records the workspace's external
+dependency specifiers, not the root package's own version — so do not
+regenerate or hand-edit the lock for the bump.
 
 ### 3. Prepare the release (on the release branch)
 
 All of these are committed to the release branch:
 
 1. **Bump version** in `package.json`
-2. **Update README:** Change `--branch vOLD` to `--branch vNEW` in the clone command, and apply the approved Features changes
+2. **Update README:** apply the approved Features changes, and follow the
+   Quick Start's two-recipe structure: the stable-release recipe and the
+   pnpm development-`main` recipe. Until the first pnpm-built release is
+   published, leave the stable-release recipe pinned to the npm-era
+   `v0.7.5` tag and its npm commands — that tag was built with npm.
 3. **Commit** with message like `release: vX.Y.Z`
+
+**First pnpm release:** the first release cut from pnpm `main` is the
+transition point. In that release, update the README's stable-release recipe
+to the new tag and to the pnpm commands (bootstrap pnpm, frozen install) in
+the same release commit, so the stable-release and development recipes
+converge. Do not re-point the stable recipe at a pnpm tag while keeping npm
+commands, and do not ship a pnpm-tag recipe before the tag exists.
 
 ### 4. Open and merge a release PR
 

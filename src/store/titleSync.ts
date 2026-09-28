@@ -5,11 +5,19 @@
  * explicit session-scope action (`PATCH /api/sessions/:key` via the sidebar /
  * history rename, or Task 7's reset). `applySessionRenameCascade` is the one
  * sanctioned cross-scope mirror: session -> open panes.
+ *
+ * Unified agent names (Task 5): scoped coding-agent panes (claude/codex/
+ * opencode terminal modes, freshclaude/freshcodex/freshopencode) are EXCLUDED
+ * from this cascade — their display comes from the canonical sessionNames
+ * cache, and no user flag is ever armed on them. Kilroy and every
+ * out-of-scope provider keep the existing mirror.
  */
 import type { AppDispatch, RootState } from './store'
-import { updatePaneTitle, updatePaneTitleByTerminalId, updatePaneTitleBySessionRef } from './panesSlice'
+import { updatePaneTitle } from './panesSlice'
 import { updateTab } from './tabsSlice'
 import { api } from '@/lib/api'
+import { collectPaneEntries, paneContentMatchesSessionRef } from '@/lib/pane-utils'
+import { isScopedPaneContent } from '@/store/selectors/sessionNameSelectors'
 
 type TitleSyncThunk = (dispatch: AppDispatch, getState: () => RootState) => void
 
@@ -20,26 +28,36 @@ function getSinglePaneId(state: RootState, tabId: string): string | null {
 }
 
 /**
- * Mirror a server-side session rename into any open pane bound to that
- * session. The terminal cascade (cascadedTerminalId, returned by the sessions
- * PATCH) covers live coding-CLI terminal panes; the sessionRef pass covers
- * SDK/fresh-agent panes that can never cascade server-side (D4) plus terminal
- * panes matched by sessionRef (D3). These are user renames, so
- * setByUser: true — they land even on previously user-renamed panes and stay
- * sticky (Scope Decision 3).
+ * Mirror a server-side session rename into any open NON-SCOPED pane bound to
+ * that session. These are user renames, so setByUser: true — they land even
+ * on previously user-renamed panes and stay sticky (Scope Decision 3). A
+ * scoped agent pane is never a target: the canonical cache owns its title.
  */
 export function applySessionRenameCascade(input: {
   dispatch: AppDispatch
+  getState: () => RootState
   provider: string
   sessionId: string
   title: string
   cascadedTerminalId?: string | null
 }): void {
-  const { dispatch, provider, sessionId, title, cascadedTerminalId } = input
-  if (cascadedTerminalId) {
-    dispatch(updatePaneTitleByTerminalId({ terminalId: cascadedTerminalId, title, setByUser: true }))
+  const { dispatch, getState, provider, sessionId, title, cascadedTerminalId } = input
+  const state = getState()
+  for (const [tabId, layout] of Object.entries(state.panes.layouts ?? {})) {
+    if (!layout) continue
+    for (const { paneId, content } of collectPaneEntries(layout)) {
+      if (isScopedPaneContent(content)) continue
+      const matchesTerminal = Boolean(
+        cascadedTerminalId
+        && content.kind === 'terminal'
+        && content.terminalId === cascadedTerminalId,
+      )
+      const matchesSession = paneContentMatchesSessionRef(content, provider, sessionId)
+      if (!matchesTerminal && !matchesSession) continue
+      if ((state.panes.paneTitles?.[tabId]?.[paneId] ?? '') === title) continue
+      dispatch(updatePaneTitle({ tabId, paneId, title, setByUser: true }))
+    }
   }
-  dispatch(updatePaneTitleBySessionRef({ provider, sessionId, title, setByUser: true }))
 }
 
 export function applyPaneRename(input: {

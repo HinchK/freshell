@@ -13,8 +13,16 @@ locally" in two steps + reboot.
    Idempotent. Installs apt toolchain (incl. mingw-w64 cross-compiler, Tauri GUI
    deps, imagemagick/tesseract/xdotool), rustup + `x86_64-pc-windows-gnu`, node 22,
    clones the repo at **`feat/rust-tauri-port`** (NOT main — the port and all its
-   docs live on that branch), `npm ci` + sidecar deps + Playwright chromium, and
+   docs live on that branch), installs JS deps + Playwright chromium, and
    builds the original reference + both Rust server binaries.
+
+   The JS dependency, browser, and build steps follow the **checked-out
+   branch's package manager**: the default port branch is npm-era (`npm ci` +
+   a separate sidecar `npm install`), while a pnpm-era checkout (current
+   `main`) bootstraps the pinned pnpm via npm (`npm install -g pnpm@10.34.5`)
+   and runs a frozen workspace install (`pnpm install --frozen-lockfile`)
+   that covers the sidecar as a workspace member. Either way, the coding CLIs
+   stay separate global npm installs (step 7 of the script).
 
 ## What only a human can do (the agent cannot)
 

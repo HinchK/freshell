@@ -171,6 +171,36 @@ describe('TerminalView OSC title scope', () => {
     expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('freshell')
   })
 
+  it('a shell terminal still folds terminal.title.updated frames into tab and pane titles', async () => {
+    const { store, paneContent, tabId, paneId, terminalId } = createStore('shell')
+    await renderAndGetTitleCb(store, paneContent, tabId, paneId)
+    const onMessage = wsMocks.onMessage.mock.calls[wsMocks.onMessage.mock.calls.length - 1]?.[0]
+    expect(onMessage).toBeTypeOf('function')
+
+    act(() => {
+      onMessage({ type: 'terminal.title.updated', terminalId, title: 'Registry title' })
+    })
+
+    expect(store.getState().tabs.tabs[0].title).toBe('Registry title')
+    expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('Registry title')
+  })
+
+  it('a scoped coding-agent (claude) terminal ignores terminal.title.updated for pane and tab titles (Task 5)', async () => {
+    const { store, paneContent, tabId, paneId, terminalId } = createStore('claude')
+    await renderAndGetTitleCb(store, paneContent, tabId, paneId)
+    const onMessage = wsMocks.onMessage.mock.calls[wsMocks.onMessage.mock.calls.length - 1]?.[0]
+    expect(onMessage).toBeTypeOf('function')
+
+    act(() => {
+      onMessage({ type: 'terminal.title.updated', terminalId, title: 'Unrevisioned registry title' })
+    })
+
+    // Display comes from the canonical sessionNames cache; an unrevisioned
+    // registry title never rewrites the pane, and it can never name a tab.
+    expect(store.getState().tabs.tabs[0].title).toBe('freshell')
+    expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('freshell')
+  })
+
   it('ignores a stale title callback after its terminal instance is disposed', async () => {
     const { store, paneContent, tabId, paneId } = createStore('shell')
     const { titleCb: staleFire, view } = await renderAndGetTitleCb(store, paneContent, tabId, paneId)

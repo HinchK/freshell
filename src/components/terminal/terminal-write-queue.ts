@@ -17,6 +17,16 @@ export type TerminalWriteQueueOptions = {
   mode?: TerminalWriteQueueMode
   generation?: string
   coalesce?: boolean
+  /**
+   * Atomic clear-then-write (round-4 F2): the flush invokes this callback
+   * immediately before the item's bytes go to the surface, INSIDE the same
+   * generation-guarded queue item — a dropped generation drops the clear
+   * and the write together (the surface is preserved), and a stale
+   * generation is refused at apply time so neither the clear nor the write
+   * ever runs late. An item carrying a clear never coalesces into a
+   * previous item (the clear is a hard boundary between byte ranges).
+   */
+  clearBeforeWrite?: () => void
 }
 
 type TerminalWriteQueueArgs = {
@@ -29,6 +39,15 @@ type TerminalWriteQueueArgs = {
    * Used by TerminalView to consume generation-scoped one-shot markers.
    */
   onItemApplied?: (item: { mode: TerminalWriteQueueMode; generation: string | undefined }) => void
+  /**
+   * Surface-mutation ledger (responsive-terminal-restore WS2): fired for
+   * EVERY completed write item — INCLUDING stale generations (the item's
+   * bytes were already submitted to the surface when it went in flight, so a
+   * stale completion is still a mutation even though onItemApplied rightly
+   * skips it). Never fired for tasks. Used by the quarantine repair to prove
+   * the surface still matches its last checkpoint.
+   */
+  onWriteCompleted?: (item: { mode: TerminalWriteQueueMode; generation: string | undefined }) => void
   budgetMs?: number
   now?: () => number
   requestFrame?: (cb: FrameRequestCallback) => number
@@ -40,6 +59,7 @@ type WriteQueueItem = {
   mode: TerminalWriteQueueMode
   generation: string | undefined
   coalescible: boolean
+  clearBeforeWrite?: () => void
   data: string
   callbacks: Array<() => void>
 }
@@ -140,6 +160,7 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
           for (const callback of item.callbacks) callback()
           args.onItemApplied?.({ mode: item.mode, generation: item.generation })
         }
+        args.onWriteCompleted?.({ mode: item.mode, generation: item.generation })
       } finally {
         scope.complete()
         decrementInFlightWrites(item.generation)
@@ -149,6 +170,12 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
     }
 
     try {
+      // Atomic clear-then-write: the clear runs INSIDE this item, at
+      // apply time — a dropped/stale generation never reaches this point,
+      // and the serial flush guarantees every earlier item's bytes (and
+      // completion) precede it, so nothing can mutate the surface after
+      // the clear except this item's own bytes.
+      item.clearBeforeWrite?.()
       args.write(item.data, onWritten)
     } catch (error) {
       if (!didWriteComplete) {
@@ -163,12 +190,27 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
 
   const flush = () => {
     if (submittedWriteInFlight) return
-    const deadline = now() + budgetMs
+    // The drain budget bounds the time the drain CONSUMES, measured per item
+    // and summed — never ambient wall-clock time. An up-front deadline makes
+    // every OS-scheduling or GC stall that lands between items (or before the
+    // first) abort the drain with zero work done, starving the queue on
+    // loaded machines and losing sync-completing items entirely under the
+    // synchronous frame mocks every e2e harness uses. Per-item spans still
+    // bound genuinely expensive work: a drain stops after the item that
+    // pushes cumulative consumed time past the budget, so each tick makes
+    // real progress before yielding.
+    let consumedMs = 0
     flushing = true
     try {
-      while (queue.length > 0 && now() <= deadline && !submittedWriteInFlight) {
+      while (queue.length > 0 && !submittedWriteInFlight) {
+        const itemStartAt = now()
         const next = queue.shift()
         if (next) runItem(next)
+        const itemEndAt = now()
+        if (itemEndAt > itemStartAt) {
+          consumedMs += itemEndAt - itemStartAt
+        }
+        if (consumedMs > budgetMs) break
       }
     } finally {
       flushing = false
@@ -202,7 +244,11 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
       const callbacks = onWritten ? [onWritten] : []
       const previous = queue[queue.length - 1]
       if (
-        coalescible
+        // An item carrying a clear NEVER coalesces into a previous item:
+        // the clear must run between the previous bytes and this item's
+        // bytes, so it always starts a new queue item.
+        !options?.clearBeforeWrite
+        && coalescible
         && previous?.kind === 'write'
         && previous.coalescible
         && previous.mode === mode
@@ -212,7 +258,15 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
         previous.data += data
         previous.callbacks.push(...callbacks)
       } else {
-        queue.push({ kind: 'write', mode, generation, coalescible, data, callbacks })
+        queue.push({
+          kind: 'write',
+          mode,
+          generation,
+          coalescible,
+          clearBeforeWrite: options?.clearBeforeWrite,
+          data,
+          callbacks,
+        })
       }
       scheduleFlush()
     },

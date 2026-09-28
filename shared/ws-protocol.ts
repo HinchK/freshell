@@ -12,6 +12,8 @@ import type { ClientExtensionEntry } from './extension-types.js'
 import type { ServerSettings } from './settings.js'
 import { LiveTerminalHandleSchema, SessionRefSchema, type RestoreError } from './session-contract.js'
 import { CodexDurabilityRefSchema, type CodexDurabilityRef } from './codex-durability.js'
+import type { SessionNameRecord, SessionNameRef, SessionNameUpdate } from './session-names.js'
+import { TabNameSourceSchema } from './session-names.js'
 
 // ──────────────────────────────────────────────────────────────
 // Shared enums and helpers
@@ -355,6 +357,20 @@ export const TerminalIdleSchema = z.object({
   reason: z.enum(['grace', 'queue-empty']),
 })
 
+/**
+ * `terminal.stuck` — the terminal-mode wedged-agent flag, emitted once per
+ * stuck/unstuck transition (and to fresh subscribers while flagged).
+ * Drives the pane's "Agent appears stuck" card; never a completion edge.
+ * Pinned wire contract shared with the Rust server port - do not change
+ * unilaterally: { terminalId, at (server epoch ms), stuck }.
+ */
+export const TerminalStuckSchema = z.object({
+  type: z.literal('terminal.stuck'),
+  terminalId: z.string().min(1),
+  at: z.number().int().nonnegative(),
+  stuck: z.boolean(),
+})
+
 // ──────────────────────────────────────────────────────────────
 // SDK content block schemas (from Claude Code NDJSON)
 // ──────────────────────────────────────────────────────────────
@@ -419,6 +435,18 @@ export const HelloSchema = z.object({
     // STRIP unknown keys, so without this the capability would silently no-op.
     paneReconcileV1: z.literal(true).optional(),
     paneReconcileFreshAgentV1: z.literal(true).optional(),
+    // Paced terminal restore (responsive-terminal-restore Workstream 1): the
+    // client understands bounded, ascending paced replay batches with
+    // continuation credit. Additive optional — declared, not just sent (same
+    // strip hazard as above); absent for the frozen client shape.
+    pacedTerminalReplayV1: z.literal(true).optional(),
+    // Hidden-pane lifetime claims (responsive-terminal-restore Workstream 1):
+    // the client understands non-hydrating per-connection terminal lifetime
+    // claims carried on `terminal.interest.claimedTerminalIds`, sent only
+    // after the `ready` echo advertises the capability. Additive optional —
+    // declared, not just sent (same strip hazard as above); absent for the
+    // frozen client shape.
+    terminalLifetimeClaimV1: z.literal(true).optional(),
   }).optional(),
   client: z.object({
     mobile: z.boolean().optional(),
@@ -478,6 +506,11 @@ export const TerminalCreateSchema = z.object({
   recoveryIntent: z.literal('fresh_after_restore_unavailable').optional(),
   tabId: z.string().min(1).optional(),
   paneId: z.string().min(1).optional(),
+  /** Unified agent names (Task 1): the pane's pre-durable naming handle,
+   * minted per logical conversation before provider identity exists.
+   * Independent of createRequestId/terminalId/sessionRef; creation retries
+   * re-send the same handle. Additive optional — old servers strip it. */
+  namingHandle: z.string().min(1).optional(),
   /** kata b8ke delayed-request fence: the (epoch, generation) pair the
    *  client observed when it decided to act. A pair sent together is the
    *  fence (the server stale-rejects pre-restart epochs and superseded
@@ -511,6 +544,29 @@ export const TerminalAttachSchema = z.object({
   expectedSessionRef: SessionLocatorSchema.optional(),
   sinceSeq: z.number().int().nonnegative().optional(),
   maxReplayBytes: z.number().int().positive().optional(),
+  /** Paced terminal restore (responsive-terminal-restore Workstream 1):
+    *  the negotiated forward-page limit the client requests — an optional
+    *  UPPER BOUND on each paced replay page's serialized bytes, honored
+    *  only on pacedTerminalReplayV1 connections and clamped by the server
+    *  to its own page-budget cap (min(requested, server cap)). E2R1
+    *  finding 2 (the honest bound): pages are bounded by
+    *  max(requested, the atomic frame size) — a single frame larger than
+    *  the request forms its own ATOMIC single-frame page, bounded by the
+    *  server's fragment cap (every frame is pre-fragmented, so one
+    *  frame's serialized size never exceeds it). Additive optional;
+    *  absent or invalid values keep the server's default. */
+  replayPageBytes: z
+    .number()
+    .int()
+    .positive()
+    .describe(
+      'Optional upper bound on each paced replay page\'s serialized bytes ' +
+        '(pacedTerminalReplayV1 connections only), clamped to the server\'s ' +
+        'page-budget cap. Pages are bounded by max(requested, the atomic ' +
+        'frame size): a single frame larger than the request forms its own ' +
+        'atomic page, bounded by the server fragment cap.',
+    )
+    .optional(),
   attachRequestId: z.string().min(1).optional(),
   /** Positive marker: the attaching xterm surface was freshly constructed
    * (page load / renderer recreation / user reset). Servers that know this
@@ -680,6 +736,17 @@ export const TerminalKillSchema = z.object({
    */
   observedEpoch: z.number().int().nonnegative().optional(),
   observedGeneration: z.number().int().nonnegative().optional(),
+  /**
+   * Wedge-backstop Task 2: WHY the client is killing this terminal.
+   * `'stuck-recovery'` = the "Agent appears stuck" card's restart action —
+   * the server runs the process-only kill and deliberately SKIPS the
+   * durable pane-close envelope so the follow-up respawn can resume the
+   * session (the card's start-fresh action omits the reason — the abandoned
+   * identity must be retired by the full durable close). Absent or any
+   * other value keeps today's full pane-close semantics. Additive optional;
+   * WS_PROTOCOL_VERSION stays put (older servers accept-and-strip inbound).
+   */
+  reason: z.string().optional(),
 })
 
 export const CodexActivityListSchema = z.object({
@@ -721,6 +788,10 @@ export const UiLayoutSyncSchema = z.object({
     id: z.string(),
     title: z.string().optional(),
     fallbackSessionRef: SessionLocatorSchema.optional(),
+    /** Unified agent names (Task 6): the tab's stable naming-source
+     * relationship — a mirror of client `Tab.nameSource`. Absent until
+     * initial content or migration resolves ownership. Additive optional. */
+    nameSource: TabNameSourceSchema.optional(),
   })),
   activeTabId: z.string().nullable().optional(),
   layouts: z.record(z.string(), z.unknown()),
@@ -794,6 +865,9 @@ export const FreshAgentCreateSchema = z.object({
   /** D8: the creating tab's client-side id; the server composes the ledger row's
    * `tabKey` as `deviceId:tabId`. Non-strict schema — tolerated by older servers. */
   tabId: z.string().min(1).optional(),
+  /** Unified agent names (Task 1): the pane's pre-durable naming handle — see
+   * `terminal.create.namingHandle`. Additive optional. */
+  namingHandle: z.string().min(1).optional(),
   /** kata b8ke delayed-request fence: the (epoch, generation) pair the
    *  client observed when it decided to act. A pair sent together is the
    *  fence; neither-sent is legacy-unfenced. */
@@ -1065,6 +1139,13 @@ export const ReadyCapabilitiesSchema = z
     terminalInterestV1: z.literal(true).optional(),
     paneReconcileV1: z.literal(true).optional(),
     paneReconcileFreshAgentV1: z.literal(true).optional(),
+    // Paced terminal restore (Workstream 1): echoed only for a hello that
+    // opted in via capabilities.pacedTerminalReplayV1.
+    pacedTerminalReplayV1: z.literal(true).optional(),
+    // Hidden-pane lifetime claims (Workstream 1): echoed only for a hello
+    // that opted in via capabilities.terminalLifetimeClaimV1. Present iff the
+    // client may send `terminal.interest.claimedTerminalIds`.
+    terminalLifetimeClaimV1: z.literal(true).optional(),
   })
   .optional()
 
@@ -1076,8 +1157,32 @@ export const TerminalInterestSchema = z.object({
   revision: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
   focusedTerminalId: z.string().min(1).max(512).nullable().optional(),
   visibleTerminalIds: z.array(z.string().min(1).max(512)).max(1024),
+  /** Hidden-pane lifetime claims (negotiated `terminalLifetimeClaimV1` only):
+   *  terminals this connection wants kept alive WITHOUT attaching. The claim
+   *  never grants replay or output delivery and never touches geometry or
+   *  stream identity; a later snapshot omitting an id is the explicit
+   *  withdrawal (release). The client sends the field only after the ready
+   *  echo; older clients never send it. */
+  claimedTerminalIds: z.array(z.string().min(1).max(512)).max(1024).optional(),
 })
 export type TerminalInterestMessage = z.infer<typeof TerminalInterestSchema>
+
+/**
+ * Paced replay continuation credit (responsive-terminal-restore Workstream 1):
+ * sent by a client whose hello negotiated `pacedTerminalReplayV1` after it
+ * fully consumed an ordered replay page. `consumedSeq` is the last sequence
+ * consumed in order; `attachRequestId` scopes the credit to one attach
+ * generation. Additive optional — older servers accept-and-strip it and
+ * protocol version stays 10.
+ */
+export const TerminalReplayCreditSchema = z.object({
+  type: z.literal('terminal.replay.credit'),
+  terminalId: z.string().min(1).max(512),
+  streamId: z.string().min(1).max(512),
+  attachRequestId: z.string().min(1).max(512),
+  consumedSeq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+})
+export type TerminalReplayCreditMessage = z.infer<typeof TerminalReplayCreditSchema>
 
 // ── Client message discriminated union ──
 
@@ -1099,6 +1204,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   TerminalInputSchema,
   TerminalResizeSchema,
   TerminalKillSchema,
+  TerminalReplayCreditSchema,
   CodexActivityListSchema,
   OpencodeActivityListSchema,
   ClaudeActivityListSchema,
@@ -1222,6 +1328,13 @@ export type TerminalCreatedMessage = {
   restoreError?: RestoreError
   /** Resume-validation: operator-visible notice set when the server dropped a stale resume id and spawned fresh. The client writes it into the pane's xterm. Additive; Node never sets it. */
   notice?: string
+  /** Unified agent names (Task 1): canonical session-name projection for this
+   * terminal's naming ref (last-known; the `session.name.updated` broadcast is
+   * the live authority). Additive optional. */
+  sessionName?: SessionNameRecord
+  /** Unified agent names (Task 1): the naming identity this terminal's name
+   * resolves through (pending handle before durable materialization). */
+  nameRef?: SessionNameRef
   /** b8ke fence-heal: the create's committed owner pair (additive, absent on legacy servers). */
   ownerKind?: 'terminal'
   ownerEpoch?: number
@@ -1236,7 +1349,9 @@ export type TerminalAttachReadyMessage = {
   geometryAuthority?: TerminalGeometryAuthority
   requestedSinceSeq?: number
   effectiveSinceSeq?: number
-  replayResetReason?: 'geometry_authority_unknown'
+  /** Restore contract (negotiated pacedTerminalReplayV1 only): earliest sequence position still available for replay (headSeq+1 when nothing older is retained). */
+  oldestRetainedSeq?: number
+  replayResetReason?: 'geometry_authority_unknown' | 'retention_lost'
   headSeq: number
   replayFromSeq: number
   replayToSeq: number
@@ -1434,8 +1549,16 @@ export type TerminalOutputGapMessage = {
   streamId: string
   fromSeq: number
   toSeq: number
-  reason: 'queue_overflow' | 'replay_window_exceeded' | 'replay_budget_exceeded'
+  reason:
+    | 'queue_overflow'
+    | 'replay_window_exceeded'
+    | 'replay_budget_exceeded'
+    | 'handoff_boundary_reached'
   attachRequestId?: string
+  /** Restore contract (negotiated pacedTerminalReplayV1 only): the terminal's current headSeq at gap-emission time. */
+  headSeq?: number
+  /** Restore contract (negotiated pacedTerminalReplayV1 only): earliest sequence position still available for replay at gap-emission time. */
+  oldestRetainedSeq?: number
 }
 
 export type TerminalTitleUpdatedMessage = {
@@ -1511,12 +1634,33 @@ export type AmplifierActivityUpdatedMessage = z.infer<typeof AmplifierActivityUp
 
 export type TerminalTurnCompleteMessage = z.infer<typeof TerminalTurnCompleteSchema>
 export type TerminalIdleMessage = z.infer<typeof TerminalIdleSchema>
+/**
+ * `terminal.stuck` — the terminal-mode wedged-agent flag, emitted once per
+ * stuck/unstuck transition (and to fresh subscribers while flagged). Drives
+ * the pane's "Agent appears stuck" card; never a completion edge.
+ */
+export type TerminalStuckMessage = z.infer<typeof TerminalStuckSchema>
 
 // -- Sessions --
 
 export type SessionsChangedMessage = {
   type: 'sessions.changed'
   revision: number
+}
+
+/**
+ * Unified agent names (Task 1): the canonical name broadcast. Published only
+ * after the server's `SessionNames` store successfully commits or adopts a
+ * document generation, in local generation order. The payload IS a
+ * `SessionNameUpdate` (record + documentGeneration + relevant pending→durable
+ * redirects + whether the accepted record changed); clients fold by record
+ * and redirect revision, never arrival time. `sessions.changed` remains the
+ * directory-invalidation signal and never orders names. Additive
+ * server→client only; WS_PROTOCOL_VERSION deliberately stays 10 (the client
+ * never gates on it — pre-frame servers simply never send it).
+ */
+export type SessionNameUpdatedMessage = SessionNameUpdate & {
+  type: 'session.name.updated'
 }
 
 // -- Settings --
@@ -1661,7 +1805,7 @@ export type SdkRestoreFailureCode =
   | 'RESTORE_STALE_REVISION'
 
 export type FreshAgentServerMessage =
-  | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }
+  | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string }; sessionName?: SessionNameRecord; nameRef?: SessionNameRef }
   | { type: 'freshAgent.create.failed'; requestId: string; code: string; message: string; retryable?: boolean
       /** kata b8ke: ownership-conflict refusals only — the owning kind, its
        *  generation, and the emitting server's boot epoch, so the client
@@ -1672,7 +1816,7 @@ export type FreshAgentServerMessage =
       ownerEpoch?: number }
   | { type: 'freshAgent.send.accepted'; requestId: string; sessionId: string; sessionType: string; provider: string; submittedTurnId?: string; cwd?: string }
   | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown }
-  | { type: 'freshAgent.session.materialized'; previousSessionId: string; sessionId: string; sessionType: string; provider: string; sessionRef?: { provider: string; sessionId: string } }
+  | { type: 'freshAgent.session.materialized'; previousSessionId: string; sessionId: string; sessionType: string; provider: string; sessionRef?: { provider: string; sessionId: string }; sessionName?: SessionNameRecord; nameRef?: SessionNameRef }
   | { type: 'freshAgent.forked'; requestId?: string; parentSessionId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }
   | { type: 'freshAgent.killed'; sessionId: string; sessionType: string; provider: string; success: boolean }
 
@@ -1764,6 +1908,10 @@ export type TerminalInventoryMessage = {
     codexDurability?: CodexDurabilityRef
     /** Server→client only, additive + optional: the terminal's resume target is an opencode subagent (child) session. */
     resumeTargetIsSubagent?: boolean
+    /** Unified agent names (Task 1): canonical session-name projection (last-known). Additive optional. */
+    sessionName?: SessionNameRecord
+    /** Unified agent names (Task 1): the naming identity this terminal's name resolves through. Additive optional. */
+    nameRef?: SessionNameRef
   }>
   terminalMeta: TerminalMetaRecord[]
 }
@@ -1809,6 +1957,8 @@ export type ServerMessage =
   | AmplifierActivityUpdatedMessage
   | TerminalTurnCompleteMessage
   | TerminalIdleMessage
+  | TerminalStuckMessage
+  | SessionNameUpdatedMessage
   | SessionsChangedMessage
   | SettingsUpdatedMessage
   | UiCommandMessage

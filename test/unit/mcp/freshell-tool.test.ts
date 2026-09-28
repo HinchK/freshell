@@ -133,6 +133,31 @@ describe('executeAction -- tab actions', () => {
     expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({ name: 'Work', mode: 'claude' }))
   })
 
+  it('new-tab seeds the create name with automatic intent by default', async () => {
+    mockClient.post.mockResolvedValue({ id: 't1' })
+    await executeAction('new-tab', { name: 'Fresh conversation', mode: 'claude' })
+    expect(mockClient.post).toHaveBeenCalledWith(
+      '/api/tabs',
+      expect.objectContaining({ name: 'Fresh conversation', nameIntent: 'automatic' }),
+    )
+  })
+
+  it('new-tab forwards an explicit user intent for the create name', async () => {
+    mockClient.post.mockResolvedValue({ id: 't1' })
+    await executeAction('new-tab', { name: 'Named by a human', nameIntent: 'user' })
+    expect(mockClient.post).toHaveBeenCalledWith(
+      '/api/tabs',
+      expect.objectContaining({ name: 'Named by a human', nameIntent: 'user' }),
+    )
+  })
+
+  it('rejects an unknown nameIntent without contacting the server', async () => {
+    const result = await executeAction('rename-tab', { target: 't1', name: 'X', nameIntent: 'bogus' })
+    expect(result).toMatchObject({ error: expect.stringContaining('nameIntent') })
+    expect(mockClient.patch).not.toHaveBeenCalled()
+    expect(mockClient.post).not.toHaveBeenCalled()
+  })
+
   it('new-tab maps resume to canonical sessionRef instead of legacy resumeSessionId', async () => {
     mockClient.post.mockResolvedValue({ id: 't1' })
 
@@ -386,6 +411,44 @@ describe('executeAction -- tab actions', () => {
     )
   })
 
+  it('rename-tab defaults the naming intent to automatic', async () => {
+    mockClient.get.mockResolvedValue({ tabs: [{ id: 't1', title: 'Tab 1' }], activeTabId: 't1' })
+    mockClient.patch.mockResolvedValue({ ok: true })
+    await executeAction('rename-tab', { target: 't1', name: 'Agent suggestion' })
+    expect(mockClient.patch).toHaveBeenCalledWith(
+      expect.stringContaining('/api/tabs/t1'),
+      expect.objectContaining({ name: 'Agent suggestion', nameIntent: 'automatic' }),
+    )
+  })
+
+  it('rename-tab forwards an explicit user intent', async () => {
+    mockClient.get.mockResolvedValue({ tabs: [{ id: 't1', title: 'Tab 1' }], activeTabId: 't1' })
+    mockClient.patch.mockResolvedValue({ ok: true })
+    await executeAction('rename-tab', { target: 't1', name: 'Human rename', nameIntent: 'user' })
+    expect(mockClient.patch).toHaveBeenCalledWith(
+      expect.stringContaining('/api/tabs/t1'),
+      expect.objectContaining({ name: 'Human rename', nameIntent: 'user' }),
+    )
+  })
+
+  it('rename responses report the server-accepted name and source, not the submitted string', async () => {
+    mockClient.get.mockResolvedValue({ tabs: [{ id: 't1', title: 'Tab 1' }], activeTabId: 't1' })
+    const acceptedResponse = {
+      data: {
+        tabId: 't1',
+        sessionName: {
+          record: { ref: { kind: 'session', provider: 'claude', sessionId: 's1' }, name: 'Accepted winner', source: 'manual', revision: 3 },
+          documentGeneration: 9,
+          redirects: [],
+          changed: true,
+        },
+      },
+    }
+    mockClient.patch.mockResolvedValue(acceptedResponse)
+    const result = await executeAction('rename-tab', { target: 't1', name: 'Losing suggestion', nameIntent: 'automatic' })
+    expect(result).toEqual(acceptedResponse)
+  })
+
   it('has-tab calls GET /api/tabs/has?target=...', async () => {
     mockClient.get.mockResolvedValue({ exists: true })
     await executeAction('has-tab', { target: 'Work' })
@@ -531,6 +594,34 @@ describe('executeAction -- pane actions', () => {
     expect(mockClient.patch).toHaveBeenCalledWith(
       expect.stringContaining('/api/panes/p1'),
       expect.objectContaining({ name: 'My Pane' }),
+    )
+  })
+
+  it('rename-pane defaults the naming intent to automatic', async () => {
+    mockClient.get.mockImplementation((path: string) => {
+      if (path === '/api/tabs') return Promise.resolve({ tabs: [{ id: 't1', activePaneId: 'p1' }], activeTabId: 't1' })
+      if (path.includes('/api/panes?tabId=t1')) return Promise.resolve({ panes: [{ id: 'p1', index: 0 }] })
+      return Promise.resolve({})
+    })
+    mockClient.patch.mockResolvedValue({ ok: true })
+    await executeAction('rename-pane', { target: 'p1', name: 'Agent suggestion' })
+    expect(mockClient.patch).toHaveBeenCalledWith(
+      expect.stringContaining('/api/panes/p1'),
+      expect.objectContaining({ name: 'Agent suggestion', nameIntent: 'automatic' }),
+    )
+  })
+
+  it('rename-pane forwards an explicit user intent', async () => {
+    mockClient.get.mockImplementation((path: string) => {
+      if (path === '/api/tabs') return Promise.resolve({ tabs: [{ id: 't1', activePaneId: 'p1' }], activeTabId: 't1' })
+      if (path.includes('/api/panes?tabId=t1')) return Promise.resolve({ panes: [{ id: 'p1', index: 0 }] })
+      return Promise.resolve({})
+    })
+    mockClient.patch.mockResolvedValue({ ok: true })
+    await executeAction('rename-pane', { target: 'p1', name: 'Human rename', nameIntent: 'user' })
+    expect(mockClient.patch).toHaveBeenCalledWith(
+      expect.stringContaining('/api/panes/p1'),
+      expect.objectContaining({ name: 'Human rename', nameIntent: 'user' }),
     )
   })
 
@@ -1517,7 +1608,7 @@ describe('executeAction -- tmux aliases', () => {
     mockClient.get.mockResolvedValue({ tabs: [{ id: 't1', title: 'Old' }], activeTabId: 't1' })
     mockClient.patch.mockResolvedValue({ ok: true })
     await executeAction('rename-window', { target: 'Old', name: 'New' })
-    expect(mockClient.patch).toHaveBeenCalledWith('/api/tabs/t1', { name: 'New' })
+    expect(mockClient.patch).toHaveBeenCalledWith('/api/tabs/t1', { name: 'New', nameIntent: 'automatic' })
   })
 
   it('next-window routes to next-tab', async () => {

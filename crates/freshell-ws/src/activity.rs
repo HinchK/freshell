@@ -6124,6 +6124,7 @@ mod tests {
         hub.set_opencode_lane_deps(Arc::new(OpencodeLaneDeps {
             http: Arc::new(PendingHttp),
             events: Arc::new(NeverConnects),
+            native_title_observer: None,
         }));
         observer_send(
             &hub,
@@ -6256,6 +6257,7 @@ mod tests {
         hub.set_opencode_lane_deps(Arc::new(crate::opencode_lane::OpencodeLaneDeps {
             http: Arc::new(http),
             events: Arc::new(ParkedStream),
+            native_title_observer: None,
         }));
         hub.set_opencode_busy_deadman_for_tests(500);
         observer_send(

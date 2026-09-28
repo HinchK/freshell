@@ -340,6 +340,47 @@ async fn apply_codex_identity(
     state
         .identity
         .upsert(terminal_id, Some("codex"), Some(thread_id), cwd, now_ms());
+    // Unified agent names (Task 2): the rollout locator's adoption/rebind —
+    // the rollout file IS the verified persistence evidence (the locator's
+    // whole job is finding persisted rollouts). The upsert established the
+    // durable identity and deliberately left a still-pending name ref for
+    // THIS transfer (the switch rule retargets only already-durable refs);
+    // the stashed pending handle transfers onto the thread with the rollout
+    // path as the native location, then the identity/registry bindings
+    // advance. A pathless adoption keeps the handle pending for a later
+    // located edge.
+    if let Some(rollout) = rollout_path {
+        // T2-M6 (Task 3): the rollout walk's root prefers the PROXIED
+        // initialize's captured home (the app-server itself reported where
+        // these rollouts live) over ambient env.
+        let codex_home = state
+            .identity
+            .codex_home_of(terminal_id)
+            .or_else(|| {
+                codex_sessions_root()
+                    .and_then(|root| root.parent().map(|home| home.display().to_string()))
+            })
+            .unwrap_or_default();
+        let acquisition = freshell_protocol::native_location::NativeAcquisition {
+            location: freshell_protocol::native_location::NativeLocation::Codex {
+                codex_home,
+                native_thread_id: Some(thread_id.to_string()),
+                rollout_path: Some(rollout.display().to_string()),
+                persistence_evidence: Some(rollout.display().to_string()),
+            },
+            evidence: freshell_protocol::native_location::NativeEvidenceKind::PersistedMetadata,
+            persistence: freshell_protocol::native_location::NativePersistence::Verified,
+        };
+        crate::identity::bind_pending_naming(
+            &state.identity,
+            &state.registry,
+            terminal_id,
+            freshell_protocol::session_names::NamedProvider::Codex,
+            thread_id,
+            acquisition,
+        )
+        .await;
+    }
     state.registry.set_meta(
         terminal_id,
         None,

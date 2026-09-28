@@ -26,8 +26,10 @@ import panesReducer, {
   clearDeadSessionAdjudication,
   setReconcileWarming,
   clearReconcileWarming,
+  setReconcilePendingPanes,
 } from '../../../../src/store/panesSlice'
 import type { PanesState } from '../../../../src/store/panesSlice'
+import { buildRestoreError } from '@shared/session-contract'
 import {
   persistMiddleware,
   resetPersistFlushListenersForTests,
@@ -116,6 +118,113 @@ describe('reconcile reducers', () => {
     const next = panesReducer(stateWithTerminalPane({}), applyReconcileAttach({ tabId: 'tab1', paneId: 'p1', terminalId: 't', duplicate: true }))
     expect(terminalContent(next, 'tab1', 'p1').reconcileNotice)
       .toBe('A duplicate terminal for this session was detected and ignored.')
+  })
+
+  // Task-009b (goal 4): a verdict that CONFIRMS the pane's exact current
+  // identity is a no-change fold — it must not bump the volatile epoch (the
+  // bump re-fired the lifecycle effect on every reconnect flap and its
+  // re-drive superseded the checkpoint delta resume with a full refetch)
+  // and must not drop the checkpoint stream identity a later resume needs.
+  describe('applyReconcileAttach no-change gate (task-009b)', () => {
+    function convergedPane(overrides: Partial<TerminalPaneContent> = {}): PanesState {
+      return stateWithTerminalPane({
+        createRequestId: 'cr-keep',
+        status: 'running',
+        terminalId: 't1',
+        serverInstanceId: 'srv-1',
+        streamId: 'st-1',
+        sessionRef: { provider: 'claude', sessionId: 's1' },
+        ...overrides,
+      })
+    }
+
+    it('a no-change fold (same terminal/instance/sessionRef, no flags) skips the epoch bump and keeps the streamId', () => {
+      const withPending = panesReducer(convergedPane(), setReconcilePendingPanes({
+        paneKeys: ['tab1:p1'],
+        startedAt: 123,
+      }))
+      const next = panesReducer(withPending, applyReconcileAttach({
+        tabId: 'tab1',
+        paneId: 'p1',
+        terminalId: 't1',
+        serverInstanceId: 'srv-1',
+        sessionRef: { provider: 'claude', sessionId: 's1' },
+      }))
+      const c = terminalContent(next, 'tab1', 'p1')
+      expect(c.reconcileEpoch).toBeUndefined()
+      expect(c.streamId).toBe('st-1')
+      expect(c.terminalId).toBe('t1')
+      expect(c.status).toBe('running')
+      expect(c.createRequestId).toBe('cr-keep')
+      // The pane's reconcile pending window still closes on its verdict.
+      expect(next.reconcilePendingPanes?.['tab1:p1']).toBeUndefined()
+    })
+
+    it('a corrective duplicate verdict still bumps the epoch but preserves the same terminal streamId', () => {
+      const next = panesReducer(convergedPane(), applyReconcileAttach({
+        tabId: 'tab1',
+        paneId: 'p1',
+        terminalId: 't1',
+        serverInstanceId: 'srv-1',
+        duplicate: true,
+      }))
+      const c = terminalContent(next, 'tab1', 'p1')
+      expect(c.reconcileEpoch).toBe(1)
+      expect(c.streamId).toBe('st-1')
+      expect(c.reconcileNotice).toBe('A duplicate terminal for this session was detected and ignored.')
+    })
+
+    it('an identity-changing fold drops the stale streamId and bumps the epoch', () => {
+      const next = panesReducer(convergedPane(), applyReconcileAttach({
+        tabId: 'tab1',
+        paneId: 'p1',
+        terminalId: 't2',
+        serverInstanceId: 'srv-1',
+      }))
+      const c = terminalContent(next, 'tab1', 'p1')
+      expect(c.terminalId).toBe('t2')
+      expect(c.streamId).toBeUndefined()
+      expect(c.reconcileEpoch).toBe(1)
+    })
+
+    it('identity-field changes still fold and bump: serverInstanceId drift', () => {
+      const next = panesReducer(convergedPane(), applyReconcileAttach({
+        tabId: 'tab1', paneId: 'p1', terminalId: 't1', serverInstanceId: 'srv-2',
+      }))
+      expect(terminalContent(next, 'tab1', 'p1').reconcileEpoch).toBe(1)
+      expect(terminalContent(next, 'tab1', 'p1').serverInstanceId).toBe('srv-2')
+    })
+
+    it('identity-field changes still fold and bump: corrected sessionRef', () => {
+      const next = panesReducer(convergedPane(), applyReconcileAttach({
+        tabId: 'tab1', paneId: 'p1', terminalId: 't1', serverInstanceId: 'srv-1',
+        sessionRef: { provider: 'claude', sessionId: 'server-truth' },
+      }))
+      const c = terminalContent(next, 'tab1', 'p1')
+      expect(c.reconcileEpoch).toBe(1)
+      expect(c.sessionRef).toEqual({ provider: 'claude', sessionId: 'server-truth' })
+    })
+
+    it('a stuck error state still folds and bumps even with matching identity', () => {
+      const errored = convergedPane({
+        restoreError: buildRestoreError('provider_runtime_failed'),
+      })
+      const next = panesReducer(errored, applyReconcileAttach({
+        tabId: 'tab1', paneId: 'p1', terminalId: 't1', serverInstanceId: 'srv-1',
+      }))
+      const c = terminalContent(next, 'tab1', 'p1')
+      expect(c.reconcileEpoch).toBe(1)
+      expect(c.restoreError).toBeUndefined()
+    })
+
+    it('a non-running pane still folds and bumps even with matching identity', () => {
+      const next = panesReducer(convergedPane({ status: 'creating' }), applyReconcileAttach({
+        tabId: 'tab1', paneId: 'p1', terminalId: 't1', serverInstanceId: 'srv-1',
+      }))
+      const c = terminalContent(next, 'tab1', 'p1')
+      expect(c.reconcileEpoch).toBe(1)
+      expect(c.status).toBe('running')
+    })
   })
 
   it('resetPaneForReconcileCreate(respawn) clears handles, keeps createRequestId, sets server-named sessionRef', () => {

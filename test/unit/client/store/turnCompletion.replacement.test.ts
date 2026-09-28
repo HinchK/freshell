@@ -140,6 +140,11 @@ describe('turn completion across terminal.replaced fold', () => {
       terminalId: NEW_ID,
       at: 100,
       seq: 1,
+      source: 'terminal',
+      // DR5-3: the receipt-time witness bit (this test's store has no
+      // receipt middleware wired, so the event queues with the
+      // un-stamped default: unwitnessed).
+      watched: false,
     }])
     expect(store.getState().turnCompletion.lastIdleAtByTerminalId?.[NEW_ID]).toBe(100)
   })

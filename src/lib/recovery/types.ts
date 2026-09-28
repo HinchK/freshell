@@ -35,6 +35,13 @@ export interface RecoveryPane {
 export interface RecoveryTab {
   tabKey: string
   tabName: string
+  /**
+   * Unified agent names (Task 6): the tab's stable naming-source
+   * relationship as recorded in the durable registry snapshot (additive;
+   * absent on pre-Task-6 records). The recovery builder remaps it through
+   * the old→new pane-id map when the restore remints pane ids.
+   */
+  nameSource?: import('@shared/session-names').TabNameSource
   panes: RecoveryPane[]
 }
 

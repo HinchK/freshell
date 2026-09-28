@@ -94,6 +94,15 @@ pub struct SessionDirectoryState {
     /// matching items per request (`session-indexer.ts:1144-1148`, key =
     /// `provider:sessionId`).
     pub metadata: crate::session_metadata::SessionMetadataStore,
+    /// Unified agent names (Task 7 review M1): whether the one-time
+    /// legacy-name consolidation's receipt has committed for this process
+    /// (captured at wiring time, after the boot consolidation ran — the
+    /// receipt is monotonic within a process). Once committed, a scoped
+    /// coding-agent session's displayed title never consults the migrated
+    /// `config.sessionOverrides` title fields again — not even when the
+    /// documented side-by-side freshness reload resurrects them
+    /// mid-session. Out-of-scope providers keep the legacy ladder.
+    pub legacy_name_migration_completed: bool,
 }
 
 /// One directory item, typed for the sort/filter/cursor derivation. Serialized to
@@ -563,7 +572,42 @@ async fn session_directory(
     // snapshot is captured — captured order is authoritative, and a seq
     // assigned pre-await would interleave with concurrent requests.
     let snapshot_seq = next_snapshot_seq();
-    let items = apply_session_overrides(items, &state.settings.session_overrides());
+    // Delta-review round 4, finding 1: the page's KILROY-ONLY rows, answered
+    // by the ONE shared seam (`crate::kilroy_lane`) — metadata-typed kilroy
+    // AND no canonical record AND no live scoped terminal (the directory
+    // has no terminal registry, so the live component is skipped here; the
+    // record component owns the dual-mode decision, and a pending-only
+    // dual-mode row converges the moment its record binds). One metadata
+    // read per request, shared with the sessionType overlay below.
+    let metadata_entries = state.metadata.get_all().await;
+    let kilroy_only_lanes = {
+        let candidates: Vec<crate::kilroy_lane::KilroyLaneCandidate> = items
+            .iter()
+            .filter(|item| {
+                freshell_freshagent::naming::named_provider_for(Some(&item.provider), None)
+                    .is_some()
+            })
+            .map(|item| crate::kilroy_lane::KilroyLaneCandidate {
+                provider: item.provider.clone(),
+                session_id: item.session_id.clone(),
+                cwd: item.cwd.clone(),
+            })
+            .collect();
+        crate::kilroy_lane::kilroy_only_keys(
+            &metadata_entries,
+            state.identity.naming().as_ref(),
+            &state.identity,
+            None,
+            &candidates,
+        )
+        .await
+    };
+    let items = apply_session_overrides(
+        items,
+        &state.settings.session_overrides(),
+        state.legacy_name_migration_completed,
+        &kilroy_only_lanes,
+    );
     // Task 20: read-join `sessionType` from the SESSION-06 metadata store --
     // ONE `get_all()` per request (a cached read; disk is touched at most
     // once per store lifetime), mirroring the original indexer reading the
@@ -572,7 +616,7 @@ async fn session_directory(
     // `applyOverride` first, then the metadata `sessionType`) and BEFORE the
     // live-terminal join (the original's indexer output already carries
     // `sessionType` when `toItems` runs).
-    let items = apply_session_metadata(items, &state.metadata.get_all().await);
+    let items = apply_session_metadata(items, &metadata_entries);
     // Capture the revision before quarantining corrupt persisted rows. A
     // change to a conflicting source must still invalidate a client's cached
     // read model even though that source is not safe to render.
@@ -627,6 +671,16 @@ async fn session_directory(
     // part of the sidebar's "running" set, matching the original's
     // `TerminalMetadataService.list()` input to `toItems`.
     let items = join_live_terminals(items, &identities);
+    // Unified agent names (Task 2): resolve every scoped item's durable name
+    // BEFORE the query (search/sort must see the manual rename), through the
+    // SAME naming authority every rename route targets. A manual or
+    // migration-protected record wins the displayed `title` in place; every
+    // found record additionally rides the page additively as
+    // `sessionName`/`nameRef` (merged below) — non-manual records never
+    // shadow a provider-generated title (provider titles fold into the
+    // record itself through the observation lanes).
+    let (items, naming_projection) =
+        apply_naming_projection(items, state.identity.naming().as_ref()).await;
     match apply_query(items, &query, &identities) {
         Ok(mut page) => {
             page["revision"] = json!(revision);
@@ -659,6 +713,10 @@ async fn session_directory(
             if !colors.is_empty() {
                 page["projectColors"] = Value::Object(colors);
             }
+            // Unified agent names (Task 2): the additive per-item
+            // `sessionName`/`nameRef` fields (the same durable record every
+            // rename route targets — the client prefers it when present).
+            merge_naming_projection(&mut page, &naming_projection);
             Json(page).into_response()
         }
         // Bad cursor → 400, matching `querySessionDirectory`'s `/cursor/i` → 400.
@@ -1094,9 +1152,29 @@ fn item_from_meta(
 /// flavor merge): `title`/`summary` prefer the override; `archived` reflects the
 /// override (default false); a `deleted: true` override removes the item. Keyed by
 /// `provider:sessionId` (`buildSessionKey`, `service.ts:36-38`).
+///
+/// Unified agent names (Task 7 review M1): once the legacy-name
+/// consolidation's receipt has committed, a SCOPED coding-agent row (one of
+/// the three unified providers) never consults the migrated
+/// `titleOverride`/`titleSource` fields again — the canonical name record
+/// owns its title, and a mid-session freshness-reload resurrection of the
+/// migrated fields (the documented side-by-side ConfigLock limit) cannot
+/// retitle it. The never-migrated fields (`summaryOverride`, `archived`,
+/// `deleted`) still apply, and every out-of-scope provider keeps the
+/// legacy ladder verbatim.
+///
+/// Delta-review round 4, finding 1: `kilroy_only_lanes` (the shared seam's
+/// answer for this page) keeps the title lane OPEN for KILROY-ONLY rows —
+/// kilroy retains its existing UI, and the sweep still writes those rows'
+/// legacy-ladder titles, so closing the lane on the provider string alone
+/// would stop displaying them. A dual-mode row (canonical record through a
+/// supported mode) is never in the set, so its lane stays closed — the
+/// supported-mode record owns its ONE singular name.
 fn apply_session_overrides(
     items: Vec<DirItem>,
     overrides: &serde_json::Map<String, Value>,
+    legacy_name_migration_completed: bool,
+    kilroy_only_lanes: &std::collections::HashSet<String>,
 ) -> Vec<DirItem> {
     let canonical_keys: std::collections::HashSet<String> =
         items.iter().map(DirItem::key).collect();
@@ -1118,40 +1196,49 @@ fn apply_session_overrides(
                 if ov.get("deleted").and_then(Value::as_bool).unwrap_or(false) {
                     return None;
                 }
-                if let Some(t) = ov.get("titleOverride").and_then(Value::as_str) {
-                    // Node's applyOverride guard (`session-indexer.ts:210-214`):
-                    // the override title applies iff it is NON-EMPTY (JS `!!`)
-                    // AND NOT (the PARSED source is 'provider-generated' AND
-                    // the row's `titleSource` is exactly 'dir'/'first-message',
-                    // strict `===` -- 'ai'/'user'/absent/any-other row source
-                    // still applies). Without this, the auto-title sweep's
-                    // dir/first-message row re-shadows a provider-generated
-                    // title within one 2s tick of the ai-title-shadow-cleanup
-                    // migration clearing it.
-                    let row_source = ov.get("titleSource").and_then(Value::as_str);
-                    let provider_generated_shadow = item.title_source.as_deref()
-                        == Some("provider-generated")
-                        && matches!(row_source, Some("dir") | Some("first-message"));
-                    if !t.is_empty() && !provider_generated_shadow {
-                        // b5fb: expose the reset-flow provenance exactly when
-                        // the override APPLIES (the same gate as Node's
-                        // `applyOverride`). Capture the pre-overlay
-                        // (parsed/provider-native) title into `provider_title`
-                        // BEFORE replacing it — left None when the parse had
-                        // no title. `title_override_source` re-validates the
-                        // stored row: config.json is hand-editable, and an
-                        // out-of-ladder string would fail the client's z.enum
-                        // page parse (`shared/read-models.ts`) — junk degrades
-                        // to "no source recorded", matching Node's
-                        // `isTitleSource` gate in `applyOverride`.
-                        item.title_overridden = true;
-                        item.title_override_source = row_source
-                            .filter(|s| {
-                                matches!(*s, "user" | "ai" | "first-message" | "legacy" | "dir")
-                            })
-                            .map(str::to_string);
-                        item.provider_title = item.title.clone();
-                        item.title = Some(t.to_string());
+                // The receipt gate: a scoped row's title consultation closes
+                // once the consolidation committed — EXCEPT the
+                // kilroy-only rows, which keep the legacy lane.
+                let title_lane_open = !legacy_name_migration_completed
+                    || freshell_freshagent::naming::named_provider_for(Some(&item.provider), None)
+                        .is_none()
+                    || kilroy_only_lanes.contains(&canonical_key);
+                if title_lane_open {
+                    if let Some(t) = ov.get("titleOverride").and_then(Value::as_str) {
+                        // Node's applyOverride guard (`session-indexer.ts:210-214`):
+                        // the override title applies iff it is NON-EMPTY (JS `!!`)
+                        // AND NOT (the PARSED source is 'provider-generated' AND
+                        // the row's `titleSource` is exactly 'dir'/'first-message',
+                        // strict `===` -- 'ai'/'user'/absent/any-other row source
+                        // still applies). Without this, the auto-title sweep's
+                        // dir/first-message row re-shadows a provider-generated
+                        // title within one 2s tick of the ai-title-shadow-cleanup
+                        // migration clearing it.
+                        let row_source = ov.get("titleSource").and_then(Value::as_str);
+                        let provider_generated_shadow = item.title_source.as_deref()
+                            == Some("provider-generated")
+                            && matches!(row_source, Some("dir") | Some("first-message"));
+                        if !t.is_empty() && !provider_generated_shadow {
+                            // b5fb: expose the reset-flow provenance exactly when
+                            // the override APPLIES (the same gate as Node's
+                            // `applyOverride`). Capture the pre-overlay
+                            // (parsed/provider-native) title into `provider_title`
+                            // BEFORE replacing it — left None when the parse had
+                            // no title. `title_override_source` re-validates the
+                            // stored row: config.json is hand-editable, and an
+                            // out-of-ladder string would fail the client's z.enum
+                            // page parse (`shared/read-models.ts`) — junk degrades
+                            // to "no source recorded", matching Node's
+                            // `isTitleSource` gate in `applyOverride`.
+                            item.title_overridden = true;
+                            item.title_override_source = row_source
+                                .filter(|s| {
+                                    matches!(*s, "user" | "ai" | "first-message" | "legacy" | "dir")
+                                })
+                                .map(str::to_string);
+                            item.provider_title = item.title.clone();
+                            item.title = Some(t.to_string());
+                        }
                     }
                 }
                 if let Some(s) = ov.get("summaryOverride").and_then(Value::as_str) {
@@ -1162,6 +1249,134 @@ fn apply_session_overrides(
             Some(item)
         })
         .collect()
+}
+
+/// Unified agent names (Task 2): the directory's read-side resolution — ONE
+/// batched `get` through the SAME naming authority every rename route
+/// targets. A manual or migration-protected record wins the item's displayed
+/// `title` in place (so search/sort/the overlay chain all see the durable
+/// user rename); lower-rank record names (directory/first-message/provider
+/// fallbacks) never shadow a provider-generated title — they fold into the
+/// record itself through the store's own observation lanes. Every FOUND
+/// record also enters the side map, which [`merge_naming_projection`] rides
+/// onto the serialized page as the additive `sessionName`/`nameRef` fields.
+/// A resolution failure degrades to the un-projected page (loudly logged) —
+/// naming is additive here, never a hard dependency of the directory.
+async fn apply_naming_projection(
+    items: Vec<DirItem>,
+    naming: Option<&std::sync::Arc<dyn freshell_freshagent::naming::SessionNaming>>,
+) -> (
+    Vec<DirItem>,
+    std::collections::HashMap<String, (String, freshell_protocol::SessionNameRef)>,
+) {
+    use freshell_protocol::session_names::SessionNameRef;
+    let Some(sink) = naming else {
+        return (items, Default::default());
+    };
+    let mut refs: Vec<SessionNameRef> = Vec::new();
+    for item in &items {
+        if let Some(named) =
+            freshell_freshagent::naming::named_provider_for(Some(&item.provider), None)
+        {
+            refs.push(SessionNameRef::Session {
+                provider: named,
+                session_id: item.session_id.clone(),
+            });
+        }
+    }
+    if refs.is_empty() {
+        return (items, Default::default());
+    }
+    let updates = match sink.get(refs).await {
+        Ok(updates) => updates,
+        Err(error) => {
+            tracing::warn!(
+                target: "freshell_server::session_names",
+                op = "get",
+                name_ref = "-",
+                revision = 0,
+                class = %error.code(),
+                "session_names.operation_failed: {}",
+                error
+            );
+            return (items, Default::default());
+        }
+    };
+    let mut by_key: std::collections::HashMap<String, freshell_protocol::SessionNameUpdate> =
+        std::collections::HashMap::new();
+    for update in updates {
+        if let SessionNameRef::Session {
+            provider,
+            session_id,
+        } = &update.record.name_ref
+        {
+            by_key.insert(format!("{}:{}", provider.as_str(), session_id), update);
+        }
+    }
+    let mut projection: std::collections::HashMap<
+        String,
+        (String, freshell_protocol::SessionNameRef),
+    > = Default::default();
+    let items = items
+        .into_iter()
+        .map(|mut item| {
+            if freshell_freshagent::naming::named_provider_for(Some(&item.provider), None).is_none()
+            {
+                return item;
+            }
+            let key = item.key();
+            if let Some(update) = by_key.get(&key) {
+                if crate::session_names::overrides_directory_title(update.record.source) {
+                    // The durable manual name wins the displayed title. The
+                    // pre-naming title (provider-native, or a legacy
+                    // override's) is captured into `provider_title` for the
+                    // same preview provenance the settings overlay records —
+                    // never overwriting a capture the overlay pass already
+                    // made. `title_overridden` (the settings-override reset
+                    // affordance) is left alone: scoped resets are refused
+                    // and the additive `sessionName` fields carry the truth.
+                    if item.provider_title.is_none() {
+                        item.provider_title = item.title.clone();
+                    }
+                    item.title = Some(update.record.name.clone());
+                }
+                projection.insert(
+                    key,
+                    (update.record.name.clone(), update.record.name_ref.clone()),
+                );
+            }
+            item
+        })
+        .collect();
+    (items, projection)
+}
+
+/// Unified agent names (Task 2): ride the naming projection onto the
+/// serialized page — per item, the additive `sessionName` (the durable
+/// record's current name) and `nameRef` (its identity). Items without a
+/// record keep their exact prior shape.
+fn merge_naming_projection(
+    page: &mut Value,
+    projection: &std::collections::HashMap<String, (String, freshell_protocol::SessionNameRef)>,
+) {
+    if projection.is_empty() {
+        return;
+    }
+    let Some(items) = page.get_mut("items").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in items {
+        let Some(provider) = item.get("provider").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(session_id) = item.get("sessionId").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some((name, name_ref)) = projection.get(&format!("{provider}:{session_id}")) {
+            item["sessionName"] = json!(name);
+            item["nameRef"] = serde_json::to_value(name_ref).unwrap_or(Value::Null);
+        }
+    }
 }
 
 /// Task 20 (read-join): overlay `sessionType` from the SESSION-06 metadata
@@ -2234,6 +2449,10 @@ mod tests {
 
     #[test]
     fn invalid_utf8_transcript_is_indexed_lossily_like_node() {
+        // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
+        // while a same-binary mutator holds `CLAUDE_HOME`) — take the
+        // crate-wide lock (see `crate::test_env_lock`).
+        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         // Regression (bug #7 class, found by the 007 seeded-home differential):
         // Node reads transcripts with `fs.readFile(file,'utf8')` -> invalid
         // bytes become U+FFFD and the session IS indexed; `read_to_string`
@@ -2272,6 +2491,10 @@ mod tests {
 
     #[test]
     fn default_query_hides_non_interactive_fixtures() {
+        // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
+        // while a same-binary mutator holds `CLAUDE_HOME`) — take the
+        // crate-wide lock (see `crate::test_env_lock`).
+        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         // `real-corrupted.jsonl` has a `cwd` and parses as non-interactive → the
         // default History browse (no includeNonInteractive) hides it → empty
         // page. `healthy.jsonl` has NO `cwd` anywhere → excluded entirely at
@@ -2293,6 +2516,10 @@ mod tests {
 
     #[test]
     fn include_non_interactive_surfaces_titled_session() {
+        // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
+        // while a same-binary mutator holds `CLAUDE_HOME`) — take the
+        // crate-wide lock (see `crate::test_env_lock`).
+        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         let home = claude_home_with(&["real-corrupted.jsonl", "healthy.jsonl"]);
         let items = list_claude_sessions(&claude_home(&home));
         let q = DirQuery {
@@ -2311,6 +2538,10 @@ mod tests {
 
     #[test]
     fn include_empty_surfaces_untitled_sessions_sorted_desc() {
+        // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
+        // while a same-binary mutator holds `CLAUDE_HOME`) — take the
+        // crate-wide lock (see `crate::test_env_lock`).
+        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         // `healthy.jsonl` has no `cwd` → excluded at discovery (R10b) even with
         // every include flag set; only the cwd-bearing `real-corrupted.jsonl`
         // (itself untitled-if-you-squint but DOES have a title) surfaces here.
@@ -2534,6 +2765,10 @@ mod tests {
 
     #[test]
     fn r10b_cwdless_repair_fixture_never_surfaces_under_any_flags() {
+        // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
+        // while a same-binary mutator holds `CLAUDE_HOME`) — take the
+        // crate-wide lock (see `crate::test_env_lock`).
+        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         // Byte-matched against a live probe of the ORIGINAL: seeding
         // `healthy.jsonl` (renamed to a canonical UUID filename, exactly as
         // `port/oracle/rest-parity/sweep.mjs#seedClaudeSessions` does) and
@@ -2571,6 +2806,10 @@ mod tests {
 
     #[test]
     fn title_search_matches_and_annotates() {
+        // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
+        // while a same-binary mutator holds `CLAUDE_HOME`) — take the
+        // crate-wide lock (see `crate::test_env_lock`).
+        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         let home = claude_home_with(&["real-corrupted.jsonl"]);
         let items = list_claude_sessions(&claude_home(&home));
         let q = DirQuery {
@@ -2856,13 +3095,86 @@ mod tests {
         );
         overrides.insert("claude:gone".into(), json!({ "deleted": true }));
 
-        let overlaid = apply_session_overrides(items, &overrides);
+        let overlaid =
+            apply_session_overrides(items, &overrides, false, &std::collections::HashSet::new());
         assert_eq!(overlaid.len(), 1, "deleted item filtered out");
         let v = overlaid[0].to_value();
         assert_eq!(v["sessionId"], json!("keep"));
         assert_eq!(v["title"], json!("Renamed"));
         assert_eq!(v["summary"], json!("New sum"));
         assert_eq!(v["archived"], json!(true));
+    }
+
+    /// Unified agent names (Task 7 review M1): once the consolidation
+    /// receipt committed, a scoped row never consults the migrated
+    /// `titleOverride`/`titleSource` — while the never-migrated fields
+    /// (`summaryOverride`/`archived`/`deleted`) still apply, and every
+    /// out-of-scope provider keeps the legacy ladder verbatim.
+    #[test]
+    fn scoped_rows_never_read_migrated_title_overrides_once_the_receipt_committed() {
+        let mk = |provider: &str, sid: &str| DirItem {
+            session_id: sid.into(),
+            legacy_session_id: None,
+            provider: provider.into(),
+            project_path: "/p".into(),
+            title: Some("parsed".into()),
+            summary: None,
+            first_user_message: None,
+            last_activity_at: 100,
+            created_at: None,
+            cwd: Some("/p".into()),
+            is_subagent: false,
+            is_non_interactive: false,
+            is_running: false,
+            archived: false,
+            matched_in: None,
+            snippet: None,
+            running_terminal_id: None,
+            live_terminal_only: false,
+            session_type: None,
+            title_source: None,
+            source_file: None,
+            token_usage: None,
+            title_overridden: false,
+            provider_title: None,
+            title_override_source: None,
+        };
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            "claude:s1".into(),
+            json!({ "titleOverride": "Resurrected Alias", "titleSource": "user",
+                    "summaryOverride": "kept summary", "archived": true }),
+        );
+        overrides.insert(
+            "amplifier:a1".into(),
+            json!({ "titleOverride": "Amplifier Ladder Stays", "titleSource": "user" }),
+        );
+
+        // Receipt committed: the scoped row ignores the migrated title
+        // fields (its canonical record owns the title)…
+        let items = vec![mk("claude", "s1"), mk("amplifier", "a1")];
+        let out =
+            apply_session_overrides(items, &overrides, true, &std::collections::HashSet::new());
+        let scoped = &out[0];
+        assert_eq!(scoped.title.as_deref(), Some("parsed"));
+        assert!(!scoped.title_overridden);
+        assert!(scoped.provider_title.is_none());
+        assert!(scoped.title_override_source.is_none());
+        // …while its never-migrated fields still apply…
+        assert_eq!(scoped.summary.as_deref(), Some("kept summary"));
+        assert!(scoped.archived);
+        // …and the out-of-scope provider keeps the ladder verbatim.
+        let outsider = &out[1];
+        assert_eq!(outsider.title.as_deref(), Some("Amplifier Ladder Stays"));
+        assert!(outsider.title_overridden);
+
+        // Pre-receipt behavior is unchanged: the scoped row still consults
+        // the ladder.
+        let items = vec![mk("claude", "s1"), mk("amplifier", "a1")];
+        let out =
+            apply_session_overrides(items, &overrides, false, &std::collections::HashSet::new());
+        assert_eq!(out[0].title.as_deref(), Some("Resurrected Alias"));
+        assert!(out[0].title_overridden);
     }
 
     #[test]
@@ -2906,7 +3218,12 @@ mod tests {
         );
 
         let overlaid = apply_session_metadata(
-            apply_session_overrides(vec![item.clone()], &overrides),
+            apply_session_overrides(
+                vec![item.clone()],
+                &overrides,
+                false,
+                &std::collections::HashSet::new(),
+            ),
             &metadata,
         );
         assert_eq!(overlaid[0].title.as_deref(), Some("Legacy rename"));
@@ -2920,8 +3237,15 @@ mod tests {
             "claude:canonical-filename".into(),
             json!({ "sessionType": "freshclaude-canonical" }),
         );
-        let canonical =
-            apply_session_metadata(apply_session_overrides(vec![item], &overrides), &metadata);
+        let canonical = apply_session_metadata(
+            apply_session_overrides(
+                vec![item],
+                &overrides,
+                false,
+                &std::collections::HashSet::new(),
+            ),
+            &metadata,
+        );
         assert_eq!(canonical[0].title.as_deref(), Some("Canonical rename"));
         assert_eq!(
             canonical[0].session_type.as_deref(),
@@ -2977,7 +3301,12 @@ mod tests {
         )]);
 
         let overlaid = apply_session_metadata(
-            apply_session_overrides(vec![original, copied], &overrides),
+            apply_session_overrides(
+                vec![original, copied],
+                &overrides,
+                false,
+                &std::collections::HashSet::new(),
+            ),
             &metadata,
         );
         let original = overlaid
@@ -3024,7 +3353,12 @@ mod tests {
             provider_title: None,
             title_override_source: None,
         };
-        let overlaid = apply_session_overrides(vec![item], &serde_json::Map::new());
+        let overlaid = apply_session_overrides(
+            vec![item],
+            &serde_json::Map::new(),
+            false,
+            &std::collections::HashSet::new(),
+        );
         let v = overlaid[0].to_value();
         // Oracle-compat: archived is ALWAYS present, defaulted false.
         assert_eq!(v["archived"], json!(false));
@@ -3077,7 +3411,12 @@ mod tests {
     fn overlaid_title(item: DirItem, row: Value) -> Option<String> {
         let mut overrides = serde_json::Map::new();
         overrides.insert(item.key(), row);
-        let out = apply_session_overrides(vec![item], &overrides);
+        let out = apply_session_overrides(
+            vec![item],
+            &overrides,
+            false,
+            &std::collections::HashSet::new(),
+        );
         out[0].title.clone()
     }
 
@@ -3167,6 +3506,8 @@ mod tests {
         let out = apply_session_overrides(
             vec![guard_item("s1", Some("provider-generated"))],
             &overrides,
+            false,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(out[0].title.as_deref(), Some("Provider Title"));
         assert_eq!(out[0].summary.as_deref(), Some("sum"));
@@ -3213,7 +3554,12 @@ mod tests {
             "claude:sess-1".to_string(),
             json!({ "titleOverride": "Accidental pane label", "titleSource": "user" }),
         );
-        let out = apply_session_overrides(vec![item], &overrides);
+        let out = apply_session_overrides(
+            vec![item],
+            &overrides,
+            false,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(out.len(), 1);
         let v = out[0].to_value();
         assert_eq!(v["title"], json!("Accidental pane label"));
@@ -3234,7 +3580,12 @@ mod tests {
             item.key(),
             json!({ "titleOverride": "proj", "titleSource": "dir" }),
         );
-        let out = apply_session_overrides(vec![item], &overrides);
+        let out = apply_session_overrides(
+            vec![item],
+            &overrides,
+            false,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(out.len(), 1);
         let v = out[0].to_value();
         assert_eq!(v["title"], json!("Provider Title"));
@@ -3256,7 +3607,12 @@ mod tests {
             "amplifier:s1".to_string(),
             json!({ "titleOverride": "Hand-edited rename", "titleSource": "bogus-value" }),
         );
-        let out = apply_session_overrides(vec![guard_item("s1", None)], &overrides);
+        let out = apply_session_overrides(
+            vec![guard_item("s1", None)],
+            &overrides,
+            false,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(out.len(), 1);
         let v = out[0].to_value();
         assert_eq!(v["title"], json!("Hand-edited rename"));
@@ -3363,6 +3719,7 @@ mod tests {
             identity,
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            legacy_name_migration_completed: false,
         })
     }
 
@@ -3472,6 +3829,7 @@ mod tests {
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            legacy_name_migration_completed: false,
         };
         let app = router(state);
         let resp = app
@@ -3497,6 +3855,332 @@ mod tests {
         assert_eq!(items[0]["archived"], json!(false));
         assert_eq!(page["nextCursor"], Value::Null);
         assert_eq!(page["revision"], json!(1_769_753_759_234i64));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Unified agent names (Task 7 review M1): a mid-session
+    /// freshness-reload resurrection of the migrated title fields (the
+    /// documented side-by-side ConfigLock limit — an external writer adds
+    /// a NEW scoped `titleOverride` row this process never touched) must
+    /// never retitle a scoped coding-agent session once the consolidation
+    /// receipt committed; out-of-scope providers keep the legacy ladder.
+    #[tokio::test]
+    async fn resurrected_title_overrides_never_retitle_scoped_rows_after_the_migration_receipt() {
+        use tower::ServiceExt;
+
+        let home = unique_temp_dir();
+        let freshell = home.join(".freshell");
+        std::fs::create_dir_all(&freshell).unwrap();
+        let mut doc = json!({
+            "version": 1,
+            "settings": { "codingCli": {
+                "enabledProviders": ["claude"], "knownProviders": ["claude"],
+                "providers": {}, "mcpServer": true
+            } },
+            "recentDirectories": ["/a"],
+            "sessionOverrides": {
+                "claude:s1": { "titleOverride": "Migrated Name", "titleSource": "first-message" }
+            },
+            "terminalOverrides": {},
+            "projectColors": {}
+        });
+        doc["completedMigrations"] = json!([]);
+        std::fs::write(
+            freshell.join("config.json"),
+            serde_json::to_string_pretty(&doc).unwrap(),
+        )
+        .unwrap();
+
+        // One real consolidation: the receipt commits and the scope-only
+        // cleanup clears the migrated row (in memory and on disk).
+        let settings = crate::settings_store::SettingsStore::load(
+            Some(&home),
+            vec!["claude".into(), "amplifier".into()],
+        )
+        .with_reload_throttle_window(Duration::ZERO);
+        let names = crate::session_names::SessionNames::open(home.join(".freshell")).unwrap();
+        crate::session_name_migration::run_session_name_consolidation(
+            crate::session_name_migration::SessionNameConsolidationInputs {
+                names: names.clone(),
+                settings: std::sync::Arc::new(settings.clone()),
+                metadata: std::sync::Arc::new(crate::session_metadata::SessionMetadataStore::new(
+                    home.join(".freshell"),
+                )),
+                identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+                data_dir: home.join(".freshell"),
+                snapshots_dir: None,
+            },
+        )
+        .await;
+        assert!(names.migration_completed(), "the consolidation committed");
+
+        // The side-by-side resurrection: an external writer (the legacy
+        // Node server) adds NEW title rows this process never touched —
+        // the freshness reload adopts them into the live store.
+        std::thread::sleep(Duration::from_millis(25)); // a later mtime tick
+        let config_path = freshell.join("config.json");
+        let mut cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        cfg["sessionOverrides"]["claude:s2"] =
+            json!({ "titleOverride": "Resurrected Alias", "titleSource": "user" });
+        cfg["sessionOverrides"]["amplifier:a1"] =
+            json!({ "titleOverride": "Amplifier Ladder Stays", "titleSource": "user" });
+        std::fs::write(&config_path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
+        let adopted = settings.session_overrides();
+        assert_eq!(
+            adopted["claude:s2"]["titleOverride"],
+            json!("Resurrected Alias"),
+            "the freshness reload adopted the resurrected row (the documented limit)"
+        );
+
+        // The directory read through the full router.
+        let items = vec![
+            static_indexed_session("claude", "s1", "/p/s1.jsonl", 100),
+            static_indexed_session("claude", "s2", "/p/s2.jsonl", 90),
+            static_indexed_session("amplifier", "a1", "/p/a1.jsonl", 80),
+        ];
+        let source = StaticSessionSource { items };
+        let app = router(SessionDirectoryState {
+            auth_token: std::sync::Arc::new("tok".to_string()),
+            settings: settings.clone(),
+            session_index: Some(std::sync::Arc::new(test_session_index(vec![
+                std::sync::Arc::new(source),
+            ]))),
+            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: std::sync::Arc::new("srv-test".to_string()),
+            legacy_name_migration_completed: names.migration_completed(),
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/session-directory?priority=visible&includeNonInteractive=1")
+                    .header("x-auth-token", "tok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        let items = page["items"].as_array().unwrap();
+        let s1 = items
+            .iter()
+            .find(|item| item["sessionId"] == json!("s1"))
+            .expect("s1 present");
+        let s2 = items
+            .iter()
+            .find(|item| item["sessionId"] == json!("s2"))
+            .expect("s2 present");
+        let a1 = items
+            .iter()
+            .find(|item| item["sessionId"] == json!("a1"))
+            .expect("a1 present");
+        // The scoped row's displayed title never consults the resurrected
+        // override — the committed receipt gates the migrated ladder.
+        assert_ne!(
+            s2["title"],
+            json!("Resurrected Alias"),
+            "a resurrected scoped titleOverride must not retitle the session"
+        );
+        assert_eq!(s2["title"], json!("claude s2"), "the parsed title stands");
+        assert_eq!(
+            s1["title"],
+            json!("claude s1"),
+            "the migration's own cleaned row stays cleaned"
+        );
+        // …while the out-of-scope provider keeps the legacy ladder verbatim.
+        assert_eq!(a1["title"], json!("Amplifier Ladder Stays"));
+        assert_eq!(a1["titleOverridden"], json!(true));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Delta-review round 4, finding 1 (the directory's post-migration title
+    /// lane): a KILROY-ONLY row keeps displaying the legacy-ladder title
+    /// the sweep deliberately still writes for it. Once the consolidation
+    /// receipt commits, the provider string alone must not close the
+    /// settings title lane — the shared kilroy-lane seam (metadata-typed
+    /// kilroy, no canonical record, no live scoped terminal) keeps the row
+    /// in the legacy lane, and no `sessionName` projection exists for it
+    /// (the sweep's guarantee: a kilroy-only session never has a record).
+    #[tokio::test]
+    async fn kilroy_only_rows_keep_displaying_legacy_titles_after_the_migration_receipt() {
+        use tower::ServiceExt;
+
+        let home = unique_temp_dir();
+        std::fs::create_dir_all(home.join(".freshell")).unwrap();
+        let settings = crate::settings_store::SettingsStore::load(
+            Some(&home),
+            vec!["claude".into(), "amplifier".into()],
+        );
+        // The legacy override row the sweep's kilroy ladder still writes.
+        settings
+            .patch_session_override(
+                "claude:k1",
+                &[
+                    ("titleOverride", Some(json!("Kilroy Legacy Title"))),
+                    ("titleSource", Some(json!("user"))),
+                ],
+            )
+            .await;
+        // The SPA's own sessionType tag — the ONLY thing that says this
+        // provider-`claude` session is kilroy.
+        let metadata = crate::session_metadata::SessionMetadataStore::new(home.join(".freshell"));
+        metadata
+            .set("claude", "k1", "kilroy", Some("explicit"))
+            .await
+            .unwrap();
+        // The naming authority wired the way production wires it; the
+        // kilroy-only session holds NO record in it.
+        let names = crate::session_names::SessionNames::open(home.join(".freshell")).unwrap();
+        let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+        identity.set_session_naming(names.clone());
+        let app = router(SessionDirectoryState {
+            auth_token: Arc::new("tok".to_string()),
+            settings,
+            session_index: Some(Arc::new(test_session_index(vec![Arc::new(
+                StaticSessionSource {
+                    items: vec![static_indexed_session("claude", "k1", "/p/k1.jsonl", 100)],
+                },
+            )]))),
+            identity,
+            metadata,
+            server_instance: Arc::new("srv-test".to_string()),
+            legacy_name_migration_completed: true,
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/session-directory?priority=visible&includeNonInteractive=1")
+                    .header("x-auth-token", "tok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        let item = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["sessionId"] == json!("k1"))
+            .expect("k1 present");
+        assert_eq!(
+            item["title"],
+            json!("Kilroy Legacy Title"),
+            "a kilroy-only row keeps displaying its legacy-ladder title: {item}"
+        );
+        assert_eq!(item["titleOverridden"], json!(true));
+        assert!(
+            item.get("sessionName").is_none(),
+            "no canonical record exists to project: {item}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The singular-name half of the same lane decision: a kilroy-typed row
+    /// whose session holds a canonical record through the claude mode
+    /// (dual-mode) keeps the lane CLOSED — the supported-mode record owns
+    /// the session's ONE name (here a low-rank fallback, so the parsed
+    /// title stands and the record rides additively), and the leftover
+    /// legacy override never resurfaces as a competing title.
+    #[tokio::test]
+    async fn a_record_holding_kilroy_typed_row_keeps_the_title_lane_closed() {
+        use tower::ServiceExt;
+
+        let home = unique_temp_dir();
+        std::fs::create_dir_all(home.join(".freshell")).unwrap();
+        let settings = crate::settings_store::SettingsStore::load(
+            Some(&home),
+            vec!["claude".into(), "amplifier".into()],
+        );
+        settings
+            .patch_session_override(
+                "claude:k1",
+                &[
+                    ("titleOverride", Some(json!("Kilroy Legacy Title"))),
+                    ("titleSource", Some(json!("user"))),
+                ],
+            )
+            .await;
+        let metadata = crate::session_metadata::SessionMetadataStore::new(home.join(".freshell"));
+        metadata
+            .set("claude", "k1", "kilroy", Some("explicit"))
+            .await
+            .unwrap();
+        // The canonical record through the claude mode (the index-adopted
+        // hydration path) — the dual-mode singular-name owner.
+        let names = crate::session_names::SessionNames::open(home.join(".freshell")).unwrap();
+        names
+            .hydrate_indexed(
+                crate::session_name_generation::IndexedNameInput {
+                    provider: freshell_protocol::session_names::NamedProvider::Claude,
+                    session_id: "k1".to_string(),
+                    cwd: Some("/p".to_string()),
+                    first_user_message: Some("Scoped first".to_string()),
+                    provider_title: None,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+        identity.set_session_naming(names.clone());
+        let app = router(SessionDirectoryState {
+            auth_token: Arc::new("tok".to_string()),
+            settings,
+            session_index: Some(Arc::new(test_session_index(vec![Arc::new(
+                StaticSessionSource {
+                    items: vec![static_indexed_session("claude", "k1", "/p/k1.jsonl", 100)],
+                },
+            )]))),
+            identity,
+            metadata,
+            server_instance: Arc::new("srv-test".to_string()),
+            legacy_name_migration_completed: true,
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/session-directory?priority=visible&includeNonInteractive=1")
+                    .header("x-auth-token", "tok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        let item = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["sessionId"] == json!("k1"))
+            .expect("k1 present");
+        assert_ne!(
+            item["title"],
+            json!("Kilroy Legacy Title"),
+            "the record-holding session's name is the authority's alone: {item}"
+        );
+        assert_eq!(item["title"], json!("claude k1"));
+        assert_eq!(
+            item["sessionName"],
+            json!("Scoped first"),
+            "the canonical record rides the page additively: {item}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -3876,6 +4560,7 @@ mod tests {
             // proves the join reads the persisted file, not shared memory.
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            legacy_name_migration_completed: false,
         };
         let app = router(state);
         let resp = app
@@ -3953,6 +4638,7 @@ mod tests {
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            legacy_name_migration_completed: false,
         };
         let app = router(state);
         let resp = app
@@ -4012,6 +4698,7 @@ mod tests {
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            legacy_name_migration_completed: false,
         };
         let app = router(state);
         let resp = app
@@ -4056,6 +4743,7 @@ mod tests {
             // missing file (empty metadata), matching the no-home page.
             metadata: crate::session_metadata::SessionMetadataStore::new(unique_temp_dir()),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            legacy_name_migration_completed: false,
         };
         let app = router(state);
         let resp = app
@@ -4139,6 +4827,7 @@ mod tests {
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            legacy_name_migration_completed: false,
         };
         let app = router(state);
 
@@ -4244,6 +4933,7 @@ mod tests {
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            legacy_name_migration_completed: false,
         };
         let app = router(state);
 
@@ -4342,6 +5032,7 @@ mod tests {
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            legacy_name_migration_completed: false,
         };
         let app = router(state);
 
@@ -4437,6 +5128,7 @@ mod tests {
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            legacy_name_migration_completed: false,
         };
         let app = router(state);
 
@@ -4574,6 +5266,7 @@ mod tests {
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            legacy_name_migration_completed: false,
         };
         let app = router(state);
         let resp = app
@@ -4972,7 +5665,12 @@ mod tests {
             "claude:s1".into(),
             json!({ "titleOverride": "My Renamed Special Project" }),
         );
-        let overlaid = apply_session_overrides(vec![item], &overrides);
+        let overlaid = apply_session_overrides(
+            vec![item],
+            &overrides,
+            false,
+            &std::collections::HashSet::new(),
+        );
 
         let q = DirQuery {
             query: Some("Renamed Special".into()),

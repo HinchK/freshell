@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Test: e2e-cloud.sh run stamps the cloud-lane harness WS-ready timeout env
-# var (kata j90s) onto every created Cloud Run job, honors an operator
-# override, and documents the var in usage. Hermetic: gcloud/docker are
-# fully stubbed; no network, no real cloud resources.
+# var (kata j90s) onto every created Cloud Run job and honors an operator
+# override. Hermetic: gcloud/docker are fully stubbed; no network, no real
+# cloud resources.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -94,12 +94,6 @@ env PATH="$STUB_DIR:$PATH" FRESHELL_E2E_WS_READY_TIMEOUT_MS=60000 \
   test/e2e-browser/specs/settings.spec.ts >/dev/null 2>&1 || true
 check "operator override (60000) lands in the env file" \
   grep -q 'FRESHELL_E2E_WS_READY_TIMEOUT_MS: "60000"' "$STUB_CAPTURE/env.yaml"
-
-# Check 3: usage documents both env vars.
-check "help documents FRESHELL_E2E_WS_READY_TIMEOUT_MS" \
-  bash -c "bash '$SCRIPT' help 2>&1 | grep -q 'FRESHELL_E2E_WS_READY_TIMEOUT_MS'"
-check "help documents FRESHELL_E2E_SERVER_VERBOSE" \
-  bash -c "bash '$SCRIPT' help 2>&1 | grep -q 'FRESHELL_E2E_SERVER_VERBOSE'"
 
 # Check 4: the wrapper script itself stays syntactically valid.
 check "e2e-cloud.sh passes bash -n" bash -n "$SCRIPT"

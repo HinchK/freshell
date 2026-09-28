@@ -255,4 +255,42 @@ describe('renamePaneAfterMirrorReady', () => {
     expect(opts.get.mock.calls[0]?.[1]?.signal.aborted).toBe(true)
     expect(opts.patch).not.toHaveBeenCalled()
   })
+
+  /**
+   * Unified agent names (Task 5): a scoped pane's rename carries the
+   * editor's captured naming target, the explicit user intent, and the
+   * captured revision on the SAME single PATCH — while the mirror
+   * deadline/membership probe and abort contract are unchanged.
+   */
+  it('carries the captured expectedNameRef, user intent, and revision on the rename PATCH', async () => {
+    const opts = options()
+    const expectedNameRef = { kind: 'session', provider: 'claude', sessionId: 'scoped-sess' }
+
+    const result = await renamePaneAfterMirrorReady('tab-1', 'pane-1', 'User rename', {
+      ...opts,
+      expectedNameRef,
+      nameIntent: 'user',
+      ifRevision: 7,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(opts.patch).toHaveBeenCalledTimes(1)
+    expect(opts.patch).toHaveBeenCalledWith(
+      '/api/panes/pane-1',
+      {
+        name: 'User rename',
+        nameIntent: 'user',
+        ifRevision: 7,
+        expectedNameRef,
+      },
+      { signal: opts.signal },
+    )
+  })
+
+  it('omits the capture guards entirely when the editor had nothing to capture (legacy body)', async () => {
+    const opts = options()
+    const result = await renamePaneAfterMirrorReady('tab-1', 'pane-1', 'Plain label', opts)
+    expect(result.ok).toBe(true)
+    expect(opts.patch).toHaveBeenCalledWith('/api/panes/pane-1', { name: 'Plain label' }, { signal: opts.signal })
+  })
 })

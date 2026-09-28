@@ -746,6 +746,23 @@ async fn directory_items(state: &TerminalsState) -> Vec<Value> {
                 obj.insert("lastLine".into(), Value::String(ll.clone()));
                 obj.insert("last_line".into(), Value::String(ll));
             }
+            // Unified agent names (Task 2): additive, omitted-when-absent
+            // naming fields from the registry's display cache (stamped by
+            // the create-lane admission and refreshed by the naming
+            // publisher — the same durable record every rename route
+            // targets).
+            if let Some(name_ref) = e.name_ref {
+                obj.insert(
+                    "nameRef".into(),
+                    serde_json::to_value(name_ref).unwrap_or(Value::Null),
+                );
+            }
+            if let Some(record) = e.session_name {
+                obj.insert(
+                    "sessionName".into(),
+                    serde_json::to_value(record).unwrap_or(Value::Null),
+                );
+            }
             Value::Object(obj)
         })
         .collect()
@@ -983,6 +1000,33 @@ async fn patch_terminal(
     let title_override = body_obj.get("titleOverride").and_then(clean_string);
     let description_override = body_obj.get("descriptionOverride").and_then(clean_string);
 
+    // Unified agent names (Task 2): a scoped terminal's title rename routes
+    // to the naming authority through its identity binding (the pre-durable
+    // pending handle or the durable provider/session ref — see
+    // `scoped_terminal_name_ref`). The terminal-override store never acquires
+    // a competing scoped title; a scoped null/reset is refused absolutely
+    // (NAME_RESET_UNSUPPORTED); the unwired-authority case fails
+    // unavailable. A request WITHOUT `titleOverride` keeps the legacy flow
+    // untouched (including the JS-spread wipe).
+    if let Some(target) = body_obj
+        .contains_key("titleOverride")
+        .then(|| state.identity.get(&terminal_id))
+        .flatten()
+        .as_ref()
+        .and_then(scoped_terminal_name_ref)
+    {
+        return scoped_terminal_rename(
+            &state,
+            &terminal_id,
+            target,
+            title_override,
+            description_override,
+            deleted,
+            &parsed_body,
+        )
+        .await;
+    }
+
     // The route's patch object carries ALL THREE keys (undefined values overwrite
     // — the JS-spread semantics `patch_terminal_override` documents).
     let next = state
@@ -1031,6 +1075,122 @@ async fn delete_terminal(
         .await;
     broadcast_terminals_changed(&state);
     Json(json!({ "ok": true })).into_response()
+}
+
+/// Unified agent names (Task 2): the naming target a scoped terminal's
+/// saved name resolves through — its explicit identity binding first (the
+/// create-lane admission / verified bind wrote `name_ref`), else a scoped
+/// provider/session association. `None` = not scoped → legacy flow.
+fn scoped_terminal_name_ref(
+    row: &freshell_ws::identity::TerminalIdentity,
+) -> Option<freshell_protocol::SessionNameRef> {
+    if let Some(name_ref) = &row.name_ref {
+        return Some(name_ref.clone());
+    }
+    let provider = row.provider.as_deref()?;
+    let session_id = row.session_id.as_deref()?;
+    let named = freshell_freshagent::naming::named_provider_for(Some(provider), None)?;
+    Some(freshell_protocol::SessionNameRef::Session {
+        provider: named,
+        session_id: session_id.to_string(),
+    })
+}
+
+/// Unified agent names (Task 2): the scoped-terminal title-rename path of
+/// `PATCH /api/terminals/:id` — ONE `rename` call through the wired
+/// authority (`state.identity`'s naming sink). The response is the accepted
+/// update: additive `sessionName` (the full `SessionNameUpdate`) + `nameRef`
+/// over the merged override row. The same request's `descriptionOverride`/
+/// `deleted` still patch through the override store, and `titleOverride` is
+/// written as `None` there — the authority owns the title, so any stale
+/// legacy override is wiped rather than left competing. The registry
+/// write-through is the naming publisher's job (single writer); this route
+/// only bumps `terminals.changed` so the list view re-reads.
+async fn scoped_terminal_rename(
+    state: &TerminalsState,
+    terminal_id: &str,
+    target: freshell_protocol::SessionNameRef,
+    title_override: Option<String>,
+    description_override: Option<String>,
+    deleted: Option<bool>,
+    body: &Value,
+) -> Response {
+    let Some(name) = title_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": freshell_freshagent::naming::NAME_RESET_UNSUPPORTED,
+                "message": "a scoped terminal's saved name is never cleared; rename it instead",
+                "nameRef": target,
+            })),
+        )
+            .into_response();
+    };
+    let Some(sink) = state.identity.naming() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "NAMING_UNAVAILABLE",
+                "message": "session naming is unavailable on this server",
+                "nameRef": target,
+            })),
+        )
+            .into_response();
+    };
+    let (intent, if_revision) = match crate::session_name_routes::parse_rename_intents(body) {
+        Ok(parsed) => parsed,
+        Err(details) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "Invalid request",
+                    "details": details,
+                })),
+            )
+                .into_response()
+        }
+    };
+    let update = match crate::session_name_routes::rename_through_authority(
+        sink.as_ref(),
+        target,
+        name.to_string(),
+        intent,
+        if_revision,
+    )
+    .await
+    {
+        Ok(update) => update,
+        Err(response) => return response,
+    };
+    let next = state
+        .settings
+        .patch_terminal_override(
+            terminal_id,
+            &[
+                ("titleOverride", None),
+                (
+                    "descriptionOverride",
+                    description_override.map(Value::String),
+                ),
+                ("deleted", deleted.map(Value::Bool)),
+            ],
+        )
+        .await;
+    broadcast_terminals_changed(state);
+    let mut out = next.as_object().cloned().unwrap_or_default();
+    out.insert(
+        "sessionName".into(),
+        serde_json::to_value(&update).unwrap_or(Value::Null),
+    );
+    out.insert(
+        "nameRef".into(),
+        serde_json::to_value(&update.record.name_ref).unwrap_or(Value::Null),
+    );
+    Json(Value::Object(out)).into_response()
 }
 
 /// express's default error-handler response for a body the strict JSON parser
@@ -1109,8 +1269,86 @@ mod title_scope_tests {
         body_json(resp).await
     }
 
-    /// b5fb scope contract: renaming a terminal bound to a coding-CLI session
-    /// writes ONLY the terminal override — no session override, live or not.
+    /// Unified agent names (Task 2): seeds + wires the ONE naming authority
+    /// the way `main.rs` does (the identity registry carries the sink; the
+    /// target's record is admitted + verified-bound like the create lane)
+    /// and returns the store for direct assertions.
+    async fn wired_naming(
+        state: &TerminalsState,
+        home: &std::path::Path,
+        provider: freshell_protocol::session_names::NamedProvider,
+        session_id: &str,
+    ) -> std::sync::Arc<crate::session_names::SessionNames> {
+        use freshell_freshagent::naming::{BindNameInput, PendingNameInput, SessionNaming};
+        use freshell_protocol::native_location::{
+            NativeAcquisition, NativeEvidenceKind, NativeLocation, NativePersistence,
+        };
+        use freshell_protocol::session_names::SessionNameRef;
+
+        let names = crate::session_names::SessionNames::open(home.join(".freshell")).unwrap();
+        let handle = format!("handle-{session_id}");
+        names
+            .ensure_pending(PendingNameInput {
+                handle: handle.clone(),
+                provider,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        names
+            .bind_pending(BindNameInput {
+                pending: SessionNameRef::Pending { id: handle },
+                target: SessionNameRef::Session {
+                    provider,
+                    session_id: session_id.to_string(),
+                },
+                acquisition: NativeAcquisition {
+                    location: match provider {
+                        freshell_protocol::session_names::NamedProvider::Claude => {
+                            NativeLocation::Claude {
+                                config_root: "/h/.claude".into(),
+                                transcript_path: Some(format!(
+                                    "/h/.claude/projects/-p/{session_id}.jsonl"
+                                )),
+                                project_directory_key: None,
+                                transcript_cwd: None,
+                                effective_project_key_override: None,
+                            }
+                        }
+                        freshell_protocol::session_names::NamedProvider::Codex => {
+                            NativeLocation::Codex {
+                                codex_home: "/h/.codex".into(),
+                                native_thread_id: Some(session_id.to_string()),
+                                rollout_path: Some(format!(
+                                    "/h/.codex/sessions/{session_id}.jsonl"
+                                )),
+                                persistence_evidence: None,
+                            }
+                        }
+                        freshell_protocol::session_names::NamedProvider::Opencode => {
+                            NativeLocation::Opencode {
+                                database_path: "/h/opencode.db".into(),
+                                native_session_id: Some(session_id.to_string()),
+                                original_directory: None,
+                                owned_local_endpoint: None,
+                            }
+                        }
+                    },
+                    evidence: NativeEvidenceKind::PersistedMetadata,
+                    persistence: NativePersistence::Verified,
+                },
+            })
+            .await
+            .unwrap();
+        state.identity.set_session_naming(names.clone());
+        names
+    }
+
+    /// Unified agent names (Task 2): renaming a terminal bound to a SCOPED
+    /// coding-CLI session routes the title to the ONE naming authority — the
+    /// session's own durable record. The b5fb invariant survives (never a
+    /// settings SESSION override), and the legacy terminal-override title is
+    /// WIPED rather than left competing with the record.
     #[tokio::test]
     async fn rename_does_not_write_a_session_override_for_a_live_cli_terminal() {
         let dir = dir();
@@ -1119,19 +1357,46 @@ mod title_scope_tests {
         state
             .identity
             .upsert("term-1", Some("claude"), Some("sess-abc"), None, 1000);
+        wired_naming(
+            &state,
+            &dir,
+            freshell_protocol::session_names::NamedProvider::Claude,
+            "sess-abc",
+        )
+        .await;
 
         let resp = patch_terminal_title(state.clone(), "term-1", "Terminal Label").await;
-        assert_eq!(resp["titleOverride"], json!("Terminal Label"));
+        assert_eq!(
+            resp["sessionName"]["record"]["name"],
+            json!("Terminal Label"),
+            "the accepted naming record: {resp}"
+        );
+        assert!(
+            resp.get("titleOverride")
+                .map(|v| v.is_null())
+                .unwrap_or(true),
+            "the competing terminal-override title is wiped: {resp}"
+        );
         assert!(
             state.settings.session_overrides().is_empty(),
             "no session override: {:?}",
             state.settings.session_overrides()
         );
+        assert!(
+            state
+                .settings
+                .terminal_overrides()
+                .get("term-1")
+                .and_then(|o| o.get("titleOverride"))
+                .is_none(),
+            "no terminal-override title may compete with the record"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The retired-identity lookup is equally in scope: an exited terminal's rename
-    /// stays terminal-scoped too.
+    /// The retired-identity lookup is equally in scope: an EXITED scoped
+    /// terminal's rename reaches the same durable record (the identity row
+    /// survives retirement), still never writing a session override.
     #[tokio::test]
     async fn rename_does_not_write_a_session_override_after_the_terminal_exits() {
         let dir = dir();
@@ -1141,10 +1406,36 @@ mod title_scope_tests {
             .identity
             .upsert("term-2", Some("codex"), Some("sess-xyz"), None, 1000);
         state.identity.retire("term-2");
+        wired_naming(
+            &state,
+            &dir,
+            freshell_protocol::session_names::NamedProvider::Codex,
+            "sess-xyz",
+        )
+        .await;
 
         let resp = patch_terminal_title(state.clone(), "term-2", "Post-Exit Label").await;
-        assert_eq!(resp["titleOverride"], json!("Post-Exit Label"));
+        assert_eq!(
+            resp["sessionName"]["record"]["name"],
+            json!("Post-Exit Label"),
+            "the accepted naming record: {resp}"
+        );
+        assert!(
+            resp.get("titleOverride")
+                .map(|v| v.is_null())
+                .unwrap_or(true),
+            "the competing terminal-override title is wiped: {resp}"
+        );
         assert!(state.settings.session_overrides().is_empty());
+        assert!(
+            state
+                .settings
+                .terminal_overrides()
+                .get("term-2")
+                .and_then(|o| o.get("titleOverride"))
+                .is_none(),
+            "no terminal-override title may compete with the record"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

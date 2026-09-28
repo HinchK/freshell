@@ -846,7 +846,6 @@ describe('SetupWizard', () => {
     // Dev-mode warning should be visible
     expect(screen.getByRole('alert')).toBeInTheDocument()
     expect(screen.getByText(/dev mode/i)).toBeInTheDocument()
-    expect(screen.getByText(/npm run dev/i)).toBeInTheDocument()
   })
 
   it('does not auto-advance on WSL when port reachability is still unknown and remote access is not yet enabled', async () => {

@@ -505,6 +505,10 @@ pub fn parse_codex_session_content(content: &str) -> ParsedSessionMeta {
         // Node's codex provider never marks a parsed title provider-generated
         // (no `titleSource` write anywhere in `providers/codex.ts`).
         title_provider_generated: false,
+        custom_title: None,
+        ai_title: None,
+        agent_name_title: None,
+        summary_title: None,
         summary,
         first_user_message,
         // Codex has no provider-authored titles in its transcripts (no custom-title,

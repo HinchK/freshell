@@ -9,7 +9,7 @@
 //!
 //! This test spawns the REAL `index.mjs` source with `node` and drives its stdin
 //! directly. The `@anthropic-ai/claude-agent-sdk` dependency is vendored via
-//! `npm install` into the sidecar package's own node_modules and is NOT present
+//! `pnpm install` into the sidecar package's own node_modules and is NOT present
 //! in a plain checkout/CI, so the test copies the real sidecar entrypoint and its
 //! local helper modules VERBATIM into a temp dir with a
 //! stub `node_modules/@anthropic-ai/claude-agent-sdk` that satisfies only the
@@ -58,8 +58,10 @@ fn real_sidecar_dispatches_interrupt_frames_to_handle_interrupt() {
     let dir = tempfile::tempdir().expect("create temp dir");
     for module in [
         "index.mjs",
+        "monotonic-clock.mjs",
         "permission-channel.mjs",
         "session-settings.mjs",
+        "turn-complete-gate.mjs",
     ] {
         std::fs::write(dir.path().join(module), real_sidecar_source(module))
             .unwrap_or_else(|e| panic!("copy real {module} verbatim: {e}"));

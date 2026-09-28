@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, act } from '@testing-library/react'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { render, screen, act, cleanup } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import TabBar from '@/components/TabBar'
@@ -13,6 +13,7 @@ import terminalMetaReducer from '@/store/terminalMetaSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import freshAgentReducer from '@/store/freshAgentSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
+import sessionNamesReducer, { receiveSessionNames } from '@/store/sessionNamesSlice'
 import type { PaneNode } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 
@@ -65,6 +66,7 @@ function createStore(
       sessions: sessionsReducer,
       freshAgent: freshAgentReducer,
       turnCompletion: turnCompletionReducer,
+      sessionNames: sessionNamesReducer,
     },
     preloadedState: {
       tabs: {
@@ -132,6 +134,10 @@ describe('title sync flow', () => {
     localStorage.clear()
   })
 
+  afterEach(() => {
+    cleanup()
+  })
+
   it('shows runtime pane title updates in both the pane header and single-pane tab label', async () => {
     const layout: PaneNode = {
       type: 'leaf',
@@ -166,7 +172,7 @@ describe('title sync flow', () => {
     expect(store.getState().tabs.tabs[0].title).toBe('Tab 1')
   })
 
-  it('does not let legacy OpenCode defaults override runtime titles during pane updates', async () => {
+  it('keeps a scoped opencode pane on its canonical session name against local title writes and pane updates (Task 5)', async () => {
     const layout: PaneNode = {
       type: 'leaf',
       id: 'pane-1',
@@ -176,10 +182,11 @@ describe('title sync flow', () => {
         createRequestId: 'req-1',
         status: 'running',
         mode: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 'sess-oc-flow-1' },
       },
     }
     const store = createStore(layout, {
-      paneTitle: 'Opencode',
+      paneTitle: 'OpenCode',
       extensions: opencodeExtensions,
     })
 
@@ -192,15 +199,37 @@ describe('title sync flow', () => {
       </Provider>,
     )
 
+    // Pre-canonical: the derived provider label shows on the pane header and
+    // the tab (a lowercase "Opencode" default never leaks).
     expect(screen.getAllByText('OpenCode').length).toBeGreaterThanOrEqual(2)
     expect(screen.queryByText('Opencode')).not.toBeInTheDocument()
 
+    // The server names the session -> the canonical name owns every surface.
+    await act(async () => {
+      store.dispatch(receiveSessionNames([{
+        record: {
+          ref: { kind: 'session', provider: 'opencode', sessionId: 'sess-oc-flow-1' },
+          name: 'Canonical opencode name',
+          source: 'first_message',
+          revision: 2,
+        },
+        documentGeneration: 3,
+        redirects: [],
+        changed: true,
+      }]))
+    })
+
+    expect(screen.getAllByText('Canonical opencode name').length).toBeGreaterThanOrEqual(2)
+
+    // A legacy local title write (registry-shaped noise) never retitles it.
     await act(async () => {
       store.dispatch(updatePaneTitleByTerminalId({ terminalId: 'term-1', title: 'Release prep', setByUser: false }))
     })
 
-    expect(screen.getAllByText('Release prep').length).toBeGreaterThanOrEqual(2)
+    expect(screen.queryByText('Release prep')).not.toBeInTheDocument()
+    expect(screen.getAllByText('Canonical opencode name').length).toBeGreaterThanOrEqual(2)
 
+    // ...and a pane content update keeps the canonical name on every surface.
     await act(async () => {
       store.dispatch(updatePaneContent({
         tabId: 'tab-1',
@@ -211,12 +240,12 @@ describe('title sync flow', () => {
           createRequestId: 'req-1',
           status: 'running',
           mode: 'opencode',
+          sessionRef: { provider: 'opencode', sessionId: 'sess-oc-flow-1' },
         },
       }))
     })
 
-    expect(screen.getAllByText('Release prep').length).toBeGreaterThanOrEqual(2)
-    expect(store.getState().panes.paneTitles['tab-1']['pane-1']).toBe('Release prep')
+    expect(screen.getAllByText('Canonical opencode name').length).toBeGreaterThanOrEqual(2)
   })
 
   it('shows the session title in the tab bar after reopening a session with a new title', async () => {

@@ -101,6 +101,64 @@ describe('openRecordAsUnlinkedCopy', () => {
     expect(calls.map((a) => a.type)).toEqual([addTab.type, initLayout.type, addPane.type])
     expect(calls[2].payload.newContent).toMatchObject({ kind: 'browser' })
   })
+
+  it('remaps a session-owned record nameSource through the explicit old->new pane-id map', () => {
+    const dispatch = vi.fn() as unknown as AppDispatch
+    const record = makeRecord({
+      nameSource: { kind: 'session', paneId: 'p2' },
+      panes: [
+        { paneId: 'p1', kind: 'terminal', title: 'sh', payload: { mode: 'shell' } },
+        { paneId: 'p2', kind: 'terminal', title: 'agent', payload: { mode: 'claude' } },
+      ],
+    })
+    openRecordAsUnlinkedCopy(record, { dispatch })
+
+    const calls = (dispatch as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0])
+    expect(calls[0].type).toBe(addTab.type)
+    // The copy remints every pane id; the pointer must follow the source
+    // pane's NEW id, not the stale recorded one.
+    const firstNewPaneId = calls[1].payload.paneId
+    const secondNewPaneId = calls[2].payload.newPaneId
+    expect(firstNewPaneId).toBeTruthy()
+    expect(secondNewPaneId).toBeTruthy()
+    expect(firstNewPaneId).not.toBe('p1')
+    expect(secondNewPaneId).not.toBe('p2')
+    expect(calls[0].payload.nameSource).toEqual({ kind: 'session', paneId: secondNewPaneId })
+  })
+
+  it('an unresolvable pointer on a copy resolves from the rebuilt layout, not a stale pane id', () => {
+    const dispatch = vi.fn() as unknown as AppDispatch
+    const record = makeRecord({
+      // Pre-feature/foreign record: no pointer to remap.
+      panes: [{ paneId: 'p1', kind: 'terminal', title: 'sh', payload: { mode: 'shell' } }],
+    })
+    openRecordAsUnlinkedCopy(record, { dispatch })
+    const calls = (dispatch as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0])
+    expect(calls[0].payload.nameSource).toBeUndefined()
+  })
+
+  it('carries the pane naming identity (namingHandle/nameRef) into the copied pane content', () => {
+    const dispatch = vi.fn() as unknown as AppDispatch
+    const record = makeRecord({
+      panes: [{
+        paneId: 'p1',
+        kind: 'terminal',
+        title: 'agent',
+        payload: {
+          mode: 'claude',
+          namingHandle: 'nh-copy-1',
+          nameRef: { kind: 'pending', id: 'nh-copy-1' },
+        },
+      }],
+    })
+    openRecordAsUnlinkedCopy(record, { dispatch })
+    const calls = (dispatch as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0])
+    expect(calls[1].payload.content).toMatchObject({
+      kind: 'terminal',
+      mode: 'claude',
+      namingHandle: 'nh-copy-1',
+    })
+  })
 })
 
 describe('openPaneInNewTab', () => {
@@ -116,6 +174,30 @@ describe('openPaneInNewTab', () => {
     expect(calls[0].payload).toMatchObject({ title: 'My Tab · docs' })
     expect(calls[1].type).toBe(initLayout.type)
     expect(calls[1].payload.content).toMatchObject({ kind: 'browser' })
+  })
+
+  it('never seeds a scoped agent pane with the record-tab group label', () => {
+    const dispatch = vi.fn() as unknown as AppDispatch
+    const record = makeRecord({
+      tabName: 'Research sprint',
+      nameSource: { kind: 'session', paneId: 'p-agent' },
+      panes: [{
+        paneId: 'p-agent',
+        kind: 'terminal',
+        title: 'Refactor planner',
+        payload: { mode: 'claude', sessionRef: { provider: 'claude', sessionId: 'sess-1' } },
+      }],
+    })
+    openPaneInNewTab(record, record.panes[0], { dispatch })
+
+    const calls = (dispatch as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0])
+    // The moved scoped pane OWNS the new tab: no composed
+    // `${record.tabName} · ${pane.title}` label, and the tab is named by
+    // that pane's session (the lifecycle middleware resolves the pointer
+    // from the created layout; the display reads the canonical name).
+    expect(calls[0].payload.title).not.toContain('Research sprint')
+    expect(calls[0].payload.title).not.toContain('·')
+    expect(calls[0].payload.title).toBe('Refactor planner')
   })
 })
 

@@ -1,5 +1,12 @@
 # freshell → Rust/Tauri port — autonomous campaign
 
+> **Historical campaign record.** The Rust/Tauri port campaign documented
+> here ran on npm-era branches (`feat/rust-tauri-port`). The Rust server is
+> now the product baseline on `main`, which uses pnpm — current development
+> runbooks live in the repo-root `AGENTS.md` and `docs/development/`.
+> Recorded commands and version evidence below are preserved verbatim as the
+> campaign record.
+
 This directory is the **plan-of-record and control surface** for an autonomous,
 no-human-in-the-loop port of freshell's backend from TypeScript/Electron to
 **Rust + Tauri**, retaining the React/TS frontend unchanged.

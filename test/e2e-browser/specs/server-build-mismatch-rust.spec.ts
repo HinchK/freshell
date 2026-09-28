@@ -89,7 +89,7 @@ test.describe('server build mismatch reload (rust)', () => {
 
     // The real post-reload ready must MATCH: in normal e2e runs the harness
     // guarantees same-HEAD artifacts — global setup fresh-builds both sides
-    // (test/e2e-browser/global-setup.ts runs `npm run build:client && npm run
+    // (test/e2e-browser/global-setup.ts runs `pnpm run build:client && pnpm run
     // build:rust` at run start) and `ensureRustServerBuilt` restamps the
     // Rust binary on HEAD moves — so the real `ready.buildId` equals the
     // client's baked `__FRESHELL_BUILD_ID__` and the production match path

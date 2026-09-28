@@ -21,6 +21,7 @@ import {
 import { broadcastPersistedRaw, resetPersistBroadcastForTests } from '../../../../src/store/persistBroadcast'
 import { BROWSER_PREFERENCES_STORAGE_KEY, MACHINE_ID_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY } from '../../../../src/store/storage-keys'
 import { resolveLocalSettings } from '@shared/settings'
+import { listCapturedMigrationEnvelopes } from '@/lib/session-name-migration'
 import { sessionMetadataKey } from '@/lib/session-metadata'
 
 // Delta round 3, finding 1 + e3r1 findings 3/4: layout envelopes are keyed
@@ -2821,5 +2822,310 @@ describe('crossTabSync', () => {
     expect(store.getState().tabs.tabs.map((t: any) => t.id), 'the old key no longer adopts the other window\u2019s tabs').toEqual(['t1'])
     expect((store.getState().panes.layouts['t1'] as any)?.id, 'the local pane tree is not replaced').toBe('pane-a')
     expect(store.getState().panes.paneTitles['t1']?.['pane-a']).toBe('Title from old shared key')
+  })
+})
+
+describe('crossTabSync — unified agent names (Task 6)', () => {
+  const cleanups: Array<() => void> = []
+
+  afterEach(() => {
+    localStorage.clear()
+    vi.restoreAllMocks()
+    for (const cleanup of cleanups.splice(0)) cleanup()
+  })
+
+  function machineReady(machineId: string) {
+    return setMachineReady({
+      machine: { id: machineId, label: machineId, createdAt: 1, lastSeenAt: 1 },
+      mode: 'server-managed',
+    })
+  }
+
+  // ── Unified agent names (Task 6): stable ownership across mirrors ──
+  //
+  // "Hydration/mirror accepts relationships and projections, never name
+  // writes. An old mirror without nameSource cannot erase an initialized
+  // server pointer" — the hydrateTabs merge keeps an established pointer
+  // when the winning side's tab record predates the field.
+  it('keeps a hydrated tab nameSource through the OWN-key hydrateTabs merge', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+    cleanups.push(installCrossTabSync(store as any))
+
+    store.dispatch(hydrateTabs({
+      tabs: [
+        {
+          id: 't-owned',
+          title: 'Owned',
+          createdAt: 1,
+          nameSource: { kind: 'session', paneId: 'p-agent' },
+        },
+      ],
+      activeTabId: 't-owned',
+      renameRequestTabId: null,
+    }))
+
+    expect(store.getState().tabs.tabs[0].nameSource).toEqual({ kind: 'session', paneId: 'p-agent' })
+  })
+
+  it('an old mirror without nameSource cannot erase an initialized pointer', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+    cleanups.push(installCrossTabSync(store as any))
+
+    // The local tab already resolved ownership (server-initialized pointer).
+    store.dispatch(hydrateTabs({
+      tabs: [
+        {
+          id: 't-owned',
+          title: 'Owned',
+          createdAt: 1,
+          updatedAt: 1,
+          nameSource: { kind: 'session', paneId: 'p-agent' },
+        },
+      ],
+      activeTabId: 't-owned',
+      renameRequestTabId: null,
+    }))
+
+    // A NEWER mirror from a pre-Task-6 window wins on recency but carries no
+    // pointer field at all.
+    store.dispatch({
+      ...hydrateTabs({
+        tabs: [{ id: 't-owned', title: 'Owned newer', createdAt: 1, updatedAt: 99 }],
+        activeTabId: 't-owned',
+        renameRequestTabId: null,
+      }),
+      meta: {
+        skipPersist: true,
+        source: 'cross-tab',
+        localLayoutPersistedAt: 1,
+        remoteLayoutPersistedAt: 2,
+      },
+    })
+
+    const merged = store.getState().tabs.tabs[0]
+    expect(merged.title).toBe('Owned newer')
+    expect(merged.nameSource).toEqual({ kind: 'session', paneId: 'p-agent' })
+  })
+
+  it('stale foreign-window title flags cannot freeze a scoped pane; legacy pane flags still work', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer, machineIdentity: machineIdentityReducer },
+    })
+    store.dispatch(machineReady('machine-1'))
+    // Local layout: one scoped agent pane and one shell pane in tab-1.
+    store.dispatch(hydrateTabs({
+      tabs: [{ id: 'tab-1', title: 'T1', createdAt: 1 }],
+      activeTabId: 'tab-1',
+      renameRequestTabId: null,
+    }))
+    store.dispatch(hydratePanes({
+      layouts: {
+        'tab-1': {
+          type: 'split',
+          id: 'split-local',
+          direction: 'horizontal',
+          sizes: [50, 50],
+          children: [
+            {
+              type: 'leaf',
+              id: 'p-agent',
+              content: { kind: 'terminal', mode: 'claude', createRequestId: 'req-agent', status: 'running' },
+            },
+            {
+              type: 'leaf',
+              id: 'p-shell',
+              content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-shell', status: 'running' },
+            },
+          ],
+        } as any,
+      },
+      activePane: { 'tab-1': 'p-agent' },
+      paneTitles: {},
+    }))
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    // A foreign window's envelope carries a stale user-set flag + old title
+    // for the SCOPED pane (a pre-Task-5 rename) and a legitimate user-set
+    // title for the shell pane.
+    const foreignRaw = JSON.stringify({
+      version: 3,
+      persistedAt: 5_000,
+      machineId: 'machine-1',
+      tabs: {
+        activeTabId: 'tab-1',
+        tabs: [{ id: 'tab-1', title: 'T1', createdAt: 1 }],
+      },
+      panes: {
+        version: 6,
+        layouts: {
+          'tab-1': {
+            type: 'split',
+            id: 'split-local',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              { type: 'leaf', id: 'p-agent', content: { kind: 'terminal', mode: 'claude', createRequestId: 'req-agent', status: 'running' } },
+              { type: 'leaf', id: 'p-shell', content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-shell', status: 'running' } },
+            ],
+          },
+        },
+        activePane: {},
+        paneTitles: { 'tab-1': { 'p-agent': 'Stale scoped title', 'p-shell': 'Pinned shell' } },
+        paneTitleSetByUser: { 'tab-1': { 'p-agent': true, 'p-shell': true } },
+      },
+      tombstones: [],
+    })
+
+    window.dispatchEvent(new StorageEvent('storage', { key: 'freshell.layout.v3.layout-window-stale-flags', newValue: foreignRaw }))
+
+    // The scoped pane did NOT adopt the stale user-set freeze…
+    expect(store.getState().panes.paneTitleSetByUser['tab-1']?.['p-agent']).toBeUndefined()
+    expect(store.getState().panes.paneTitles['tab-1']?.['p-agent']).toBeUndefined()
+    // …while the legacy shell pane's user-set flag still works verbatim.
+    expect(store.getState().panes.paneTitleSetByUser['tab-1']?.['p-shell']).toBe(true)
+    expect(store.getState().panes.paneTitles['tab-1']?.['p-shell']).toBe('Pinned shell')
+  })
+})
+
+// ── unified agent names (Task 7) ─────────────────────────────────────────────
+
+describe('crossTabSync — unified agent names (Task 7)', () => {
+  const task7Cleanups: Array<() => void> = []
+  afterEach(() => {
+    while (task7Cleanups.length > 0) {
+      task7Cleanups.pop()!()
+    }
+  })
+
+  it('captures an old foreign-window envelope as immutable legacy evidence BEFORE the sanitized hydrate runs', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer, machineIdentity: machineIdentityReducer },
+    })
+    store.dispatch(setMachineReady({
+      machine: { id: 'machine-1', label: 'machine-1', createdAt: 1, lastSeenAt: 1 },
+      mode: 'server-managed',
+    }))
+    store.dispatch(hydrateTabs({
+      tabs: [{ id: 'tab-1', title: 'T1', createdAt: 1 }],
+      activeTabId: 'tab-1',
+      renameRequestTabId: null,
+    }))
+    store.dispatch(hydratePanes({
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'p-agent',
+          content: { kind: 'terminal', mode: 'claude', createRequestId: 'req-agent', status: 'running' },
+        } as any,
+      },
+      activePane: { 'tab-1': 'p-agent' },
+      paneTitles: {},
+    }))
+
+    task7Cleanups.push(installCrossTabSync(store as any))
+
+    const foreignRaw = JSON.stringify({
+      version: 3,
+      persistedAt: 5_000,
+      machineId: 'machine-1',
+      tabs: { activeTabId: 'tab-1', tabs: [{ id: 'tab-1', title: 'T1', createdAt: 1 }] },
+      panes: {
+        version: 6,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'p-agent',
+            content: { kind: 'terminal', mode: 'claude', createRequestId: 'req-agent', status: 'running' },
+          },
+        },
+        activePane: {},
+        paneTitles: { 'tab-1': { 'p-agent': 'Old Pre-Change Rename' } },
+        paneTitleSetByUser: { 'tab-1': { 'p-agent': true } },
+      },
+      tombstones: [],
+    })
+
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: 'freshell.layout.v3.layout-window-task7-capture',
+      newValue: foreignRaw,
+    }))
+
+    // The sanitized hydrate dropped the scoped alias…
+    expect(store.getState().panes.paneTitles['tab-1']?.['p-agent']).toBeUndefined()
+    // …and the raw bytes were preserved as immutable legacy-name evidence
+    // (captured BEFORE the dispatch — the capture is what keeps the label
+    // recoverable for the consolidation import).
+    const envelopes = listCapturedMigrationEnvelopes(localStorage)
+    const captured = envelopes.find(
+      (envelope) => envelope.storageKey === 'freshell.layout.v3.layout-window-task7-capture',
+    )
+    expect(captured).toBeTruthy()
+    expect(captured?.raw).toBe(foreignRaw)
+  })
+
+  it('drops a LOCAL scoped pane alias on the title-only path — an unacknowledged old label never stays an active override', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer, machineIdentity: machineIdentityReducer },
+    })
+    store.dispatch(setMachineReady({
+      machine: { id: 'machine-1', label: 'machine-1', createdAt: 1, lastSeenAt: 1 },
+      mode: 'server-managed',
+    }))
+    store.dispatch(hydrateTabs({
+      tabs: [{ id: 'tab-1', title: 'T1', createdAt: 1 }],
+      activeTabId: 'tab-1',
+      renameRequestTabId: null,
+    }))
+    // The LOCAL state still carries a scoped pane's pre-Task-5 alias.
+    store.dispatch(hydratePanes({
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'p-agent',
+          content: { kind: 'terminal', mode: 'claude', createRequestId: 'req-agent', status: 'running' },
+        } as any,
+      },
+      activePane: { 'tab-1': 'p-agent' },
+      paneTitles: { 'tab-1': { 'p-agent': 'Local Scoped Alias' } },
+      paneTitleSetByUser: { 'tab-1': { 'p-agent': true } },
+    }))
+
+    task7Cleanups.push(installCrossTabSync(store as any))
+
+    const foreignRaw = JSON.stringify({
+      version: 3,
+      persistedAt: 9_000,
+      machineId: 'machine-1',
+      tabs: { activeTabId: 'tab-1', tabs: [{ id: 'tab-1', title: 'T1', createdAt: 1 }] },
+      panes: {
+        version: 6,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'p-agent',
+            content: { kind: 'terminal', mode: 'claude', createRequestId: 'req-agent', status: 'running' },
+          },
+        },
+        activePane: {},
+        paneTitles: { 'tab-1': { 'p-agent': 'Foreign Scoped Alias' } },
+        paneTitleSetByUser: { 'tab-1': { 'p-agent': true } },
+      },
+      tombstones: [],
+    })
+
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: 'freshell.layout.v3.layout-window-task7-local-drop',
+      newValue: foreignRaw,
+    }))
+
+    // Neither the foreign alias nor the pre-existing LOCAL alias survives:
+    // the canonical server record owns the scoped pane's name.
+    expect(store.getState().panes.paneTitles['tab-1']?.['p-agent']).toBeUndefined()
+    expect(store.getState().panes.paneTitleSetByUser['tab-1']?.['p-agent']).toBeUndefined()
   })
 })

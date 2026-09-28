@@ -30,6 +30,7 @@ import { mergeSessionMetadataByKey, sessionMetadataKey } from '@/lib/session-met
 import { mergeSessionMetadataForPreferredResumeId } from './persistControl'
 import { migrateLegacyTerminalDurableState, sanitizeSessionRef } from '@shared/session-contract'
 import { sanitizeTabsAgainstLayouts } from '@/lib/tab-fallback-identity'
+import { TabNameSourceSchema, type TabNameSource } from '@shared/session-names'
 
 
 const log = createLogger('TabsSlice')
@@ -77,6 +78,10 @@ function normalizePersistedTerminalStatus(status: unknown): TerminalStatus {
   return 'creating'
 }
 
+function sanitizeTabNameSource(value: unknown): TabNameSource | undefined {
+  return TabNameSourceSchema.safeParse(value).success ? value as TabNameSource : undefined
+}
+
 function migrateTabFields(t: Tab): Tab {
   const legacyCodingCliSessionId = typeof (t as any).codingCliSessionId === 'string'
     ? (t as any).codingCliSessionId
@@ -109,6 +114,9 @@ function migrateTabFields(t: Tab): Tab {
     sessionRef: durableState.sessionRef,
     resumeSessionId: undefined,
     lastInputAt: t.lastInputAt,
+    // Unified agent names (Task 6): a persisted pointer survives the
+    // migration; a malformed one drops instead of entering tab state.
+    nameSource: sanitizeTabNameSource((rest as { nameSource?: unknown }).nameSource),
   }
 }
 
@@ -139,6 +147,19 @@ function reconcileHydratedTabTitle(localTab: Tab, remoteTab: Tab, winner: Tab): 
   const userSide = localTab.titleSetByUser ? localTab : remoteTab.titleSetByUser ? remoteTab : null
   if (!userSide) return winner
   return { ...winner, title: userSide.title, titleSetByUser: true }
+}
+
+/**
+ * Unified agent names (Task 6): an old mirror without `nameSource` cannot
+ * erase an initialized pointer. A pointer, once resolved, is never reset to
+ * undefined — so when the recency winner's tab record predates the field,
+ * the merged tab keeps whichever side still carries the relationship
+ * (hydration accepts the RELATIONSHIP, never a name write).
+ */
+function preserveHydratedTabNameSource(localTab: Tab, remoteTab: Tab, winner: Tab): Tab {
+  if (winner.nameSource) return winner
+  const carried = localTab.nameSource ?? remoteTab.nameSource
+  return carried ? { ...winner, nameSource: carried } : winner
 }
 
 function deriveTabSessionRef(tab: Tab) {
@@ -298,6 +319,13 @@ type AddTabPayload = {
    * very first tab always becomes active — nothing else promotes it.
    */
   activate?: boolean
+  /**
+   * Unified agent names (Task 6): the new tab's stable naming-source
+   * relationship. Copy/recovery dispatchers pass their explicitly remapped
+   * pointer; ordinary creates leave it undefined for the lifecycle
+   * middleware to resolve at the initial content choice.
+   */
+  nameSource?: TabNameSource
 }
 
 export const tabsSlice = createSlice({
@@ -329,6 +357,7 @@ export const tabsSlice = createSlice({
         updatedAt: Date.now(),
         titleSetByUser: payload.titleSetByUser,
         lastInputAt: undefined,
+        nameSource: payload.nameSource,
       }
       state.tabs.push(tab)
       if (payload.activate !== false || state.tabs.length === 1) {
@@ -408,7 +437,8 @@ export const tabsSlice = createSlice({
         if (localTab) {
           const winningTab = pickHydratedTabWinner(localTab, remoteTab, meta)
           const titledTab = reconcileHydratedTabTitle(localTab, remoteTab, winningTab)
-          merged.push(protectCanonicalFallbackIdentity(localTab, remoteTab, titledTab))
+          const sourcedTab = preserveHydratedTabNameSource(localTab, remoteTab, titledTab)
+          merged.push(protectCanonicalFallbackIdentity(localTab, remoteTab, sourcedTab))
         } else {
           merged.push(remoteTab)
         }
@@ -457,6 +487,23 @@ export const tabsSlice = createSlice({
       const prevIndex = (currentIndex - 1 + state.tabs.length) % state.tabs.length
       state.activeTabId = state.tabs[prevIndex].id
     },
+    /**
+     * Unified agent names (Task 6): set one tab's stable naming-source
+     * relationship. The lifecycle middleware drives this from actual layout
+     * transitions; copy/recovery dispatchers pass their explicitly remapped
+     * pointer. A tab stores the RELATIONSHIP, never a second name.
+     */
+    setTabNameSource: (
+      state,
+      action: PayloadAction<{ tabId: string; nameSource: TabNameSource }>,
+    ) => {
+      const tab = state.tabs.find((t) => t.id === action.payload.tabId)
+      if (!tab) {
+        log.warn('setTabNameSource targeted a missing tab', { tabId: action.payload.tabId })
+        return
+      }
+      tab.nameSource = action.payload.nameSource
+    },
   },
 })
 
@@ -472,6 +519,7 @@ export const {
   reorderTabs,
   switchToNextTab,
   switchToPrevTab,
+  setTabNameSource,
 } = tabsSlice.actions
 
 function collectPaneIds(node: PaneNode | undefined): string[] {
@@ -967,6 +1015,9 @@ export const reopenClosedTab = createAsyncThunk(
       codingCliProvider: entry.tab.codingCliProvider,
       resumeSessionId: entry.tab.resumeSessionId,
       sessionMetadataByKey: entry.tab.sessionMetadataByKey,
+      // Unified agent names (Task 6): the reopened tab keeps the frozen
+      // pointer — restoreLayout preserves the layout's pane ids verbatim.
+      nameSource: entry.tab.nameSource,
     }))
     dispatch(restoreLayout({
       tabId: newTabId,

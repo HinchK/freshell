@@ -11,7 +11,7 @@ export default defineConfig({
     : // 'never' locally too: many concurrent agents run this suite, and
       // 'on-failure' auto-opens a report browser page (localhost:9323) at the
       // user on every failing run. View reports on demand with
-      // `npx playwright show-report`.
+      // `pnpm exec playwright show-report`.
       [['html', { open: 'never' }]],
   timeout: 120_000, // Electron startup can be slow
   expect: {

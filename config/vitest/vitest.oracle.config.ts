@@ -29,7 +29,7 @@ const projectRoot = path.resolve(__dirname, '../..')
  *   - single-fork / no file parallelism so spawned ports & pids never contend.
  *
  * NOT wired into the shared test-coordinator/full-suite — run explicitly via
- * `npm run test:oracle`.
+ * `pnpm run test:oracle`.
  */
 export default defineConfig({
   root: projectRoot,

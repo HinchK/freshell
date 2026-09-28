@@ -12,6 +12,17 @@ export function countPaneLeaves(node: PaneNode | undefined): number {
   return countPaneLeaves(node.children[0]) + countPaneLeaves(node.children[1])
 }
 
+/** Unified agent names (Task 6): the pane's naming identity rides registry
+ * payloads so recovery/copies preserve the provisional handle and the bound
+ * ref; omitted when the pane has none (pre-Task-6 panes). */
+function paneNamingIdentityPayload(content: PaneContent): Record<string, unknown> {
+  if (content.kind !== 'terminal' && content.kind !== 'fresh-agent') return {}
+  return {
+    ...(content.namingHandle ? { namingHandle: content.namingHandle } : {}),
+    ...(content.nameRef ? { nameRef: content.nameRef } : {}),
+  }
+}
+
 function stripPanePayload(content: PaneContent, serverInstanceId: string): Record<string, unknown> {
   switch (content.kind) {
     case 'terminal':
@@ -28,6 +39,7 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
             }
           : undefined,
         initialCwd: content.initialCwd,
+        ...paneNamingIdentityPayload(content),
       }
     case 'browser':
       return {
@@ -59,6 +71,7 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
         ...(content.restoreError ? { restoreError: content.restoreError } : {}),
         settingsDismissed: content.settingsDismissed,
         showTimecodes: content.showTimecodes,
+        ...paneNamingIdentityPayload(content),
       }
     case 'extension':
       return {
@@ -136,6 +149,10 @@ export function buildOpenTabRegistryRecord(input: SnapshotRecordInput): Registry
     updatedAt: input.updatedAt,
     paneCount: paneSnapshots.length,
     titleSetByUser: !!input.tab.titleSetByUser,
+    // Unified agent names (Task 6): the stable naming-source relationship
+    // travels with the record so copies/recovery can remap it; omitted when
+    // unresolved.
+    ...(input.tab.nameSource ? { nameSource: input.tab.nameSource } : {}),
     panes: paneSnapshots,
   }
 }
@@ -160,6 +177,9 @@ export function buildClosedTabRegistryRecord(input: SnapshotRecordInput): Regist
     closedAt: input.updatedAt,
     paneCount: paneSnapshots.length,
     titleSetByUser: !!input.tab.titleSetByUser,
+    // Unified agent names (Task 6): the stable naming-source relationship
+    // travels with the closed record (reopen/recovery read it back).
+    ...(input.tab.nameSource ? { nameSource: input.tab.nameSource } : {}),
     panes: paneSnapshots,
   }
 }

@@ -8,6 +8,7 @@ import tabsReducer, { addTab } from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer, { initLayout } from '@/store/panesSlice'
+import sessionNamesReducer from '@/store/sessionNamesSlice'
 import tabRegistryReducer from '@/store/tabRegistrySlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import extensionsReducer from '@/store/extensionsSlice'
@@ -43,6 +44,7 @@ vi.mock('@/hooks/useFullscreen', () => ({ useFullscreen: () => ({ isFullscreen: 
 
 const mocks = vi.hoisted(() => ({
   apiGet: vi.fn(),
+  apiPost: vi.fn(),
   getMachines: vi.fn(),
   createMachine: vi.fn(),
   fetchSidebarSessionsSnapshot: vi.fn(),
@@ -66,10 +68,13 @@ vi.mock('@/lib/api', () => ({
       super(message)
     }
   },
+  // The naming bootstrap read rides the real retry wrapper; the mock keeps
+  // it a passthrough (the fixtures never 429).
+  with429Retry: async (attempt: () => Promise<unknown>) => attempt(),
   api: {
     get: (path: string) => mocks.apiGet(path),
     patch: vi.fn(),
-    post: vi.fn(),
+    post: (...args: unknown[]) => mocks.apiPost(...args) as unknown as Promise<unknown>,
   },
   getMachines: () => mocks.getMachines(),
   createMachine: (label: string) => mocks.createMachine(label),
@@ -136,6 +141,7 @@ function createStore() {
       connection: connectionReducer,
       sessions: sessionsReducer,
       panes: panesReducer,
+      sessionNames: sessionNamesReducer,
       tabRegistry: tabRegistryReducer,
       terminalMeta: terminalMetaReducer,
       network: networkReducer,
@@ -225,5 +231,129 @@ describe('App terminal.inventory title fold wiring', () => {
       expect(store.getState().panes.paneTitles['tab-inv']?.['pane-inv']).toBe('From inventory')
     })
     expect(store.getState().panes.paneTitleSetByUser['tab-inv']?.['pane-inv']).toBeFalsy()
+  })
+
+  it('folds terminal.inventory canonical records into the sessionNames cache (Task 5)', async () => {
+    localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
+    mocks.getMachines.mockResolvedValue([MACHINE])
+    const store = createStore()
+    store.dispatch(addTab({ id: 'tab-inv', title: 'tab-inv' }))
+    store.dispatch(initLayout({
+      tabId: 'tab-inv',
+      paneId: 'pane-inv',
+      content: { kind: 'terminal', mode: 'claude', terminalId: 't-inv-1', createRequestId: 'cr-t-inv-1', status: 'running' },
+    }))
+
+    render(<Provider store={store}><App /></Provider>)
+
+    await waitFor(() => { expect(messageHandler).toBeTypeOf('function') })
+
+    act(() => {
+      messageHandler?.({
+        type: 'terminal.inventory',
+        terminals: [{
+          terminalId: 't-inv-1',
+          title: 'From inventory',
+          status: 'running',
+          nameRef: { kind: 'session', provider: 'claude', sessionId: 'sess-inv-a' },
+          sessionName: {
+            ref: { kind: 'session', provider: 'claude', sessionId: 'sess-inv-a' },
+            name: 'Canonical inventory name',
+            source: 'manual',
+            revision: 3,
+          },
+        }],
+        terminalMeta: [],
+      })
+    })
+
+    const key = JSON.stringify(['session', 'claude', 'sess-inv-a'])
+    await waitFor(() => {
+      expect(store.getState().sessionNames.records[key]?.name).toBe('Canonical inventory name')
+    })
+  })
+
+  it('folds a session.name.updated broadcast into the sessionNames cache by revision', async () => {
+    localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
+    mocks.getMachines.mockResolvedValue([MACHINE])
+    const store = createStore()
+
+    render(<Provider store={store}><App /></Provider>)
+
+    await waitFor(() => { expect(messageHandler).toBeTypeOf('function') })
+
+    act(() => {
+      messageHandler?.({
+        type: 'session.name.updated',
+        record: {
+          ref: { kind: 'session', provider: 'claude', sessionId: 'sess-push-a' },
+          name: 'Pushed canonical name',
+          source: 'manual',
+          revision: 5,
+          renamedAt: 1_700_000_000_000,
+        },
+        documentGeneration: 9,
+        redirects: [],
+        changed: true,
+      })
+    })
+
+    const key = JSON.stringify(['session', 'claude', 'sess-push-a'])
+    await waitFor(() => {
+      expect(store.getState().sessionNames.records[key]?.name).toBe('Pushed canonical name')
+    })
+    expect(store.getState().sessionNames.records[key]?.revision).toBe(5)
+  })
+
+  it('bootstraps canonical names on ready: POSTs the collected refs and folds the response', async () => {
+    localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
+    mocks.getMachines.mockResolvedValue([MACHINE])
+    mocks.apiPost.mockResolvedValue({
+      names: [{
+        record: {
+          ref: { kind: 'session', provider: 'claude', sessionId: 'sess-boot-1' },
+          name: 'Bootstrapped name',
+          source: 'first_message',
+          revision: 1,
+        },
+        documentGeneration: 2,
+        redirects: [],
+        changed: false,
+      }],
+    })
+    const store = createStore()
+    store.dispatch(addTab({ id: 'tab-boot', title: 'tab-boot' }))
+    store.dispatch(initLayout({
+      tabId: 'tab-boot',
+      paneId: 'pane-boot',
+      content: {
+        kind: 'terminal',
+        mode: 'claude',
+        terminalId: 't-boot-1',
+        createRequestId: 'cr-t-boot-1',
+        status: 'running',
+        sessionRef: { provider: 'claude', sessionId: 'sess-boot-1' },
+      },
+    }))
+
+    render(<Provider store={store}><App /></Provider>)
+
+    await waitFor(() => { expect(messageHandler).toBeTypeOf('function') })
+
+    act(() => {
+      messageHandler?.({ type: 'ready', timestamp: new Date().toISOString(), serverInstanceId: 'server-a', bootId: 'boot-a' })
+    })
+
+    await waitFor(() => {
+      expect(mocks.apiPost).toHaveBeenCalledWith(
+        '/api/session-names/read',
+        { refs: [{ kind: 'session', provider: 'claude', sessionId: 'sess-boot-1' }] },
+        expect.anything(),
+      )
+    })
+    const key = JSON.stringify(['session', 'claude', 'sess-boot-1'])
+    await waitFor(() => {
+      expect(store.getState().sessionNames.records[key]?.name).toBe('Bootstrapped name')
+    })
   })
 })

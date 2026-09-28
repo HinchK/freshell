@@ -3,7 +3,9 @@ import { randomUUID } from 'node:crypto'
 import { hostname, userInfo } from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+
+import { detectProjectManager, type PackageManagerKind } from '../lib/package-manager.js'
 
 import {
   resolveGitBranchAndDirty,
@@ -41,6 +43,16 @@ import { assertNoCoordinatorRecursion, runUpstreamPhase } from './coordinator-up
 const execFileAsync = promisify(execFile)
 const DEFAULT_POLL_MS = 60_000
 const DEFAULT_MAX_WAIT_MS = 24 * 60 * 60 * 1000
+const COORDINATOR_REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
+
+let coordinatorManagerCache: PackageManagerKind | undefined
+
+function detectCoordinatorManager(): PackageManagerKind {
+  if (coordinatorManagerCache === undefined) {
+    coordinatorManagerCache = detectProjectManager(COORDINATOR_REPO_ROOT).manager
+  }
+  return coordinatorManagerCache
+}
 
 type ParsedRunArgs = {
   commandKey: CommandKey
@@ -591,9 +603,15 @@ function summarizeCommand(commandKey: CommandKey, forwardedArgs: string[], summa
   }
 }
 
-function publicCommandDisplay(commandKey: CommandKey, forwardedArgs: string[]): string {
-  const base = commandKey === 'test' ? 'npm test' : `npm run ${commandKey}`
-  return forwardedArgs.length > 0 ? `${base} -- ${forwardedArgs.join(' ')}` : base
+export function publicCommandDisplay(
+  commandKey: CommandKey,
+  forwardedArgs: string[],
+  manager: PackageManagerKind = detectCoordinatorManager(),
+): string {
+  const base = commandKey === 'test' ? `${manager} test` : `${manager} run ${commandKey}`
+  if (forwardedArgs.length === 0) return base
+  const joined = forwardedArgs.join(' ')
+  return manager === 'pnpm' ? `${base} ${joined}` : `${base} -- ${joined}`
 }
 
 function stripLeadingArgSeparator(args: string[]): string[] {

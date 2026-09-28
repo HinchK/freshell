@@ -56,7 +56,7 @@ If you drag dividers, log those drags as timed events.
 ## Example: Build + Preview + Runtime Layout
 
 ```bash
-FSH="npx tsx tools/freshell-cli/index.ts"
+FSH="pnpm exec tsx tools/freshell-cli/index.ts"
 
 # Start from one code pane id in $CODE_PANE
 BOTTOM_JSON="$($FSH split-pane -t "$CODE_PANE" -v --mode shell)"
@@ -72,7 +72,7 @@ $FSH resize-pane -t "$BOTTOM_PANE" --y 22
 ## Example: Coordinator + Two Agents + Document
 
 ```bash
-FSH="npx tsx tools/freshell-cli/index.ts"
+FSH="pnpm exec tsx tools/freshell-cli/index.ts"
 
 # Start with coordinator in $COORD_PANE
 RIGHT_JSON="$($FSH split-pane -t "$COORD_PANE" --mode codex)"

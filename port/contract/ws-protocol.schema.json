@@ -1,8 +1,8 @@
 {
-  "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. Each entry in `schemas` is a self-contained JSON Schema for one exported Zod schema. The wire contract is frozen for the Rust port — changing it is out of scope.",
+  "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `pnpm run contract:generate`. Each entry in `schemas` is a self-contained JSON Schema for one exported Zod schema. The wire contract is frozen for the Rust port — changing it is out of scope.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "schemaCount": 83,
+  "schemaCount": 85,
   "schemas": {
     "AmplifierActivityListResponseSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -522,6 +522,10 @@
             "capabilities": {
               "additionalProperties": false,
               "properties": {
+                "pacedTerminalReplayV1": {
+                  "const": true,
+                  "type": "boolean"
+                },
                 "paneReconcileFreshAgentV1": {
                   "const": true,
                   "type": "boolean"
@@ -531,6 +535,10 @@
                   "type": "boolean"
                 },
                 "terminalInterestV1": {
+                  "const": true,
+                  "type": "boolean"
+                },
+                "terminalLifetimeClaimV1": {
                   "const": true,
                   "type": "boolean"
                 },
@@ -842,6 +850,10 @@
               "default": "shell",
               "type": "string"
             },
+            "namingHandle": {
+              "minLength": 1,
+              "type": "string"
+            },
             "observedEpoch": {
               "maximum": 9007199254740991,
               "minimum": 0,
@@ -1013,6 +1025,12 @@
               ],
               "type": "string"
             },
+            "replayPageBytes": {
+              "description": "Optional upper bound on each paced replay page's serialized bytes (pacedTerminalReplayV1 connections only), clamped to the server's page-budget cap. Pages are bounded by max(requested, the atomic frame size): a single frame larger than the request forms its own atomic page, bounded by the server fragment cap.",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991,
+              "type": "integer"
+            },
             "rows": {
               "maximum": 500,
               "minimum": 2,
@@ -1051,6 +1069,15 @@
         {
           "additionalProperties": false,
           "properties": {
+            "claimedTerminalIds": {
+              "items": {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 1024,
+              "type": "array"
+            },
             "focusedTerminalId": {
               "anyOf": [
                 {
@@ -1320,6 +1347,9 @@
               "minimum": 0,
               "type": "integer"
             },
+            "reason": {
+              "type": "string"
+            },
             "requestId": {
               "minLength": 1,
               "type": "string"
@@ -1336,6 +1366,43 @@
           "required": [
             "type",
             "terminalId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attachRequestId": {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            "consumedSeq": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "streamId": {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            "terminalId": {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "terminal.replay.credit",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "terminalId",
+            "streamId",
+            "attachRequestId",
+            "consumedSeq"
           ],
           "type": "object"
         },
@@ -1538,6 +1605,41 @@
                   },
                   "id": {
                     "type": "string"
+                  },
+                  "nameSource": {
+                    "oneOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "kind": {
+                            "const": "session",
+                            "type": "string"
+                          },
+                          "paneId": {
+                            "minLength": 1,
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "paneId"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "kind": {
+                            "const": "legacy",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ],
+                        "type": "object"
+                      }
+                    ]
                   },
                   "title": {
                     "type": "string"
@@ -1785,6 +1887,10 @@
                   "type": "null"
                 }
               ]
+            },
+            "namingHandle": {
+              "minLength": 1,
+              "type": "string"
             },
             "observedEpoch": {
               "maximum": 9007199254740991,
@@ -3228,6 +3334,10 @@
                 }
               ]
             },
+            "namingHandle": {
+              "minLength": 1,
+              "type": "string"
+            },
             "observedEpoch": {
               "maximum": 9007199254740991,
               "minimum": 0,
@@ -4222,6 +4332,10 @@
             }
           ]
         },
+        "namingHandle": {
+          "minLength": 1,
+          "type": "string"
+        },
         "observedEpoch": {
           "maximum": 9007199254740991,
           "minimum": 0,
@@ -4780,6 +4894,10 @@
         "capabilities": {
           "additionalProperties": false,
           "properties": {
+            "pacedTerminalReplayV1": {
+              "const": true,
+              "type": "boolean"
+            },
             "paneReconcileFreshAgentV1": {
               "const": true,
               "type": "boolean"
@@ -4789,6 +4907,10 @@
               "type": "boolean"
             },
             "terminalInterestV1": {
+              "const": true,
+              "type": "boolean"
+            },
+            "terminalLifetimeClaimV1": {
               "const": true,
               "type": "boolean"
             },
@@ -7761,6 +7883,10 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "pacedTerminalReplayV1": {
+          "const": true,
+          "type": "boolean"
+        },
         "paneReconcileFreshAgentV1": {
           "const": true,
           "type": "boolean"
@@ -7770,6 +7896,10 @@
           "type": "boolean"
         },
         "terminalInterestV1": {
+          "const": true,
+          "type": "boolean"
+        },
+        "terminalLifetimeClaimV1": {
           "const": true,
           "type": "boolean"
         }
@@ -7987,6 +8117,12 @@
             "background"
           ],
           "type": "string"
+        },
+        "replayPageBytes": {
+          "description": "Optional upper bound on each paced replay page's serialized bytes (pacedTerminalReplayV1 connections only), clamped to the server's page-budget cap. Pages are bounded by max(requested, the atomic frame size): a single frame larger than the request forms its own atomic page, bounded by the server fragment cap.",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "type": "integer"
         },
         "rows": {
           "maximum": 500,
@@ -8224,6 +8360,10 @@
           "default": "shell",
           "type": "string"
         },
+        "namingHandle": {
+          "minLength": 1,
+          "type": "string"
+        },
         "observedEpoch": {
           "maximum": 9007199254740991,
           "minimum": 0,
@@ -8394,6 +8534,15 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "claimedTerminalIds": {
+          "items": {
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 1024,
+          "type": "array"
+        },
         "focusedTerminalId": {
           "anyOf": [
             {
@@ -8449,6 +8598,9 @@
           "maximum": 9007199254740991,
           "minimum": 0,
           "type": "integer"
+        },
+        "reason": {
+          "type": "string"
         },
         "requestId": {
           "minLength": 1,
@@ -8688,6 +8840,44 @@
       ],
       "type": "object"
     },
+    "TerminalReplayCreditSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "attachRequestId": {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        "consumedSeq": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "streamId": {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        "terminalId": {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.replay.credit",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "terminalId",
+        "streamId",
+        "attachRequestId",
+        "consumedSeq"
+      ],
+      "type": "object"
+    },
     "TerminalResizeSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -8734,6 +8924,35 @@
         "terminalId",
         "cols",
         "rows"
+      ],
+      "type": "object"
+    },
+    "TerminalStuckSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "at": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "stuck": {
+          "type": "boolean"
+        },
+        "terminalId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.stuck",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "terminalId",
+        "at",
+        "stuck"
       ],
       "type": "object"
     },
@@ -9043,6 +9262,41 @@
               },
               "id": {
                 "type": "string"
+              },
+              "nameSource": {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "const": "session",
+                        "type": "string"
+                      },
+                      "paneId": {
+                        "minLength": 1,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "paneId"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "const": "legacy",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ],
+                    "type": "object"
+                  }
+                ]
               },
               "title": {
                 "type": "string"

@@ -24,7 +24,7 @@
  * type checker, so it stays complete and drift-safe for both the Zod-validated
  * client surface and the TypeScript-only server surface.
  *
- * Run: `npm run contract:generate` (or `tsx port/contract/generate-ws-contract.ts`).
+ * Run: `pnpm run contract:generate` (or `pnpm exec tsx port/contract/generate-ws-contract.ts`).
  * The drift guard `test/unit/port/ws-contract-freeze.test.ts` regenerates this
  * in-memory and fails if the committed files are stale.
  *
@@ -183,7 +183,7 @@ function assembleBundle(schemas: Record<string, JsonSchema>, dialect: string): S
     title: 'freshell WebSocket wire protocol — frozen contract',
     description:
       'Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. ' +
-      'Regenerate with `npm run contract:generate`. Each entry in `schemas` is a ' +
+      'Regenerate with `pnpm run contract:generate`. Each entry in `schemas` is a ' +
       'self-contained JSON Schema for one exported Zod schema. The wire contract ' +
       'is frozen for the Rust port — changing it is out of scope.',
     wsProtocolVersion: WS_PROTOCOL_VERSION,
@@ -306,7 +306,7 @@ export function buildMessageInventory(): MessageInventory {
     title: 'freshell WebSocket message inventory — T0 conformance surface',
     description:
       'Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. ' +
-      'Regenerate with `npm run contract:generate`. `type` discriminants for ' +
+      'Regenerate with `pnpm run contract:generate`. `type` discriminants for ' +
       'every message in each direction, resolved from the ClientMessage and ' +
       'ServerMessage union types via the TypeScript type checker.',
     wsProtocolVersion: WS_PROTOCOL_VERSION,
@@ -556,7 +556,7 @@ export function buildServerMessageSchemas(): ServerMessageSchemaBundle {
     title: 'freshell server→client message shapes — frozen contract',
     description:
       'Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. ' +
-      'Regenerate with `npm run contract:generate`. Each entry is a JSON Schema for ' +
+      'Regenerate with `pnpm run contract:generate`. Each entry is a JSON Schema for ' +
       'one server→client message shape, keyed by its `type` discriminant and ' +
       'synthesized from the ServerMessage union via the TypeScript type checker. ' +
       'Opaque values (unknown / index signatures / any) are intentionally permissive ' +

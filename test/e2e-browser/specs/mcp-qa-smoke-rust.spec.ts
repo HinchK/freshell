@@ -64,7 +64,7 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
   test('the retained MCP stdio binary drives an ephemeral Rust server across every pane mode', async () => {
     const { path: mcpBinPath, buildMs } = ensureMcpServerBuilt(REPO_ROOT)
     // eslint-disable-next-line no-console
-    console.error(`[mcp-qa-smoke-rust] npm run build:tools completed in ${buildMs}ms (dist/tools/freshell-mcp/server.js)`)
+    console.error(`[mcp-qa-smoke-rust] pnpm run build:tools completed in ${buildMs}ms (dist/tools/freshell-mcp/server.js)`)
 
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-mcp-qa-smoke-'))
     const binDir = path.join(sharedRoot, 'bin')

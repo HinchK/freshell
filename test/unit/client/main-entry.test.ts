@@ -18,4 +18,25 @@ describe('Client entrypoint', () => {
     expect(src).toMatch(/initClientPerfLogging/)
     expect(src).toMatch(/initClientPerfLogging\(\)/)
   })
+
+  // Unified agent names (Task 7): the legacy-name capture is a
+  // side-effect-only synchronous module — it must run BEFORE
+  // `@/store/storage-migration` (which can rewrite the layout keys), the
+  // store imports (whose slice initial states load them), and App — or the
+  // raw legacy labels could be cleared before they are preserved.
+  it('imports the legacy-name capture before the storage migrations and store', () => {
+    const src = readSource('../../../src/main.tsx')
+    const captureIndex = src.indexOf("import '@/lib/session-name-migration'")
+    const migrationIndex = src.indexOf("import '@/store/storage-migration'")
+    const storeIndex = src.indexOf("import { store } from '@/store/store'")
+    expect(captureIndex).toBeGreaterThanOrEqual(0)
+    expect(migrationIndex).toBeGreaterThan(captureIndex)
+    expect(storeIndex).toBeGreaterThan(migrationIndex)
+  })
+
+  it('never lets the capture module reach the Redux store through its imports', () => {
+    const src = readSource('../../../src/lib/session-name-migration.ts')
+    expect(src).not.toMatch(/@\/store\/store/)
+    expect(src).not.toMatch(/from ['"]@\/store\/(tabsSlice|panesSlice|sessionNamesSlice)/)
+  })
 })

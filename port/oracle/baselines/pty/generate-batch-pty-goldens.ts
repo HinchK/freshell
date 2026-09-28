@@ -27,7 +27,7 @@ import { BATCH_PTY_SCENARIOS } from '../../fixtures/batch-pty-scenarios.js'
  * launches the owned Rust harness. The historical generator rationale is kept
  * in the committed fixture metadata.
  *
- * Usage:  npx tsx port/oracle/baselines/pty/generate-batch-pty-goldens.ts
+ * Usage:  pnpm exec tsx port/oracle/baselines/pty/generate-batch-pty-goldens.ts
  *
  * SAFETY: spawns its own server on an ephemeral loopback port and reaps it; never
  * touches the user's live :3001 instance.

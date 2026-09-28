@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { WsCaptureClient } from './ws-capture-client.js'
-import { normalizeTranscript } from './normalize.js'
+import { maskEnvelopeShape } from './normalize.js'
 import type { ExternalServerHandle } from './external-server.js'
 import type { PtyScenario } from '../fixtures/pty-scenarios.js'
 
@@ -115,9 +115,14 @@ export interface PtyCaptureResult {
   /** streamId from terminal.attach.ready (raw). */
   streamId: string
   /**
-   * The `terminal.created` + `terminal.attach.ready` envelopes with
-   * nondeterministic fields (ids/seqs) normalised — stable across boots, so the
-   * envelope shape can be compared even though the golden is compared by bytes.
+   * The `terminal.created` + `terminal.attach.ready` envelopes with every
+   * nondeterministic leaf masked to a stable per-field placeholder — the
+   * field-scoped SHAPE form (see `maskEnvelopeShape`): stable across boots
+   * AND across the contract-valid banner/attach startup race that decides
+   * whether the shell banner lands in the ring before the attach snapshots
+   * it (which raw seq values the ready carries, and which coincide). The
+   * presence/nesting of fields and every deterministic contract value still
+   * survive, so a genuine structural divergence remains visible.
    */
   normalizedEnvelope: { created: string; attachReady: string }
   /** `terminal.output.gap` occurrences (should be empty; non-empty = lost bytes). */
@@ -321,12 +326,6 @@ export function hexDiff(a: Buffer, b: Buffer, context = 16): string {
   ].join('\n')
 }
 
-/** Normalise a single captured message envelope to its stable serialized form. */
-function normalizeEnvelope(parsed: unknown): string {
-  const { normalized } = normalizeTranscript([{ dir: 'in', parsed }])
-  return normalized[0]?.serialized ?? '{}'
-}
-
 /**
  * Capture the golden byte stream for one scenario against a running server.
  *
@@ -435,8 +434,8 @@ export async function capturePtyScenario(
       terminalId,
       streamId,
       normalizedEnvelope: {
-        created: normalizeEnvelope(created.parsed),
-        attachReady: normalizeEnvelope(attachReady.parsed),
+        created: maskEnvelopeShape(created.parsed),
+        attachReady: maskEnvelopeShape(attachReady.parsed),
       },
       gaps,
       outputBatches: batches,

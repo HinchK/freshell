@@ -625,3 +625,49 @@ describe('RecoveryOfferPanel', () => {
     expect(sessionIds).not.toContain('O1')
   })
 })
+
+describe('RecoveryOfferPanel — unified agent names (Task 6)', () => {
+  it('accept threads the recovered plan nameSource onto the restored tab', async () => {
+    const inventory: RecoveryInventory = {
+      recoverable: true,
+      contentId: 'cid-owned',
+      device: {
+        deviceId: 'd',
+        deviceLabel: 'l',
+        capturedAt: 1,
+        tabs: [{
+          tabKey: 'k-owned',
+          tabName: 'owned work',
+          nameSource: { kind: 'session', paneId: 'p-owned' },
+          panes: [{
+            paneId: 'p-owned',
+            kind: 'terminal',
+            mode: 'claude',
+            shell: null,
+            cwd: '/w',
+            payload: {},
+            sessionRef: { provider: 'claude', sessionId: 'S-owned' },
+            ledgerState: 'bound',
+            live: false,
+          }],
+        }],
+      },
+      otherDevices: [],
+      ledgerOnly: [],
+    }
+    vi.mocked(getRecoveryInventory).mockResolvedValue(inventory)
+    const store = makeTestStore()
+    render(<Provider store={store}><RecoveryOfferPanel /></Provider>)
+    await userEvent.click(await screen.findByTestId('recovery-accept'))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+
+    const tab = store.getState().tabs.tabs.find((t) => t.title === 'owned work')
+    expect(tab).toBeTruthy()
+    // Cross-device recovery remints pane ids; the pointer must name the pane
+    // that actually exists in the restored layout (the remapped source), not
+    // the stale snapshot pane id.
+    const restoredPaneIds = collectAllLeaves(store.getState().panes.layouts[tab!.id]).map((l) => l.id)
+    expect(tab?.nameSource).toBeDefined()
+    expect(restoredPaneIds).toContain((tab?.nameSource as { paneId: string }).paneId)
+  })
+})

@@ -28,7 +28,7 @@
  * - HistoryView: Crashes when projects array is undefined (reduce/map fails)
  * - TabBar: Crashes when tabs array is undefined (map fails)
  *
- * Run with: npx vitest run test/unit/client/components/component-edge-cases.test.tsx
+ * Run with: pnpm run test:vitest run test/unit/client/components/component-edge-cases.test.tsx
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach, MockInstance } from 'vitest'

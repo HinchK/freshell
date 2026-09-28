@@ -481,14 +481,17 @@ describe('fresh-agent-ws', () => {
     expect(store.getState().freshAgent.sessions[key]).toBeUndefined()
   })
 
-  it('folds freshAgent.status(stuck) into the store and dispatches no turn-completion action', () => {
-    // Wedged-sidecar deadman fold: the status must land (and stop the
-    // busy-driving streaming flag) WITHOUT fabricating a completion edge —
-    // the deadman never fabricates a `freshAgent.turn.complete`, so no
-    // turnCompletion/* action may be dispatched, ever. The pane layout below
-    // is seeded so a (hypothetical, forbidden) completion thunk would resolve
-    // its target and dispatch turnCompletion/recordTurnComplete — the pin
-    // would catch it.
+  it('folds freshAgent.status(stuck) with no attention action; a companion turn.complete edge folds attention independently', () => {
+    // Wedged-sidecar deadman fold: the STATUS frame itself dispatches no
+    // attention — it must land (and stop the busy-driving streaming flag)
+    // with zero turnCompletion/* actions. The deadman's companion
+    // freshAgent.turn.complete edge is a SEPARATE frame: when it follows for
+    // the same session, it folds attention independently (the unified
+    // contract — the deadman rings deliberately). The pane layout below is
+    // seeded so the completion thunk resolves its target, making the
+    // companion's recordTurnComplete pin genuinely fire — and the status
+    // half of the test genuinely protective against a status fold that
+    // fabricated attention.
     const actionTypes: string[] = []
     const store = createFreshAgentPaneStore(actionTypes)
     const sessionId = 'thread-stuck-1'
@@ -535,6 +538,27 @@ describe('fresh-agent-ws', () => {
     expect(session.status).toBe('stuck')
     expect(session.streamingActive).toBe(false)
     expect(actionTypes.filter((type) => type.startsWith('turnCompletion/'))).toHaveLength(0)
+
+    // Companion edge: the deadman's discrete freshAgent.turn.complete for the
+    // same session dispatches recordTurnComplete — attention folds
+    // independently of the status frame (exactly one turnCompletion action,
+    // and it is the record, not anything the status fold minted).
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      event: { type: 'freshAgent.turn.complete', sessionId, at: 1_700_000_000_000 },
+    })).toBe(true)
+    expect(actionTypes.filter((type) => type === 'turnCompletion/recordTurnComplete')).toHaveLength(1)
+    expect(actionTypes.filter((type) => type.startsWith('turnCompletion/'))).toEqual([
+      'turnCompletion/recordTurnComplete',
+    ])
+    // The status fold itself stays untouched by the companion: still 'stuck',
+    // still not streaming.
+    const after = store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`]
+    expect(after.status).toBe('stuck')
+    expect(after.streamingActive).toBe(false)
   })
 
   it('keeps the session and surfaces an error when an event-wrapped killed reports success:false', () => {
