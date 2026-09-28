@@ -5269,6 +5269,9 @@ pub(crate) async fn handle_create(
                 session_ref,
                 session_name: state.registry.session_name_of(&managed_terminal_id),
                 name_ref: state.identity.name_ref_for(&managed_terminal_id),
+                owner_kind: None,
+                owner_epoch: None,
+                owner_generation: None,
             });
             let sent = out.send(&created).await;
             state.create_dedupe.settle(
@@ -9868,6 +9871,9 @@ async fn handle_kill(
                             terminal_id: kill.terminal_id,
                             success: false,
                             error: Some(copy),
+                            owner_kind: None,
+                            owner_generation: None,
+                            owner_epoch: None,
                         }),
                     )
                     .await;
