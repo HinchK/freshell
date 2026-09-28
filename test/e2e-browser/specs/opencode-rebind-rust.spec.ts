@@ -168,6 +168,7 @@ async function seedOpencodeSessionRow(homeDir: string, sessionId: string, direct
         directory TEXT NOT NULL,
         title TEXT NOT NULL,
         version TEXT NOT NULL,
+        model TEXT NOT NULL,
         time_created INTEGER NOT NULL,
         time_updated INTEGER NOT NULL,
         time_archived INTEGER
@@ -180,10 +181,10 @@ async function seedOpencodeSessionRow(homeDir: string, sessionId: string, direct
     )
     db.prepare(
       `INSERT OR REPLACE INTO session
-        (id, project_id, parent_id, slug, directory, title, version,
+        (id, project_id, parent_id, slug, directory, title, version, model,
          time_created, time_updated, time_archived)
-       VALUES (?, ?, NULL, ?, ?, ?, 'opencode-rebind-e2e-seed', ?, ?, NULL)`,
-    ).run(sessionId, `proj-${sessionId}`, sessionId, directory, sessionId, now, now)
+       VALUES (?, ?, NULL, ?, ?, ?, 'opencode-rebind-e2e-seed', ?, ?, ?, NULL)`,
+    ).run(sessionId, `proj-${sessionId}`, sessionId, directory, sessionId, 'fake-model', now, now)
   } finally {
     db.close()
   }
