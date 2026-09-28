@@ -5,6 +5,12 @@ import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
+import {
+  buildRunScriptArgs,
+  detectProjectManager,
+  resolveManagerCommand,
+} from './lib/package-manager.js'
+
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
 const PROJECT_ROOT = path.resolve(SCRIPT_DIR, '..')
 
@@ -18,11 +24,11 @@ export interface ElectronDevPrerequisitePaths {
 export interface ElectronDevPrerequisitePhase {
   command: string
   args: string[]
+  viaShell?: boolean
 }
 
 export type ElectronDevCommandRunner = (
-  command: string,
-  args: string[],
+  phase: ElectronDevPrerequisitePhase,
   cwd: string,
 ) => void
 
@@ -48,19 +54,38 @@ export type ElectronDevSpawn = (
 const defaultSpawn: ElectronDevSpawn = (command, args, options) =>
   spawnSync(command, args, options)
 
-export function npmCommand(platform: NodeJS.Platform = process.platform): string {
-  return platform === 'win32' ? 'npm.cmd' : 'npm'
+const ELECTRON_DEV_SCRIPTS = ['prebuild', 'build:client', 'build:tools', 'build:rust'] as const
+
+export interface BuildElectronDevPrerequisitePhaseOptions {
+  projectRoot?: string
+  platform?: NodeJS.Platform
+  env?: NodeJS.ProcessEnv
 }
 
 export function buildElectronDevPrerequisitePhases(
-  npm = npmCommand(),
+  managerCommand?: string,
+  options: BuildElectronDevPrerequisitePhaseOptions = {},
 ): ElectronDevPrerequisitePhase[] {
-  return [
-    { command: npm, args: ['run', 'prebuild'] },
-    { command: npm, args: ['run', 'build:client'] },
-    { command: npm, args: ['run', 'build:tools'] },
-    { command: npm, args: ['run', 'build:rust'] },
-  ]
+  if (managerCommand !== undefined) {
+    return ELECTRON_DEV_SCRIPTS.map((script) => ({ command: managerCommand, args: ['run', script] }))
+  }
+  const projectRoot = options.projectRoot ?? PROJECT_ROOT
+  const platform = options.platform ?? process.platform
+  const env = options.env ?? process.env
+  const manager = detectProjectManager(projectRoot).manager
+  return ELECTRON_DEV_SCRIPTS.map((script) => {
+    const resolved = resolveManagerCommand({
+      manager,
+      args: buildRunScriptArgs(manager, script, []),
+      env,
+      platform,
+    })
+    return {
+      command: resolved.command,
+      args: resolved.args,
+      ...(resolved.viaShell === true ? { viaShell: true } : {}),
+    }
+  })
 }
 
 export function resolveElectronDevPrerequisitePaths(
@@ -80,39 +105,38 @@ export function resolveElectronDevPrerequisitePaths(
 }
 
 export function runElectronDevCommand(
-  command: string,
-  args: string[],
+  phase: ElectronDevPrerequisitePhase,
   cwd: string,
-  platform: NodeJS.Platform = process.platform,
   spawn: ElectronDevSpawn = defaultSpawn,
 ): void {
   let result: ElectronDevSpawnResult
   try {
-    result = spawn(command, args, {
+    result = spawn(phase.command, phase.args, {
       cwd,
-      shell: platform === 'win32',
+      shell: phase.viaShell ?? false,
       stdio: 'inherit',
       windowsHide: true,
     })
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    throw new Error(`${command} ${args.join(' ')} failed to start: ${message}`)
+    throw new Error(`${phase.command} ${phase.args.join(' ')} failed to start: ${message}`)
   }
 
   if (result.error) {
-    throw new Error(`${command} ${args.join(' ')} failed to start: ${result.error.message}`)
+    throw new Error(`${phase.command} ${phase.args.join(' ')} failed to start: ${result.error.message}`)
   }
 
   if (result.status !== 0) {
     const reason = result.signal ? `signal ${result.signal}` : `exit ${result.status ?? 'unknown'}`
-    throw new Error(`${command} ${args.join(' ')} failed with ${reason}`)
+    throw new Error(`${phase.command} ${phase.args.join(' ')} failed with ${reason}`)
   }
 }
 
 export interface RunElectronDevPrerequisitesOptions {
   projectRoot?: string
   platform?: NodeJS.Platform
-  npm?: string
+  managerCommand?: string
+  env?: NodeJS.ProcessEnv
   runCommand?: ElectronDevCommandRunner
   spawn?: ElectronDevSpawn
   pathExists?: (filePath: string) => boolean
@@ -121,19 +145,24 @@ export interface RunElectronDevPrerequisitesOptions {
 export function runElectronDevPrerequisites({
   projectRoot = PROJECT_ROOT,
   platform = process.platform,
-  npm,
+  managerCommand,
+  env,
   runCommand: injectedCommandRunner,
   spawn: injectedSpawn = defaultSpawn,
   pathExists = existsSync,
 }: RunElectronDevPrerequisitesOptions = {}): ElectronDevPrerequisitePaths {
   const root = path.resolve(projectRoot)
   const paths = resolveElectronDevPrerequisitePaths(root, platform)
-  const phases = buildElectronDevPrerequisitePhases(npm ?? npmCommand(platform))
-  const commandRunner = injectedCommandRunner ?? ((command: string, args: string[], cwd: string) =>
-    runElectronDevCommand(command, args, cwd, platform, injectedSpawn))
+  const phases = buildElectronDevPrerequisitePhases(managerCommand, {
+    projectRoot: root,
+    platform,
+    env,
+  })
+  const commandRunner = injectedCommandRunner ?? ((phase: ElectronDevPrerequisitePhase, cwd: string) =>
+    runElectronDevCommand(phase, cwd, injectedSpawn))
 
   for (const phase of phases) {
-    commandRunner(phase.command, phase.args, root)
+    commandRunner(phase, root)
   }
 
   const requiredOutputs: Array<[string, string]> = [

@@ -15,12 +15,12 @@
 //! | `freshAgent.create {provider:'opencode',…}` | mint a `freshopencode-<requestId>` **placeholder** session (NO serve spawn, NO durable session yet — `adapter.ts:419-431`), broadcast `freshAgent.created` |
 //! | `freshAgent.send {sessionId,text,…}` | **materialize-or-send** (`adapter.ts:324-361`): create the durable `ses_*` session ONLY the first time (THE continuity fix — see below), broadcast `freshAgent.session.materialized` exactly once, then broadcast `freshAgent.send.accepted` and run the turn |
 //! | `freshAgent.kill` | remove the session (both its placeholder and durable keys), abort any in-flight turn task, broadcast `freshAgent.killed` — the SHARED `opencode serve` sidecar is NEVER touched (`adapter.ts kill()` has no `serveManager.shutdown()` call) |
-//! | `freshAgent.interrupt` | best-effort: abort the in-flight turn task + issue `serveManager.abort()` against the real session (`adapter.ts interrupt()` / `abortForState`) |
-//! | `freshAgent.compact` | AGENT-04 (approval-respond Task 4): `POST /session/:id/summarize` with EXACTLY `{providerID, modelID}` (the VALIDATED 1.18.18 contract), sized between a running snapshot and an idle snapshot + gated turn-complete chime |
+//! | `freshAgent.interrupt` | set the suppression flag + TAKE the in-flight turn task (a compact aborts+settles inside the take; a SEND drive is only taken), issue `serveManager.abort()` against the real session (`adapter.ts interrupt()` / `abortForState`): on a LANDED abort, abort+settle the taken send task before answering (silent); on a FAILED abort, clear the flag and preserve the taken send task's observation — restore it (only into the empty slot) so the still-running daemon turn's later natural end rings, or mint ONE recovery edge for a settle the flag suppressed during the RPC window (DR5-1) |
+//! | `freshAgent.compact` | AGENT-04 (approval-respond Task 4): `POST /session/:id/summarize` with EXACTLY `{providerID, modelID}` (the VALIDATED 1.18.18 contract), sized between a running snapshot and an idle snapshot + the turn-complete attention edge (gated only on a user-initiated interrupt) |
 //! | `freshAgent.fork` | AGENT-07 (approval-respond Task 5): `POST /session/:id/fork` (optional `messageID` when the client pins a `^msg` turn), then register the child (bridge + binding row) and answer `freshAgent.forked` ON THE REQUESTING CONNECTION — every failure path also answers on that sink, never silence |
 //!
 //! PR-3 bridges the serve SSE stream into `freshAgent.event` frames (status snapshots +
-//! the status-guarded `freshAgent.turn.complete` chime). PR-4 adds `freshAgent.attach`
+//! the `freshAgent.turn.complete` attention edge, gated only on a user-initiated interrupt). PR-4 adds `freshAgent.attach`
 //! (reload-rehydrate): a known session re-emits a status snapshot and restarts its
 //! serve-SSE bridge if it died; an unknown session emits the `INVALID_SESSION_ID` shape
 //! the client folds into `markSessionLost` instead of hanging.
@@ -66,8 +66,8 @@ use tokio::sync::Mutex as TokioMutex;
 
 use freshell_codex::next_monotonic_turn_complete_at;
 use freshell_opencode::{
-    normalize_opencode_effort, normalize_opencode_model, ChangedReason, OpencodeServeManager,
-    SdkProviderEvent, ServeError, SessionSignal, SnapshotStatus,
+    normalize_opencode_effort, normalize_opencode_model, ChangedReason, DaemonSignal,
+    OpencodeServeManager, SdkProviderEvent, ServeError, SessionSignal, SnapshotStatus,
 };
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentConfigure,
@@ -151,6 +151,13 @@ pub struct FreshOpencodeState {
     /// its only wait point is the per-session mutex, so a send issued mid-rollback
     /// blocks behind it, then proceeds and destroys redo (no circular wait).
     rollback_in_flight: crate::InFlightRegistry,
+    /// Unified agent names (Task 2): the injected naming authority — same
+    /// set-once/shared model as [`Self::identity_sink`]. Wired by
+    /// `freshell-server::main`; unwired = scoped naming fails unavailable.
+    /// The placeholder→handle stash lives on the shared
+    /// [`Self::fresh_agent`] so the REST spawn pipeline and this WS slice
+    /// resolve the SAME handle for `freshopencode-<createRequestId>`.
+    naming: crate::naming::NamingSink,
     /// b8ke focused round-2 review R2-1: the CONDEMNED-SESSION record —
     /// the canonical real `ses_*` id → the daemon-side quiescence identity
     /// (the accepted-turn flag + the session's route) every
@@ -160,6 +167,54 @@ pub struct FreshOpencodeState {
     /// replacement probe re-issues the daemon-side abort through exactly
     /// this record. Cleared by whichever path settles the acceptance.
     condemned_sessions: Arc<std::sync::Mutex<HashMap<String, CondemnedOpencodeSession>>>,
+    /// Task 4 (opencode daemon-death recovery): the daemon-loss watcher's
+    /// arming cell — set-once per state (Arc-shared across every clone), so
+    /// the FIRST `handle_send`/`handle_attach`/`handle_compact` arms exactly
+    /// ONE runtime-level listener on the manager's `DaemonSignal` stream for
+    /// the process lifetime. The watcher makes a shared-daemon death
+    /// observable (the typed `OPENCODE_DAEMON_LOST` edge per materialized
+    /// session) and recoverable (the level-triggered bridge revival on every
+    /// `Started`), mirroring the freshcodex onExit self-heal. See
+    /// [`Self::ensure_daemon_loss_watcher`].
+    daemon_loss_watcher: Arc<std::sync::OnceLock<()>>,
+    /// ep2-r3 test seam (`cfg(test)`-only): when armed for a durable id, the
+    /// post-commit rescue tail parks BETWEEN its map re-lookup clone and the
+    /// session-lock take — the exact window the ep2-r3 fresheyes Major pins
+    /// (a kill/handoff completing against the rescue's retained `Arc`).
+    /// Never compiled into production builds. See [`Self::arm_rescue_stall`].
+    #[cfg(test)]
+    rescue_stall: Arc<StdMutex<Option<RescueStallGate>>>,
+    /// ep2-r5 test seam (`cfg(test)`-only): when armed for a durable id, the
+    /// post-commit rescue tail parks BEFORE its map re-lookup — the window
+    /// where a same-key kill+replace can complete while the rescue is in
+    /// flight, so the re-lookup then observes whichever session (the
+    /// original or a replacement) the mover left under the key. Never
+    /// compiled into production builds. See
+    /// [`Self::arm_rescue_lookup_stall`].
+    #[cfg(test)]
+    rescue_lookup_stall: Arc<StdMutex<Option<RescueStallGate>>>,
+}
+
+/// The armed rescue-stall gate's state (ep2-r3 test seam, `cfg(test)`-only).
+#[cfg(test)]
+struct RescueStallGate {
+    /// The durable id this gate intercepts (the rescue is per-durable).
+    key: String,
+    /// Fires when the rescue has CLONED the session `Arc` out of the map and
+    /// is about to proceed — the exact parked point the finding's interleave
+    /// needs.
+    entered_tx: std::sync::mpsc::Sender<()>,
+    /// The test's release: the rescue parks until this oneshot resolves.
+    release_rx: StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+/// The handles [`FreshOpencodeState::arm_rescue_stall`] hands the test
+/// (ep2-r3 test seam, `cfg(test)`-only): `entered` fires at the parked point;
+/// `release` lets the rescue proceed.
+#[cfg(test)]
+pub(crate) struct RescueStallHandles {
+    pub(crate) entered: std::sync::mpsc::Receiver<()>,
+    pub(crate) release: tokio::sync::oneshot::Sender<()>,
 }
 
 /// The condemned opencode session's quiescence identity (b8ke focused
@@ -229,8 +284,35 @@ struct TurnTask {
     settling: Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// Focused ep4-r5 (opencode_ws.rs:1155): the pre-drive redo destroy must be
-/// restored when the compact drive dies without ever dispatching the
+/// What [`FreshOpencodeState::handle_interrupt`]'s take block captured —
+/// decides the RPC leg's handling (DR5-1, delta round 5).
+enum InterruptedOp {
+    /// No registered task (a not-yet-materialized session can never hold
+    /// one — the send path registers the turn task and the real id in one
+    /// locked section, and an idle session simply has none).
+    None,
+    /// A COMPACT drive: aborted + settled INSIDE the take block, exactly as
+    /// pre-DR5-1 (ep4-r6 F2 — the redo compensation must LAND before the
+    /// interrupt answers, and the D2-F1 send-refusal window must never
+    /// open: the compact drive is a LOCAL pipeline, not the daemon-turn
+    /// observer DR5-1 preserves).
+    CompactSettled,
+    /// A SEND turn drive: TAKEN but NOT aborted — the take block hands it
+    /// to the RPC leg, which decides its fate. Carries the session's
+    /// shared turn-complete clock, the clock's value snapshot taken BEFORE
+    /// the flag store (any later mint advances it — the "nothing rang in
+    /// the window" oracle), and whether the task was already finished at
+    /// take (a turn that ended before the interrupt must never ring twice —
+    /// the 12989 pin).
+    SendTaken {
+        task: TurnTask,
+        clock: Arc<StdMutex<Option<i64>>>,
+        clock_at_flag: Option<i64>,
+        finished_at_take: bool,
+    },
+}
+
+/// Focused ep4-r5 (opencode_ws.rs:1155): the pre-drive redo destroy must be/// restored when the compact drive dies without ever dispatching the
 /// summarize POST — INCLUDING the kill/interrupt-during-cold-start leg that
 /// drops the drive task before `manager.compact()` even returns (the match
 /// arm never runs for a dropped future). Owned by the drive task; `disarm()`
@@ -453,6 +535,21 @@ struct OpencodeSession {
     /// `freshAgent.session.snapshot` / `freshAgent.session.changed` / `freshAgent.error`
     /// for the lifetime of the session. `None` until materialized; aborted on kill.
     serve_bridge: Option<tokio::task::JoinHandle<()>>,
+    /// Delta round 2 (fresheyes Major — the doomed-bridge revival race): the
+    /// `ownership_id` of the daemon GENERATION the current `serve_bridge`
+    /// task was spawned against — the daemon-generation fence. Written ONLY
+    /// by [`FreshOpencodeState::install_serve_bridge`], together with the
+    /// handle, so `serve_bridge` is `Some` ⟹ this is `Some`. Read by
+    /// [`FreshOpencodeState::restart_session_bridge_guarded`]'s liveness
+    /// check: the manager's loss path fans `Lost` and re-warms
+    /// INDEPENDENTLY of the bridge tasks, so a bridge still draining its
+    /// closed channel when the new daemon's `Started` revival pass runs is
+    /// ALIVE-but-DOOMED — bound to a superseded generation it must be
+    /// restarted against, never mistaken for health by task liveness alone.
+    /// Not cleared on kill/handoff teardown: a torn-down session has no
+    /// handle, and a stale stamp with no handle is dead by the
+    /// absent-handle arm alone.
+    serve_bridge_daemon: Option<String>,
     /// Retire-on-kill (delta-review round 5): set by `handle_kill` inside its
     /// session-lock phase. A send that took this session's Arc just before the
     /// kill's map removal is Parking on this lock and would otherwise
@@ -533,6 +630,7 @@ impl OpencodeSession {
             turn_errored: Arc::new(AtomicBool::new(false)),
             last_turn_complete_at: Arc::new(StdMutex::new(None)),
             serve_bridge: None,
+            serve_bridge_daemon: None,
             killed: Arc::new(AtomicBool::new(false)),
             close_pending: 0,
             provenance: None,
@@ -664,7 +762,13 @@ impl FreshOpencodeState {
             terminal_liveness: Arc::new(|_, _| false),
             fork_in_flight: crate::InFlightRegistry::new(),
             rollback_in_flight: crate::InFlightRegistry::new(),
+            naming: crate::naming::NamingSink::default(),
             condemned_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            daemon_loss_watcher: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(test)]
+            rescue_stall: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            rescue_lookup_stall: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -721,6 +825,77 @@ impl FreshOpencodeState {
         self.fresh_agent.ownership_snapshot(provider, session_id)
     }
 
+    /// Arm the `cfg(test)`-only rescue stall (ep2-r3): the post-commit
+    /// rescue tail for `durable` fires `entered` once it has CLONED the
+    /// session `Arc` out of the sessions map, then parks until the test
+    /// sends on `release` — the deterministic interleaving point for "a
+    /// kill/handoff completes between the rescue's map lookup and its
+    /// session-lock take". One-shot per arming.
+    #[cfg(test)]
+    fn arm_rescue_stall(&self, durable: &str) -> RescueStallHandles {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.rescue_stall.lock().expect("rescue stall mutex") = Some(RescueStallGate {
+            key: durable.to_string(),
+            entered_tx,
+            release_rx: StdMutex::new(Some(release_rx)),
+        });
+        RescueStallHandles {
+            entered,
+            release: release_tx,
+        }
+    }
+
+    /// Take the armed rescue stall for `durable`, if it matches (one-shot;
+    /// `cfg(test)`-only, ep2-r3).
+    #[cfg(test)]
+    fn take_rescue_stall(&self, durable: &str) -> Option<RescueStallGate> {
+        let mut guard = self.rescue_stall.lock().expect("rescue stall mutex");
+        match guard.as_ref() {
+            Some(g) if g.key == durable => guard.take(),
+            _ => None,
+        }
+    }
+
+    /// Arm the `cfg(test)`-only PRE-LOOKUP rescue stall (ep2-r5): the
+    /// post-commit rescue tail for `durable` fires `entered` BEFORE its
+    /// map re-lookup, then parks until the test sends on `release` — the
+    /// deterministic interleaving point for "a kill and a same-key
+    /// replacement resume complete while the rescue is in flight" (the
+    /// re-lookup below then finds whichever session the mover left under
+    /// the key). One-shot per arming.
+    #[cfg(test)]
+    fn arm_rescue_lookup_stall(&self, durable: &str) -> RescueStallHandles {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self
+            .rescue_lookup_stall
+            .lock()
+            .expect("rescue lookup stall mutex") = Some(RescueStallGate {
+            key: durable.to_string(),
+            entered_tx,
+            release_rx: StdMutex::new(Some(release_rx)),
+        });
+        RescueStallHandles {
+            entered,
+            release: release_tx,
+        }
+    }
+
+    /// Take the armed pre-lookup rescue stall for `durable`, if it matches
+    /// (one-shot; `cfg(test)`-only, ep2-r5).
+    #[cfg(test)]
+    fn take_rescue_lookup_stall(&self, durable: &str) -> Option<RescueStallGate> {
+        let mut guard = self
+            .rescue_lookup_stall
+            .lock()
+            .expect("rescue lookup stall mutex");
+        match guard.as_ref() {
+            Some(g) if g.key == durable => guard.take(),
+            _ => None,
+        }
+    }
+
     /// kata b8ke Task 3: begin this lane's coordinator claim. See
     /// [`crate::ownership_lane::begin_lane_claim`].
     fn begin_lane_claim_at(
@@ -769,6 +944,28 @@ impl FreshOpencodeState {
         )
     }
 
+    /// The post-commit rescue's committed fence (fresheyes ep2-r5): the
+    /// `(epoch, generation)` pair the lane's own claim committed `Live`
+    /// under — the registry's boot epoch and the ticket's generation
+    /// (the exact generation `commit_live` lands at, so a still-own
+    /// coordinator observation reports the SAME pair back). `None` when
+    /// the coordinator is unwired or the caller holds no ticket (the
+    /// under-ticket handoff continuation — the runner's single `Live`
+    /// commit is still ahead — or the unwired lane, where no
+    /// coordinator observation exists to fence against).
+    fn committed_lane_fence(
+        ownership: &Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
+        ticket: Option<&freshell_ownership::OperationTicket>,
+    ) -> Option<freshell_ownership::ObservedFence> {
+        match (ownership.as_ref(), ticket) {
+            (Some(registry), Some(ticket)) => Some(freshell_ownership::ObservedFence {
+                epoch: registry.boot_epoch(),
+                generation: ticket.generation(),
+            }),
+            _ => None,
+        }
+    }
+
     /// The initiator label for a coordinator transition event: the
     /// connection's device id when the provenance carries one, else the lane
     /// label (diagnostic, not audit-grade).
@@ -786,6 +983,131 @@ impl FreshOpencodeState {
     /// The wired identity sink, if any.
     pub(crate) fn identity_sink(&self) -> Option<SharedPaneIdentitySink> {
         self.identity_sink.get().cloned()
+    }
+
+    /// Unified agent names (Task 2): wire the naming authority (set-once;
+    /// later calls are no-ops). `freshell-server::main` injects the ONE
+    /// local store participant.
+    pub fn set_session_naming(
+        &self,
+        sink: std::sync::Arc<dyn crate::naming::SessionNaming>,
+    ) -> bool {
+        self.naming.set(sink)
+    }
+
+    /// Unified agent names: the wired naming authority, if any.
+    pub(crate) fn naming(&self) -> Option<std::sync::Arc<dyn crate::naming::SessionNaming>> {
+        self.naming.get()
+    }
+
+    /// Unified agent names (Task 2): the materialization lane's pending bind.
+    /// An opencode session's SQLite row exists from the moment `opencode serve`
+    /// creates it (zero-message persistence), so materialization IS verified
+    /// durability: the stashed pre-durable handle transfers onto the durable
+    /// `ses_*` id BEFORE the materialized frame publishes the identity.
+    /// Idempotent (the store answers an already-bound handle with a Read) and
+    /// never a lane blocker (a failure retains the handle for the tick's
+    /// retry). Answers the accepted projection for the frame.
+    async fn bind_naming_handle_at_materialization(
+        &self,
+        placeholder: &str,
+        real_id: &str,
+        cwd: Option<&str>,
+    ) -> Option<(
+        freshell_protocol::session_names::SessionNameRef,
+        freshell_protocol::session_names::SessionNameRecord,
+    )> {
+        let handle = self.fresh_agent.peek_naming_handle(placeholder)?;
+        let sink = self.naming()?;
+        let pending =
+            freshell_protocol::session_names::SessionNameRef::Pending { id: handle.clone() };
+        let target = freshell_protocol::session_names::SessionNameRef::Session {
+            provider: freshell_protocol::session_names::NamedProvider::Opencode,
+            session_id: real_id.to_string(),
+        };
+        let acquisition = freshell_protocol::native_location::NativeAcquisition {
+            location: freshell_protocol::native_location::NativeLocation::Opencode {
+                database_path: freshell_sessions::parse::default_opencode_data_home()
+                    .join("opencode.db")
+                    .display()
+                    .to_string(),
+                native_session_id: Some(real_id.to_string()),
+                original_directory: cwd.map(str::to_string),
+                owned_local_endpoint: None,
+            },
+            evidence: freshell_protocol::native_location::NativeEvidenceKind::PersistedMetadata,
+            persistence: freshell_protocol::native_location::NativePersistence::Verified,
+        };
+        let update = match sink
+            .bind_pending(crate::naming::BindNameInput {
+                pending: pending.clone(),
+                target: target.clone(),
+                acquisition,
+            })
+            .await
+        {
+            Ok(update) => update,
+            Err(error) => {
+                // T1-N3 enrichment: a bind conflict's relevant "current" is
+                // the record the handle is ACTUALLY bound to — resolve it
+                // through the store's redirect and log that record.
+                if let crate::naming::NameError::Conflict { .. } = &error {
+                    if let Ok(updates) = sink.get(vec![pending.clone()]).await {
+                        for update in updates {
+                            if let Some(redirect) = update.redirects.first() {
+                                tracing::warn!(
+                                    target: "freshell_server::session_names",
+                                    op = "bind_pending",
+                                    name_ref = %crate::naming::name_ref_debug_key(&pending),
+                                    bound_to = %crate::naming::name_ref_debug_key(&redirect.to),
+                                    revision = update.record.revision,
+                                    class = %error.code(),
+                                    "session_names.bind_conflict: {}",
+                                    error
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    crate::naming::log_name_error("bind_pending", &pending, &error);
+                }
+                return None;
+            }
+        };
+        if update.record.name_ref == target {
+            self.fresh_agent.take_naming_handle(placeholder);
+        }
+        Some((update.record.name_ref.clone(), update.record))
+    }
+
+    /// Unified agent names (Task 2): the current frame projection for an
+    /// already-created session — the stashed handle's record (the dedup
+    /// replay arm), else the durable record when one exists.
+    async fn created_projection_for(
+        &self,
+        session_id: &str,
+    ) -> Option<(
+        freshell_protocol::session_names::SessionNameRef,
+        freshell_protocol::session_names::SessionNameRecord,
+    )> {
+        let sink = self.naming();
+        let stashed = self.fresh_agent.peek_naming_handle(session_id);
+        if let Some(handle) = stashed {
+            let pending = freshell_protocol::session_names::SessionNameRef::Pending { id: handle };
+            if let Some(sink) = &sink {
+                if let Ok(updates) = sink.get(vec![pending.clone()]).await {
+                    if let Some(update) = updates.into_iter().next() {
+                        return Some((update.record.name_ref.clone(), update.record));
+                    }
+                }
+            }
+        }
+        crate::naming::session_projection(
+            &sink,
+            freshell_protocol::session_names::NamedProvider::Opencode,
+            session_id,
+        )
+        .await
     }
 
     /// Broadcast a `freshAgent.error` alarm/degradation frame (Task 8 consumes this
@@ -1001,6 +1323,11 @@ impl FreshOpencodeState {
         // (`real_session_id`) that had already happened since the first create.
         let _dedup_guard = match self.create_dedup.acquire_or_replay(&request_id).await {
             FreshAgentCreateOutcome::Replay(cached) => {
+                // Unified agent names: the replay re-answers with the SAME
+                // naming projection the original create acknowledged.
+                let projection = self.created_projection_for(&cached.placeholder_id).await;
+                let name_ref = projection.as_ref().map(|(r, _)| r.clone());
+                let session_name = projection.map(|(_, record)| record);
                 self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
                     provider: PROVIDER.to_string(),
                     request_id,
@@ -1011,6 +1338,8 @@ impl FreshOpencodeState {
                         provider: PROVIDER.to_string(),
                         session_id: cached.placeholder_id,
                     }),
+                    name_ref,
+                    session_name,
                 }));
                 return;
             }
@@ -1079,6 +1408,34 @@ impl FreshOpencodeState {
             }
         }
 
+        // Unified agent names (Task 2): admit the pre-durable handle BEFORE
+        // acknowledging creation (idempotent — creation/recovery retries
+        // re-ensure the same handle). A create without a handle proceeds
+        // unnamed.
+        let naming_projection = match msg.naming_handle.as_deref() {
+            Some(handle) if !handle.trim().is_empty() => {
+                let handle = handle.trim().to_string();
+                let sink = self.naming();
+                match crate::naming::admit_pending_projection(
+                    &sink,
+                    &handle,
+                    freshell_protocol::session_names::NamedProvider::Opencode,
+                    msg.cwd.as_deref(),
+                )
+                .await
+                {
+                    Some(projection) => {
+                        self.fresh_agent.stash_naming_handle(&placeholder, &handle);
+                        Some(projection)
+                    }
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+        let name_ref = naming_projection.as_ref().map(|(r, _)| r.clone());
+        let session_name = naming_projection.map(|(_, record)| record);
+
         self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
             provider: PROVIDER.to_string(),
             request_id,
@@ -1089,6 +1446,8 @@ impl FreshOpencodeState {
                 provider: PROVIDER.to_string(),
                 session_id: placeholder,
             }),
+            name_ref,
+            session_name,
         }));
     }
 
@@ -1434,6 +1793,8 @@ impl FreshOpencodeState {
                 create_request_id: None,
                 resolves_pending: None,
                 supersedes: None,
+                // Unified agent names: no naming fact on this ledger edge.
+                name_transition: None,
                 provenance: match pre_park_provenance.clone() {
                     Some(parked) => crate::identity_sink::ProvenanceUpdate::Replace(parked),
                     None => crate::identity_sink::ProvenanceUpdate::Inherit,
@@ -1457,6 +1818,8 @@ impl FreshOpencodeState {
                     create_request_id: None,
                     resolves_pending: None,
                     supersedes: None,
+                    // Unified agent names: no naming fact on this ledger edge.
+                    name_transition: None,
                     provenance: crate::identity_sink::ProvenanceUpdate::Replace(p),
                     // b8ke ext r27 F1: the refresh write carries the SAME
                     // observed pair (it can land after a turnover's
@@ -1536,6 +1899,12 @@ impl FreshOpencodeState {
             )
             .await;
 
+        // Unified agent names: a resumed pane names through the durable
+        // session's own record (never a fresh pending handle — resume of an
+        // established identity never aliases durable keys).
+        let projection = self.created_projection_for(&durable_id).await;
+        let name_ref = projection.as_ref().map(|(r, _)| r.clone());
+        let session_name = projection.map(|(_, record)| record);
         self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
             provider: PROVIDER.to_string(),
             request_id,
@@ -1546,6 +1915,8 @@ impl FreshOpencodeState {
                 provider: PROVIDER.to_string(),
                 session_id: durable_id,
             }),
+            name_ref,
+            session_name,
         }));
     }
 
@@ -1567,6 +1938,10 @@ impl FreshOpencodeState {
     pub async fn handle_send(&self, msg: FreshAgentSend) {
         let request_id = msg.request_id.clone();
         let session_id = msg.session_id.clone();
+
+        // Task 4: arm the runtime's daemon-loss watcher (idempotent — the
+        // first opencode WS traffic arms the one process-level listener).
+        self.ensure_daemon_loss_watcher().await;
 
         let session_arc = {
             let guard = self.sessions.lock().await;
@@ -2005,6 +2380,30 @@ impl FreshOpencodeState {
                         .map(str::to_string),
                     resolves_pending: Some(session.placeholder_id.clone()),
                     supersedes: None,
+                    // Unified agent names (Task 4, T2-M5 wired): the
+                    // materialization's DECLARED classification — the same
+                    // InitialMaterialization the dedicated bind lane below
+                    // folds through the shared classification-driven fold
+                    // (opencode persistence is verified at materialization).
+                    name_transition: Some(crate::naming::NameTransition::binding(
+                        crate::naming::NameTransitionReason::InitialMaterialization,
+                        freshell_protocol::native_location::NativeAcquisition {
+                            location: freshell_protocol::native_location::NativeLocation::Opencode {
+                                database_path: freshell_sessions::parse::default_opencode_data_home()
+                                    .join("opencode.db")
+                                    .display()
+                                    .to_string(),
+                                native_session_id: Some(durable_id.clone()),
+                                original_directory: session.cwd.clone(),
+                                owned_local_endpoint: None,
+                            },
+                            evidence:
+                                freshell_protocol::native_location::NativeEvidenceKind::PersistedMetadata,
+                            persistence:
+                                freshell_protocol::native_location::NativePersistence::Verified,
+                        },
+                        session.placeholder_id.clone(),
+                    )),
                     provenance: session.provenance.clone().into(),
                     observed_epoch: None,
                     observed_generation: None,
@@ -2041,18 +2440,35 @@ impl FreshOpencodeState {
                 return;
             }
 
+            // Unified agent names (Task 2): commit the pending→durable name
+            // transfer BEFORE the materialized frame publishes the identity
+            // (opencode persistence is verified at materialization — the
+            // SQLite row exists). A missing/unwired handle leaves the frame
+            // projection-less (a neutral fallback), never blocks the send.
+            let naming_projection = self
+                .bind_naming_handle_at_materialization(
+                    &session.placeholder_id,
+                    &durable_id,
+                    session.cwd.as_deref(),
+                )
+                .await;
+            let name_ref = naming_projection.as_ref().map(|(r, _)| r.clone());
+            let session_name = naming_projection.map(|(_, record)| record);
+
             // `freshAgent.session.materialized` (ws-handler.ts:3477-3484): placeholder ->
             // durable, emitted EXACTLY ONCE (a later send never re-enters this branch).
-            self.broadcast(&materialized_frame(&session.placeholder_id, &durable_id));
+            self.broadcast(&materialized_frame(
+                &session.placeholder_id,
+                &durable_id,
+                name_ref,
+                session_name,
+            ));
 
             // PR-3: `bindServeStream(state)` (adapter.ts:349) -- start the persistent
             // serve-SSE bridge ONCE, right after materialization. A later send never
             // re-enters this branch (mirrors `if (state.unsubscribeServe ...) return`).
-            session.serve_bridge = Some(self.spawn_serve_bridge(
-                manager.clone(),
-                durable_id.clone(),
-                session.turn_errored.clone(),
-            ));
+            self.install_serve_bridge(&manager, &mut *session, &durable_id)
+                .await;
 
             // kata b8ke Task 3: the materialization's registration is
             // complete — commit `Live{FreshAgent}` for the minted `ses_*`
@@ -2115,6 +2531,8 @@ impl FreshOpencodeState {
                     create_request_id: None,
                     resolves_pending: None,
                     supersedes: None,
+                    // Unified agent names: no naming fact on this ledger edge.
+                    name_transition: None,
                     provenance: session.provenance.clone().into(),
                     observed_epoch: None,
                     observed_generation: None,
@@ -2147,6 +2565,36 @@ impl FreshOpencodeState {
         let real_id = acked_session_id.clone();
         let route = session.cwd.clone();
         let text = msg.text.clone();
+
+        // Unified agent names (Task 4): the shared accepted-input callback —
+        // the turn was accepted for submission, so the user input is
+        // ACCEPTED. The naming target is the stashed pre-durable handle
+        // (freshopencode-<createRequestId>, still pending until the
+        // materialization bind consumes it), else the durable `ses_*` id. A
+        // failed feed never blocks the turn.
+        let naming_target = self
+            .fresh_agent
+            .peek_naming_handle(&session.placeholder_id)
+            .map(|handle| freshell_protocol::session_names::SessionNameRef::Pending { id: handle })
+            .or_else(|| {
+                session.real_session_id.clone().map(|ses_id| {
+                    freshell_protocol::session_names::SessionNameRef::Session {
+                        provider: freshell_protocol::session_names::NamedProvider::Opencode,
+                        session_id: ses_id,
+                    }
+                })
+            });
+        if let Some(target) = naming_target {
+            crate::naming::report_accepted_input(
+                &self.naming(),
+                &target,
+                SESSION_TYPE,
+                request_id.as_deref().unwrap_or(""),
+                &msg.text,
+                route.as_deref(),
+            )
+            .await;
+        }
 
         // `freshAgent.send.accepted` (ws-handler.ts:3487-3495) — broadcast immediately,
         // mirroring the codex slice's ack timing. The turn itself runs in a detached
@@ -2516,6 +2964,8 @@ impl FreshOpencodeState {
                     create_request_id: None,
                     resolves_pending: None,
                     supersedes: None,
+                    // Unified agent names: no naming fact on this ledger edge.
+                    name_transition: None,
                     provenance: provenance.into(),
                     observed_epoch: None,
                     observed_generation: None,
@@ -2940,7 +3390,7 @@ impl FreshOpencodeState {
         cwd: Option<&str>,
         operation_id: &str,
         generation: u64,
-    ) -> Result<freshell_ownership::OwnerIdentity, (String, String)> {
+    ) -> Result<(freshell_ownership::OwnerIdentity, OpencodeSessionHandle), (String, String)> {
         match self
             .resume_durable_session(
                 session_id,
@@ -2951,15 +3401,22 @@ impl FreshOpencodeState {
             )
             .await
         {
-            Ok(_session) => Ok(freshell_ownership::OwnerIdentity {
-                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
-                terminal_id: None,
-                live_session_key: Some(session_id.to_string()),
-                // OpenCode invariant: the shared serve daemon is not the
-                // per-session writer — never a kill target, never the pid.
-                pid: None,
-                ownership_id: None,
-            }),
+            // ep2-r5: the under-ticket resume hands its committed session
+            // INSTANCE out with the identity — the runner's post-commit
+            // rescue re-check verifies this exact `Arc` against the map
+            // (a same-key replacement can never satisfy it).
+            Ok(session_arc) => Ok((
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some(session_id.to_string()),
+                    // OpenCode invariant: the shared serve daemon is not the
+                    // per-session writer — never a kill target, never the pid.
+                    pid: None,
+                    ownership_id: None,
+                },
+                OpencodeSessionHandle::new(session_arc),
+            )),
             Err(ResumeOpencodeError::NotFound) => Err((
                 "opencode session not known to the shared serve".to_string(),
                 session_id.to_string(),
@@ -3937,13 +4394,43 @@ impl FreshOpencodeState {
 
     // ── freshAgent.interrupt (WS) ────────────────────────────────────────
 
-    /// Handle a `freshAgent.interrupt` for opencode: mark the turn aborted (BEFORE
-    /// aborting, so a racing in-flight completion sees the flag — adapter.ts:521), abort
-    /// the in-flight turn task, and issue a best-effort `serveManager.abort()` against
-    /// the real session (`adapter.ts interrupt()` / `abortForState`). Always broadcasts
-    /// the resulting idle status (`emitStatus(state,'idle')`, adapter.ts:530) — even for
-    /// a not-yet-materialized session (`abortForState` no-ops when there's no
-    /// `realSessionId`, but the reference still emits idle unconditionally).
+    /// Handle a `freshAgent.interrupt` for opencode (DR5-1, delta round 5):
+    /// set the suppression flag, TAKE the registered turn task, then issue
+    /// the best-effort `serveManager.abort()` against the real session
+    /// (`adapter.ts interrupt()` / `abortForState`) — and let the RPC's
+    /// outcome decide the taken task:
+    ///
+    /// - Ok (the abort LANDED — the user's interrupt genuinely ended the
+    ///   daemon-side turn): abort + settle the taken SEND task NOW, so the
+    ///   ep4-r6 F2 invariant holds (the interrupt's answer still never
+    ///   precedes the settle) and the DR2-1 silence contract stands — no
+    ///   edge for the user's own stop. Broadcasts the idle snapshot.
+    ///
+    /// - Err (the abort FAILED — the daemon-side turn is STILL RUNNING): its
+    ///   LATER REAL natural end is a turn end the user did not witness (the
+    ///   user believes the interrupt stopped it) and MUST ring. The take
+    ///   block no longer aborts the only observer of that end: the Err arm
+    ///   clears the flag (so any settle from there on rings naturally) and
+    ///   either RESTORES the still-running task into the session's slot
+    ///   (restore-only-if-empty — a concurrent send may have installed its
+    ///   own task during the RPC await; never clobber it, and in that corner
+    ///   the old turn's abort-handle is lost even though its end still
+    ///   rings through its own settle tail, because the concurrent send's
+    ///   dispatch cleared the flag) or, for a task that settled INSIDE the
+    ///   RPC window with the flag suppressing it, mints EXACTLY ONE
+    ///   recovery edge — a REAL completion the finished drive observed, NOT
+    ///   the DR2-1-banned fabricated detachment edge (that ban removed a
+    ///   mint for a turn whose observer the take had DESTROYED; this mint
+    ///   rings only for an observer that provably FINISHED, and only when
+    ///   the clock proves nothing else rang in the window). A task already
+    ///   finished AT TAKE ended before the interrupt's flag could suppress
+    ///   it (its settle rang then, or was lost in the flag-store→take
+    ///   nano-window — the 12989 no-second-edge pin forbids minting for it).
+    ///
+    /// DELTA-R2 DR2-1 (unchanged): the interrupt EVENT is SILENT on both
+    /// arms — "a user-initiated interrupt is silent" has NO success
+    /// qualifier; the user initiated (and witnessed) this stop, so an edge
+    /// at interrupt time would be a false alarm for the user's own action.
     pub async fn handle_interrupt(&self, msg: FreshAgentInterrupt) {
         let session_arc = {
             let guard = self.sessions.lock().await;
@@ -3954,8 +4441,16 @@ impl FreshOpencodeState {
             return;
         };
 
-        let (real_id, route, turn_aborted, orphaned_daemon_turn, abort_in_flight) = {
+        let (real_id, route, turn_aborted, orphaned_daemon_turn, abort_in_flight, taken) = {
             let mut session = session_arc.lock().await;
+            // DR5-1: snapshot the turn-complete clock BEFORE the flag store.
+            // A settle tail that already passed its flag check rings and
+            // stamps the clock at any instant; snapshotting first makes the
+            // Err arm's "clock unchanged since the take" comparison a sound
+            // "nothing rang during the window" oracle (the 12989/13122
+            // no-double-bell pins).
+            let clock = session.last_turn_complete_at.clone();
+            let clock_at_flag = *clock.lock().expect("last_turn_complete_at mutex");
             session.turn_aborted.store(true, Ordering::SeqCst);
             // send-during-compact queue (delta-review round 3): arm the
             // orphan marker at the TEARDOWN START — the moment the local
@@ -3972,23 +4467,42 @@ impl FreshOpencodeState {
             // locked block as the latch so no idle observation can slip
             // between the two.
             session.abort_in_flight.fetch_add(1, Ordering::SeqCst);
-            if let Some(task) = session.turn_task.take() {
-                // ep4-r6 F2: join + await the compact's pre-drive-redo settle
-                // — the interrupt's answer must never precede the restore.
-                task.abort_and_settle().await;
-            }
+            let taken = match session.turn_task.take() {
+                None => InterruptedOp::None,
+                Some(task) if task.kind == TurnTaskKind::Compact => {
+                    // ep4-r6 F2: join + await the compact's pre-drive-redo
+                    // settle — the interrupt's answer must never precede the
+                    // restore, and a send arriving in any window this hold
+                    // would open must stay refused (D2-F1). The compact is a
+                    // LOCAL pipeline; aborting it here does not touch the
+                    // daemon-turn observation DR5-1 preserves.
+                    task.abort_and_settle().await;
+                    InterruptedOp::CompactSettled
+                }
+                Some(task) => {
+                    let finished_at_take = task.is_finished();
+                    InterruptedOp::SendTaken {
+                        task,
+                        clock,
+                        clock_at_flag,
+                        finished_at_take,
+                    }
+                }
+            };
             (
                 session.real_session_id.clone(),
                 session.cwd.clone(),
                 session.turn_aborted.clone(),
                 session.orphaned_daemon_turn.clone(),
                 session.abort_in_flight.clone(),
+                taken,
             )
         };
 
         let Some(real_id) = real_id else {
-            // Not yet materialized: `abortForState` is a no-op, but `emitStatus('idle')`
-            // still fires (adapter.ts:530), stamped with whatever id the client sent.
+            // Not yet materialized: `abortForState` is a no-op, but
+            // `emitStatus('idle')` still fires (adapter.ts:530), stamped
+            // with whatever id the client sent.
             // Delta-review round 4: the teardown-start latch arming is
             // undone here — an unmaterialized session has NO daemon-side
             // turn, so nothing can be orphaned; leaving the latch armed
@@ -3999,6 +4513,24 @@ impl FreshOpencodeState {
             // leak armed (a leaked counter would defer every later idle
             // release forever).
             abort_in_flight.fetch_sub(1, Ordering::SeqCst);
+            // DR5-1: the registration atomicity above means `taken` can
+            // only be `None`/`CompactSettled` here; if a future writer ever
+            // hands the interrupt a live SEND task with no real id,
+            // preserve its observation exactly like the Err arm (clear the
+            // flag + restore-if-empty) instead of strangling it.
+            if let InterruptedOp::SendTaken {
+                task,
+                clock: _,
+                clock_at_flag: _,
+                ..
+            } = taken
+            {
+                turn_aborted.store(false, Ordering::SeqCst);
+                let mut session = session_arc.lock().await;
+                if session.turn_task.is_none() && !session.killed.load(Ordering::SeqCst) {
+                    session.turn_task = Some(task);
+                }
+            }
             self.broadcast(&event_frame(
                 &msg.session_id,
                 snapshot_event(&msg.session_id, "idle"),
@@ -4056,6 +4588,15 @@ impl FreshOpencodeState {
                 let _ = session.daemon_idle_seen.swap(false, Ordering::SeqCst);
                 let _ = session.daemon_proof_answered.swap(false, Ordering::SeqCst);
                 drop(session);
+                // DR5-1: the abort LANDED — the user's interrupt genuinely
+                // ended the turn. Abort + settle the taken SEND task NOW:
+                // ep4-r6 F2 preserved (the handler still answers only after
+                // the settle lands) and DR2-1 silence holds (no edge for the
+                // user's own stop; the aborted drive's settle tail never
+                // runs). COMPACT drives settled inside the take block.
+                if let InterruptedOp::SendTaken { task, .. } = taken {
+                    task.abort_and_settle().await;
+                }
                 // send-during-compact queue: an interrupted compact never
                 // runs its own settle tail (the TurnTask doc — an aborted
                 // drive drops mid-await and never reaches its tail), so
@@ -4066,6 +4607,89 @@ impl FreshOpencodeState {
                 Self::drain_detached(self, &real_id);
             }
             Err(serve_err) => {
+                // DR5-1: the abort FAILED — the daemon-side turn is STILL
+                // RUNNING, and its later real natural end is an unwitnessed
+                // turn end that MUST ring. Clear the flag FIRST so any
+                // settle from this moment on rings naturally, then preserve
+                // the taken task's observation.
+                turn_aborted.store(false, Ordering::SeqCst);
+                if let InterruptedOp::SendTaken {
+                    task,
+                    clock,
+                    clock_at_flag,
+                    finished_at_take,
+                } = taken
+                {
+                    if !finished_at_take {
+                        if task.is_finished() {
+                            // The task settled DURING the RPC await. If
+                            // nothing rang in the window (the clock is
+                            // unchanged since the flag store), its own tail
+                            // was suppressed by the flag — mint ONE recovery
+                            // edge for the REAL completion this finished
+                            // drive observed. This is NOT the DR2-1-banned
+                            // fabricated detachment edge: that mint rang at
+                            // interrupt time for a turn whose observer the
+                            // take had destroyed; THIS rings at the Err arm,
+                            // for an observer that provably finished, and
+                            // only when the clock proves no natural ring
+                            // happened in the window (the 13122 pin).
+                            let clock_now = *clock.lock().expect("last_turn_complete_at mutex");
+                            if clock_now == clock_at_flag {
+                                let session_gone = {
+                                    let session = session_arc.lock().await;
+                                    session.killed.load(Ordering::SeqCst)
+                                };
+                                if !session_gone {
+                                    mint_turn_complete_edge(&self.fresh_agent, &real_id, &clock);
+                                    tracing::debug!(
+                                        provider = PROVIDER,
+                                        session_id = %real_id,
+                                        "opencode.interrupt_abort_failed_suppressed_settle_recovered"
+                                    );
+                                }
+                            }
+                        } else {
+                            // The daemon turn is still running and its
+                            // observer is still live: RESTORE it so the
+                            // later natural settle rings (the flag is clear)
+                            // and a later interrupt/kill can still abort it.
+                            // Restore ONLY into the empty slot: a concurrent
+                            // send may have installed its own task during
+                            // the RPC await — clobbering it would disconnect
+                            // kill/interrupt from the NEW turn. In that
+                            // corner the old turn's abort-handle is lost
+                            // (accepted bounded corner), though its end
+                            // still rings through its own settle tail (the
+                            // concurrent send's dispatch cleared the flag).
+                            let mut session = session_arc.lock().await;
+                            if session.killed.load(Ordering::SeqCst) {
+                                // The pane is going away (handle_kill won a
+                                // race inside the window): never resurrect a
+                                // handle into a condemned record; the kill
+                                // owns the teardown silence.
+                            } else if session.turn_task.is_none() {
+                                session.turn_task = Some(task);
+                                tracing::debug!(
+                                    provider = PROVIDER,
+                                    session_id = %real_id,
+                                    "opencode.interrupt_abort_failed_turn_task_restored"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    provider = PROVIDER,
+                                    session_id = %real_id,
+                                    "opencode.interrupt_abort_failed_restore_slot_occupied"
+                                );
+                            }
+                        }
+                    }
+                }
+                tracing::debug!(
+                    provider = PROVIDER,
+                    session_id = %real_id,
+                    "opencode.interrupt_abort_failed_silent"
+                );
                 // Same locked-critical-section discipline (episode 2
                 // round 3, Major 2): the deferral/release decision is
                 // atomic against idle observations.
@@ -4266,9 +4890,9 @@ impl FreshOpencodeState {
     /// the model pair (the serve crate stores no session metadata, so resolution lives
     /// here: the session's model split via `split_opencode_model`, else `GET /config`'s
     /// `model`, else a LOUD error), POST, await idle, and settle with the SAME
-    /// idle-snapshot + gated `freshAgent.turn.complete` chime as a send turn. A serve
-    /// error still returns the pane to idle and surfaces the error loudly — never a
-    /// false completion.
+    /// idle-snapshot + unified `freshAgent.turn.complete` edge as a send turn. A
+    /// serve error still returns the pane to idle, rings the same unified edge
+    /// (the turn still ended), and surfaces the error loudly.
     ///
     /// TURN-SCOPED LIFECYCLE (delta-review round 1, D1-F1): the composer stays
     /// interactive while a session is busy (queued sends) and the `/compact` slash
@@ -4328,6 +4952,10 @@ impl FreshOpencodeState {
                     return;
                 }
             };
+        // Task 4: arm the runtime's daemon-loss watcher (idempotent — the
+        // fence parse above stays the FIRST interaction, so a typed refusal
+        // still mutates nothing).
+        self.ensure_daemon_loss_watcher().await;
         let session_arc = {
             let guard = self.sessions.lock().await;
             guard.get(&session_id).cloned()
@@ -4650,10 +5278,11 @@ impl FreshOpencodeState {
                 }
             };
 
-            // adapter.ts:386-393 — the same settle tail as a send turn (idle snapshot
-            // unconditionally + the gated chime); a serve error additionally surfaces
-            // loudly (the SAME nested envelope `emit_fresh_agent_error` builds) and
-            // never produces a false turn-complete.
+            // adapter.ts:386-393 — the same settle tail as a send turn (idle
+            // snapshot unconditionally + the unified attention edge: any turn
+            // end except a user interrupt); a serve error additionally
+            // surfaces loudly (the SAME nested envelope `emit_fresh_agent_error`
+            // builds).
             //
             // b8ke focused round-2 review R2-5: the accepted-daemon-operation
             // witness settles with the SAME discipline the send drive uses —
@@ -5138,15 +5767,16 @@ impl FreshOpencodeState {
         );
         child_session.provenance = fork_provenance.clone();
         child_session.real_session_id = Some(child.id.clone());
-        child_session.serve_bridge = Some(self.spawn_serve_bridge(
-            manager,
-            child.id.clone(),
-            child_session.turn_errored.clone(),
-        ));
+        self.install_serve_bridge(&manager, &mut child_session, &child.id)
+            .await;
+        // ep2-r5: bind the child's session INSTANCE — the fork's rescue
+        // verifies this exact `Arc` against the map (a same-key
+        // replacement for the child can never satisfy it).
+        let child_session_arc = Arc::new(TokioMutex::new(child_session));
         self.sessions
             .lock()
             .await
-            .insert(child.id.clone(), Arc::new(TokioMutex::new(child_session)));
+            .insert(child.id.clone(), child_session_arc.clone());
 
         // P1.13: binding row for the child (the materialization record pattern,
         // `_pattern :600-626`) — AWAITED BEFORE the forked reply
@@ -5160,6 +5790,10 @@ impl FreshOpencodeState {
         // claim typed.
         if let Err(e) = self
             .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                // Unified agent names: no naming fact on this ledger edge
+                // (the fork's naming classification is driven by its
+                // dedicated lane).
+                name_transition: None,
                 provider: PROVIDER.into(),
                 session_id: child.id.clone(),
                 mode: SESSION_TYPE.into(),
@@ -5250,6 +5884,46 @@ impl FreshOpencodeState {
                     bridge.abort();
                 }
             }
+            reply_sink(event_frame(
+                &msg.session_id,
+                json!({
+                    "type": "freshAgent.error",
+                    "sessionId": msg.session_id,
+                    "code": "INTERNAL_ERROR",
+                    "message": "session ownership changed during fork; the child was torn down",
+                }),
+            ));
+            return;
+        }
+
+        // fresheyes ep2-r2 Major (the transitional-window dead bridge): the
+        // commit landed, so the child is now visible to every future
+        // revival trigger — but the triggers that fired inside the
+        // construction window are already spent. The rescue tail re-checks
+        // the bridge HERE, before the success reply: an operation must
+        // never answer success over a bridge its own window got killed
+        // (daemon loss swept the just-subscribed sender; the one-shot
+        // `Started` revival skipped the unpublished/`Starting` child).
+        //
+        // ep2-r3: a REFUSAL (the child was killed/handed off between the
+        // commit and this tail — the mover's teardown owns the cleanup)
+        // answers the stale-commit ownership-changed error frame instead:
+        // never a successful forked reply over a retired child, and never
+        // a resurrected bridge for it either.
+        // ep2-r5: the refusal set now includes a same-key REPLACEMENT for
+        // the child — the rescue is bound to the fork's committed instance
+        // and the child's committed (epoch, generation) fence, so it can
+        // only ever verify the fork's own child.
+        if matches!(
+            self.rescue_transitional_bridge_after_commit(
+                &child.id,
+                false,
+                &OpencodeSessionHandle::new(child_session_arc),
+                Self::committed_lane_fence(&self.fresh_agent.ownership, own_ticket.as_ref()),
+            )
+            .await,
+            TransitionalBridgeRescue::Refused
+        ) {
             reply_sink(event_frame(
                 &msg.session_id,
                 json!({
@@ -5967,6 +6641,10 @@ impl FreshOpencodeState {
                     return;
                 }
             };
+        // Task 4: arm the runtime's daemon-loss watcher (idempotent — the
+        // fence parse above stays the FIRST interaction, so a typed refusal
+        // still mutates nothing).
+        self.ensure_daemon_loss_watcher().await;
         let session_arc = {
             let guard = self.sessions.lock().await;
             guard.get(&msg.session_id).cloned()
@@ -6242,23 +6920,32 @@ impl FreshOpencodeState {
         let (status_session_id, running, real_session_id) = {
             let mut session = session_arc.lock().await;
 
-            // Ensure the serve-SSE bridge is running (restart it if it died) -- only
-            // meaningful once a durable session exists; a not-yet-materialized session has
-            // never started a bridge (`bindServeStream` only fires from `materializeOrSend`).
-            if let Some(real_id) = session.real_session_id.clone() {
-                let bridge_dead = session
-                    .serve_bridge
-                    .as_ref()
-                    .map(tokio::task::JoinHandle::is_finished)
-                    .unwrap_or(true);
-                if bridge_dead {
-                    let manager = self.fresh_agent.ensure_manager().await;
-                    session.serve_bridge = Some(self.spawn_serve_bridge(
-                        manager,
-                        real_id,
-                        session.turn_errored.clone(),
-                    ));
-                }
+            // Ensure the serve-SSE bridge is running (restart it if it died) --
+            // only meaningful once a durable session exists; a not-yet-
+            // materialized session has never started a bridge (`bindServeStream`
+            // only fires from `materializeOrSend`). Task 4: the tail is the
+            // shared `restart_session_bridge_guarded` helper, which FIRST
+            // `ensure_started()`s the shared daemon (LB-05 — a restart without
+            // a daemon re-bridges into nothing; the incident's 3 attach
+            // attempts recovered NOTHING because nothing respawned the daemon
+            // for a map-hit). On a bounded respawn failure the attach answers
+            // the TYPED error path, never a silent half-attached state.
+            if let Err(err) = self.restart_session_bridge_guarded(&mut session).await {
+                drop(session);
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %msg.session_id, error = %err,
+                    "freshagent.opencode.attach_daemon_respawn_failed: the dead-bridge \
+                     restart could not bring the shared daemon back — the attach answers \
+                     the typed error instead of a silent half-attached state"
+                );
+                self.emit_fresh_agent_error(
+                    &msg.session_id,
+                    "OPENCODE_ATTACH_RESUME_FAILED",
+                    &format!(
+                        "The opencode serve daemon could not be restarted for this session: {err}"
+                    ),
+                );
+                return;
             }
 
             let status_session_id = session
@@ -6280,7 +6967,17 @@ impl FreshOpencodeState {
         // (materialize-on-send) -- the client fold updates slice AND pane content.
         if let Some(real_id) = real_session_id.as_ref() {
             if real_id != &msg.session_id {
-                self.broadcast(&materialized_frame(&msg.session_id, real_id));
+                // Unified agent names: the durable session's current
+                // projection rides the re-key frame.
+                let projection = self.created_projection_for(real_id).await;
+                let name_ref = projection.as_ref().map(|(r, _)| r.clone());
+                let session_name = projection.map(|(_, record)| record);
+                self.broadcast(&materialized_frame(
+                    &msg.session_id,
+                    real_id,
+                    name_ref,
+                    session_name,
+                ));
             }
         }
 
@@ -6521,11 +7218,8 @@ impl FreshOpencodeState {
             sink.as_ref()
                 .and_then(|s| s.load_provenance(PROVIDER, session_id))
         });
-        session.serve_bridge = Some(self.spawn_serve_bridge(
-            manager,
-            session_id.to_string(),
-            session.turn_errored.clone(),
-        ));
+        self.install_serve_bridge(&manager, &mut session, session_id)
+            .await;
         let session_arc = Arc::new(TokioMutex::new(session));
 
         self.sessions
@@ -6705,6 +7399,8 @@ impl FreshOpencodeState {
                     create_request_id: None,
                     resolves_pending: None,
                     supersedes: None,
+                    // Unified agent names: no naming fact on this ledger edge.
+                    name_transition: None,
                     provenance,
                     observed_epoch: binding_epoch,
                     observed_generation: binding_generation,
@@ -6746,6 +7442,50 @@ impl FreshOpencodeState {
             }
         }
 
+        // fresheyes ep2-r2 Major (the transitional-window dead bridge): the
+        // resume installed its bridge BEFORE the map publication and the
+        // claim commits above, so a daemon loss inside that window killed
+        // the fresh bridge with every recovery trigger spent (an
+        // unpublished session is invisible to the revival pass; a plain
+        // resume holds no `Live` state for it to rescue either; the
+        // re-warm's already-running fast path emits no second `Started`).
+        // Every failure gate has passed — the rescue tail re-checks the
+        // bridge HERE, before the success return, so the resume never
+        // hands back a session whose bridge died in its own window.
+        //
+        // ep2-r3: a REFUSAL (the session was killed/handed off between the
+        // commit and this tail — the mover's teardown owns the cleanup)
+        // answers the stale-commit ownership-changed error instead: never
+        // a handed-back retired session, and never a resurrected bridge for
+        // it either. The under-ticket handoff continuation runs inside the
+        // RUNNER's own lifecycle window (`handoff.is_some()`) — the rescue's
+        // coordinator observation is skipped for exactly that leg (the
+        // runner performs the one `commit_live`); the killed check and the
+        // map re-lookup remain its gates.
+        // ep2-r5: the refusal set now includes a same-key REPLACEMENT —
+        // the rescue is bound to THIS resume's committed instance (the
+        // `session_arc` it returns below, so a replacement under the key
+        // can never be adopted and the retired `Arc` can never be handed
+        // back) and, for the own-commit leg, the resume's committed
+        // (epoch, generation) fence.
+        if matches!(
+            self.rescue_transitional_bridge_after_commit(
+                session_id,
+                handoff.is_some(),
+                &OpencodeSessionHandle::new(Arc::clone(&session_arc)),
+                Self::committed_lane_fence(&self.fresh_agent.ownership, own_ticket.as_ref()),
+            )
+            .await,
+            TransitionalBridgeRescue::Refused
+        ) {
+            return Err(ResumeOpencodeError::Manager(
+                freshell_opencode::ServeError::Transport(format!(
+                    "opencode session {session_id} ownership changed during resume; \
+                     the session was retired mid-operation"
+                )),
+            ));
+        }
+
         Ok(session_arc)
     }
 
@@ -6768,6 +7508,7 @@ impl FreshOpencodeState {
         // the bridge captures the state handle (the same Arc-based clone
         // every detached trigger uses).
         let this = self.clone();
+        let state = self.clone();
         let mut rx = manager.subscribe(&real_id);
         tokio::spawn(async move {
             loop {
@@ -6829,18 +7570,42 @@ impl FreshOpencodeState {
                                 session_id,
                                 message,
                             } => {
-                                // adapter.ts:278-282 -- a turn error means the in-flight
-                                // turn did not positively complete; consulted by
-                                // the send task's completion gating once idle resolves.
+                                // adapter.ts:278-282 -- a turn error ended the
+                                // in-flight turn without a clean outcome; under
+                                // the unified contract it gates nothing -- it
+                                // only feeds the settle tail's non-clean-outcome
+                                // debug marker (`settle_turn_outcome`).
                                 turn_errored.store(true, Ordering::SeqCst);
                                 error_event(session_id, message)
+                            }
+                            SdkProviderEvent::TitleObserved { session_id, title } => {
+                                // Unified agent names (Task 3): a native title
+                                // observation is automatic provider metadata —
+                                // folded at the store's current location
+                                // revision, never promoted to manual, and
+                                // never a wire frame of its own.
+                                let sink = state.naming();
+                                let _ = crate::naming::observe_native_live(
+                                    &sink,
+                                    freshell_protocol::session_names::SessionNameRef::Session {
+                                        provider:
+                                            freshell_protocol::session_names::NamedProvider::Opencode,
+                                        session_id: session_id.clone(),
+                                    },
+                                    title,
+                                    crate::naming::NativeNameOrigin::Snapshot,
+                                    None,
+                                )
+                                .await;
+                                continue;
                             }
                         };
                         fresh_agent.broadcast(&event_frame(&real_id, inner));
                     }
                     // The sidecar was lost; `run_turn`'s own `await_idle` independently
-                    // surfaces `ServeError::SidecarLost`, which already excludes the
-                    // turn from a positive completion. Nothing further to bridge here.
+                    // surfaces `ServeError::SidecarLost`, whose failed settle still
+                    // rings the unified attention edge (`settle_turn_outcome`,
+                    // succeeded=false). Nothing further to bridge here.
                     Ok(SessionSignal::Lost) => {}
                     Err(RecvError::Lagged(_)) => {}
                     Err(RecvError::Closed) => break,
@@ -7125,6 +7890,654 @@ impl FreshOpencodeState {
             Self::arm_orphan_idle_recovery(this, real_id);
         }
     }
+    /// Install a fresh serve-SSE bridge on `session` for `real_id`, stamped
+    /// with the CURRENT daemon's `ownership_id` — the daemon-generation
+    /// fence [`Self::restart_session_bridge_guarded`] compares against.
+    /// EVERY bridge install goes through here (materialization, the resume
+    /// and fork-child constructions, the guarded restart), so the
+    /// handle/stamp pair can never drift apart.
+    async fn install_serve_bridge(
+        &self,
+        manager: &OpencodeServeManager,
+        session: &mut OpencodeSession,
+        real_id: &str,
+    ) {
+        // Read the identity BEFORE spawning: the stamp names the daemon
+        // whose event stream the bridge is about to subscribe to. A daemon
+        // lost in between is caught by the fence itself (the stamp no longer
+        // matches the running daemon, or none runs) — the next revival pass
+        // or fenced attach restarts the bridge.
+        let daemon = manager.ownership_id().await;
+        session.serve_bridge = Some(self.spawn_serve_bridge(
+            manager.clone(),
+            real_id.to_string(),
+            session.turn_errored.clone(),
+        ));
+        session.serve_bridge_daemon = daemon;
+    }
+
+    // ── Task 4 (opencode daemon-death recovery): the runtime-level self-heal ──
+
+    /// Arm the runtime's daemon-loss watcher (2026-09-20 incident: the shared
+    /// `opencode serve` daemon died and NOTHING told the panes — no status
+    /// edge, no bridge revival; panes dead-ended on the snapshot 409).
+    /// Idempotent: the set-once [`OnceLock`] guarantees exactly ONE listener
+    /// per state no matter how many handlers call this. Armed from
+    /// [`Self::handle_send`] / [`Self::handle_attach`] / [`Self::handle_compact`]
+    /// — the opencode WS entry points — so the listener exists before any
+    /// session traffic can depend on it. The watcher task holds a FULL state
+    /// clone (LB-10), so `spawn_serve_bridge(&self, ..)` is callable directly.
+    ///
+    /// - `Lost{reason}`: WARN `freshagent.opencode.daemon_loss_observed`, then
+    ///   fan the typed `OPENCODE_DAEMON_LOST` edge out to every MATERIALIZED
+    ///   session ([`Self::fan_out_daemon_loss_edge`]). The manager's own
+    ///   backoff-guarded re-warm (Task 3) is already scheduled at that point.
+    /// - `Started`: the LEVEL-TRIGGERED revival pass
+    ///   ([`Self::revive_dead_bridges_if_daemon_running`]) — never dependent
+    ///   on having observed `Lost` (LB-02: tokio broadcast does NOT replay
+    ///   history to late subscribers).
+    /// - `Lagged`: continue (LB-08: never disarm on lag).
+    /// - `Closed`: the manager (and its signal sender) is gone — return.
+    ///
+    /// NO CHIME (the freshcodex onExit mirror's discipline): neither edge of
+    /// this watcher ever emits `freshAgent.turn.complete` — a crash is not a
+    /// positive completion.
+    async fn ensure_daemon_loss_watcher(&self) {
+        if self.daemon_loss_watcher.set(()).is_err() {
+            return; // already armed (the cell is Arc-shared across every clone)
+        }
+        let manager = self.fresh_agent.ensure_manager().await;
+        let state = self.clone();
+        let mut signals = manager.subscribe_daemon_signals();
+        tokio::spawn(async move {
+            // Arming-time LEVEL pass (LB-02): broadcast does NOT replay
+            // history — a daemon that re-warmed before this subscription
+            // must still get its dead bridges revived now.
+            state.revive_dead_bridges_if_daemon_running().await;
+            loop {
+                match signals.recv().await {
+                    Ok(DaemonSignal::Lost { reason }) => {
+                        tracing::warn!(target: "freshell_freshagent::opencode",
+                            reason = reason,
+                            "freshagent.opencode.daemon_loss_observed: the shared \
+                             opencode serve daemon was lost — fanning the typed edge \
+                             out to every materialized session; the manager's \
+                             backoff-guarded re-warm is already scheduled"
+                        );
+                        state.fan_out_daemon_loss_edge().await;
+                    }
+                    Ok(DaemonSignal::Started) => {
+                        // LEVEL-TRIGGERED revival (LB-02): revive whatever is
+                        // dead right now — no `saw_loss` heuristic.
+                        state.revive_dead_bridges_if_daemon_running().await;
+                    }
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => return,
+                }
+            }
+        });
+    }
+
+    /// The daemon-loss fan-out (Task 4): exactly ONE typed edge per
+    /// MATERIALIZED session —
+    /// `freshAgent.event{provider:"opencode", sessionType:"freshopencode",
+    /// event:{type:"freshAgent.error", code:"OPENCODE_DAEMON_LOST", message}}`
+    /// — which the client folds through the EXISTING generic `sessionError`
+    /// path (the dismissible "Agent error:" banner + busy-clear). The
+    /// sessions map is keyed by BOTH the placeholder and the durable id
+    /// pointing at the SAME session (`remember()` mirror) — dedupe by
+    /// `real_session_id` (BTreeSet) so each materialized session gets exactly
+    /// ONE edge. The message names the re-warm so the banner reads as the
+    /// self-heal it is, and NO chime ever accompanies it.
+    async fn fan_out_daemon_loss_edge(&self) {
+        const CODE: &str = "OPENCODE_DAEMON_LOST";
+        const MESSAGE: &str =
+            "The opencode serve daemon was lost unexpectedly - it is restarting automatically.";
+        for id in self.materialized_session_ids().await {
+            self.emit_fresh_agent_error(&id, CODE, MESSAGE);
+        }
+    }
+
+    /// The distinct durable `ses_*` ids of every MATERIALIZED session in the
+    /// map (dual-key dedupe), for the loss fan-out and the revival pass
+    /// alike. LB-01: the sessions-map guard is NEVER held across a
+    /// per-session lock (the documented contract above — the reverse edge
+    /// deadlocked production) — the session `Arc`s are cloned out under ONE
+    /// short map lock, the guard drops, and each session is read outside it.
+    async fn materialized_session_ids(&self) -> Vec<String> {
+        let arcs: Vec<Arc<TokioMutex<OpencodeSession>>> = {
+            let map = self.sessions.lock().await;
+            map.values().cloned().collect()
+        };
+        let mut ids = std::collections::BTreeSet::new();
+        for arc in arcs {
+            if let Some(id) = arc.lock().await.real_session_id.clone() {
+                ids.insert(id);
+            }
+        }
+        ids.into_iter().collect()
+    }
+
+    /// The LEVEL-TRIGGERED revival pass (Task 4, LB-02): restart dead/absent
+    /// serve-SSE bridges for MATERIALIZED sessions while the shared daemon
+    /// runs, and push `freshAgent.session.snapshot{status:"idle"}` ONLY to
+    /// sessions whose bridge was actually restarted (the client treats that
+    /// push as snapshot-invalidating → transcript refetch). Called on watcher
+    /// arming and on every `DaemonSignal::Started` — never dependent on
+    /// having observed `Lost`. "Dead" is judged by the shared tail's
+    /// daemon-generation fence ([`Self::restart_session_bridge_guarded`]):
+    /// a bridge still bound to a LOST daemon generation restarts even
+    /// while its old task is draining (the doomed-bridge revival race,
+    /// delta round 2); a bridge already bound to the CURRENT daemon is
+    /// healthy and is neither restarted nor re-pushed.
+    ///
+    /// The ownership coordinator (plan-review round 3) is respected at every
+    /// step: (1) `base_url()` is None → return (daemon absent — nothing to
+    /// revive into; the next `Started` or a fenced attach drives revival);
+    /// (2) snapshot the map (clone the `Arc`s under one short lock, drop the
+    /// guard); (3) per candidate OUTSIDE the map guard: RE-LOOKUP the id at
+    /// revival time (a killed/handed-off session's keys are gone — never act
+    /// on the retained `Arc` alone), observe the CANONICAL ownership state
+    /// fresh, skip on ANY transition (Handoff/Starting/Stopping/Fenced) or a
+    /// terminal owner, revive only `Live{FreshAgent}` (this runtime's own
+    /// sessions) behind the SAME `arm_adopt_guard` the attach path uses,
+    /// then run the shared [`Self::restart_session_bridge_guarded`] tail. An
+    /// unwired coordinator applies no gate (the pre-wiring legacy: map
+    /// membership is the only authority).
+    async fn revive_dead_bridges_if_daemon_running(&self) {
+        let manager = self.fresh_agent.ensure_manager().await;
+        if manager.base_url().await.is_none() {
+            return;
+        }
+        for durable in self.materialized_session_ids().await {
+            // (3a) Re-lookup at revival time — the retained Arc alone is
+            // stale the moment a kill/handoff removes the keys.
+            let session_arc = {
+                let map = self.sessions.lock().await;
+                map.get(&durable).cloned()
+            };
+            let Some(session_arc) = session_arc else {
+                continue;
+            };
+            // (3b) The ownership gate — armed with the SAME adopt-guard
+            // machinery the attach path uses, so the coordinator's
+            // atomicity rides along instead of being re-implemented.
+            let mut adopt_guard = None;
+            if self.fresh_agent.ownership.is_some() {
+                let snap = self
+                    .fresh_agent
+                    .canonical_ownership_snapshot(PROVIDER, &durable);
+                match snap.state {
+                    freshell_ownership::OwnershipState::Live { owner, .. }
+                        if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent =>
+                    {
+                        let expected = freshell_ownership::OwnerIdentity {
+                            kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                            terminal_id: None,
+                            live_session_key: None,
+                            pid: None,
+                            ownership_id: None,
+                        };
+                        match crate::ownership_lane::arm_adopt_guard(
+                            &self.fresh_agent.ownership,
+                            PROVIDER,
+                            &durable,
+                            &format!("daemon-revive-{}", uuid::Uuid::new_v4()),
+                            &expected,
+                            freshell_ownership::ObservedFence {
+                                epoch: snap.epoch,
+                                generation: snap.generation,
+                            },
+                            "freshopencode/daemon-revival",
+                        ) {
+                            crate::ownership_lane::LaneAttachGuard::Armed(guard) => {
+                                adopt_guard = Some(guard)
+                            }
+                            // The coordinator moved between the observe and
+                            // the arm — a lifecycle owns the window; skip,
+                            // never force.
+                            crate::ownership_lane::LaneAttachGuard::Refused => continue,
+                            crate::ownership_lane::LaneAttachGuard::Unwired => {}
+                        }
+                    }
+                    // Any transition (Handoff/Starting/Stopping/Fenced), a
+                    // terminal owner, a vacant key, any other kind: someone
+                    // else's window — never revive into it.
+                    _ => continue,
+                }
+            }
+            // (3c/3d) The shared guarded-restart tail, under the session
+            // lock; the snapshot push goes ONLY to actually-restarted
+            // bridges. `Ok(None)` (bridge alive against the CURRENT daemon /
+            // unmaterialized) is the quiet no-op.
+            let restarted = {
+                let mut session = session_arc.lock().await;
+                self.restart_session_bridge_guarded(&mut session).await
+            };
+            match restarted {
+                Ok(Some(real_id)) => {
+                    self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %durable, error = %err,
+                        "freshagent.opencode.daemon_revival_restart_failed: the \
+                         bridge restart's bounded daemon respawn failed — the next \
+                         Started signal or a fenced attach retries"
+                    );
+                }
+            }
+            // The guard covered the restart; release the window.
+            drop(adopt_guard);
+        }
+    }
+
+    /// The GUARD-HELD bridge-restart tail (the Task 4 refactor): the ONE
+    /// shared restart both [`Self::handle_attach`]'s dead-bridge arm and the
+    /// revival pass ([`Self::revive_dead_bridges_if_daemon_running`]) call.
+    /// Callers arm `ownership_lane::arm_adopt_guard` and hold it ACROSS this
+    /// call so a handoff beginning inside the window answers the typed
+    /// Blocked outcome. The caller holds the per-session lock here (NEVER
+    /// the sessions-map guard — LB-01).
+    ///
+    /// LB-05 (falsified → redesign): in the incident the fenced attach was
+    /// exercised 3× against the dead shared daemon and recovered nothing —
+    /// the tail only re-subscribed the bridge. A restart must first
+    /// `ensure_started()` the shared daemon (mirroring
+    /// `resume_durable_session`'s map-miss behavior); `ensure_started` is
+    /// single-flighted, so concurrent attach/send/compact callers cannot
+    /// spawn a second daemon.
+    ///
+    /// Delta round 2 (fresheyes Major — the doomed-bridge revival race):
+    /// task liveness alone is NOT bridge health. The manager's loss path
+    /// fans `Lost` and re-warms INDEPENDENTLY of the bridge tasks, so a
+    /// bridge still draining its closed channel when the new daemon's
+    /// `Started` revival pass (or a fenced attach) reaches this tail is
+    /// ALIVE-but-DOOMED. The daemon-generation fence: the bridge is
+    /// healthy ONLY while its task is unfinished AND its
+    /// [`OpencodeSession::serve_bridge_daemon`] stamp matches the CURRENT
+    /// daemon's `ownership_id` (an absent daemon orphans every bridge; an
+    /// unstamped handle is unreachable by construction — every install
+    /// stamps — and fails toward recovery).
+    ///
+    /// `Ok(Some(real_id))` — the bridge was (re)started; `Ok(None)` — nothing
+    /// to do (unmaterialized, or the bridge is alive against the current
+    /// daemon); `Err` — the BOUNDED respawn failed (the caller answers
+    /// typed, never a silent half-attached state).
+    async fn restart_session_bridge_guarded(
+        &self,
+        session: &mut OpencodeSession,
+    ) -> Result<Option<String>, ServeError> {
+        // Only meaningful once a durable session exists; a not-yet-
+        // materialized session has never started a bridge (`bindServeStream`
+        // only fires from `materializeOrSend`).
+        let Some(real_id) = session.real_session_id.clone() else {
+            return Ok(None);
+        };
+        let manager = self.fresh_agent.ensure_manager().await;
+        let current_daemon = manager.ownership_id().await;
+        let bridge_bound_to_current_daemon = matches!(
+            (&session.serve_bridge_daemon, &current_daemon),
+            (Some(stamp), Some(current)) if stamp == current
+        );
+        let bridge_dead = session
+            .serve_bridge
+            .as_ref()
+            .map(|handle| handle.is_finished() || !bridge_bound_to_current_daemon)
+            .unwrap_or(true);
+        if !bridge_dead {
+            return Ok(None);
+        }
+        manager.ensure_started().await?;
+        // The superseded/draining task is ABORTED, not merely detached:
+        // dropping a JoinHandle does not reap the task, and a doomed
+        // bridge must not outlive the replacement it lost to.
+        if let Some(old) = session.serve_bridge.take() {
+            old.abort();
+        }
+        self.install_serve_bridge(&manager, session, &real_id).await;
+        Ok(Some(real_id))
+    }
+
+    /// The POST-COMMIT transitional-bridge rescue tail (fresheyes ep2-r2
+    /// Major — the transitional-window dead bridge; HARDENED ep2-r3 — the
+    /// rescue can resurrect a killed/handed-off session): the fork-child
+    /// and resume constructions install the generation-fenced bridge
+    /// BEFORE the session is published in `sessions` and committed
+    /// `Live`, so a daemon loss landing inside that window kills the fresh
+    /// bridge (the loss sweep claims its just-subscribed sender; the fanned
+    /// `Lost` closes its channel) while every recovery trigger misses it —
+    /// the successor's one-shot `Started` revival pass cannot see an
+    /// unpublished session, deliberately skips transitional ownership
+    /// states, and the re-warm's already-running fast path emits no second
+    /// `Started`. The operation would otherwise answer success over a
+    /// permanently dead bridge. The tail closes the window from the
+    /// operation's own side: after the `Live` commit (the only state the
+    /// revival pass rescues), it re-runs the SAME fenced
+    /// [`Self::restart_session_bridge_guarded`] tail the revival pass
+    /// uses — a bridge still alive against the CURRENT daemon is the
+    /// quiet `Healthy` no-op (no push, no restart: the happy path is
+    /// byte-identical), a bridge stamped to the lost generation (or
+    /// exited, or absent) is restarted against the successor and the
+    /// client gets the one recovery snapshot. The position-independent
+    /// re-check covers BOTH window variants — the unpublished leg (a
+    /// revival pass can never see a session before its map publication)
+    /// and the published-`Starting` leg (a pass that sees it must skip
+    /// it) — because it judges the bridge's health at tail time, not
+    /// where in the window the loss landed.
+    ///
+    /// **ep2-r3 hardening — the rescue rides the ESTABLISHED
+    /// ownership-coordinator-gated restart discipline** (the same gates
+    /// the revival pass and the fenced attach use), never a bare
+    /// install on a retained `Arc`: (a) a FRESH map re-lookup — a miss
+    /// is the typed [`TransitionalBridgeRescue::Refused`] (the keys were
+    /// removed by a kill/handoff whose teardown already aborted the
+    /// bridge), never a silent success over the retired session;
+    /// (b) the CANONICAL ownership observation + `arm_adopt_guard` window
+    /// — revive only `Live{FreshAgent}`; every transition
+    /// (Handoff/Starting/Stopping/Fenced), a terminal owner, and a
+    /// vacant key refuse, and the guard is held ACROSS the restart so a
+    /// handoff beginning inside the window answers its typed Blocked
+    /// outcome; (c) the `killed` check UNDER the session lock — a
+    /// kill/close/handoff teardown that completed between the map clone
+    /// and the lock take is final, never resurrected (its detached
+    /// `JoinHandle` would keep broadcasting for the retired session).
+    /// `own_lifecycle_window` skips ONLY the observation (b): the
+    /// under-ticket handoff continuation resumes inside the RUNNER's own
+    /// held claim (the coordinator key is mid-transition by design and
+    /// the runner — not this lane — performs the one `commit_live`), so
+    /// the killed check and the map re-lookup remain its gates. Every
+    /// caller whose lifecycle window has ALREADY committed passes
+    /// `false` — the observation then sees the caller's own
+    /// `Live{FreshAgent}` and arms the adopt guard across the restart
+    /// (the revival pass's exact discipline): the lane's own-commit
+    /// tails (fork/resume) and, since ep2-r4, the handoff runner's
+    /// post-commit re-check for its freshopencode targets — the
+    /// runner's commit is the ONE `Live` commit an under-ticket
+    /// continuation ever gets, so the runner re-runs this seam after it
+    /// (a daemon loss in the runner's awaited flavor-write window kills
+    /// the just-rescued bridge with every other recovery trigger spent:
+    /// the successor's `Started` revival pass skips the transitional
+    /// owner, and the commit itself emits no new daemon signal).
+    ///
+    /// **ep2-r5 hardening — the rescue is bound to the identity the
+    /// CALLER committed, never to whichever session currently occupies
+    /// the durable id**: every caller passes its committed session
+    /// instance ([`OpencodeSessionHandle`]) and its committed ownership
+    /// fence (the `(epoch, generation)` pair observed at ITS commit).
+    /// The by-id map re-lookup must return the SAME instance
+    /// (`Arc::ptr_eq` against the caller's handle) — a same-key
+    /// REPLACEMENT (the original killed/removed and another resume's
+    /// brand-new session object under the same durable id, moved in
+    /// during the awaited post-commit work) is a different instance and
+    /// REFUSES, never gets adopted — and, when the coordinator gates
+    /// the call, the canonical observation must still hold the CALLER's
+    /// OWN committed `(epoch, generation)` era: a replacement's
+    /// same-kind `Live{FreshAgent}` at a NEWER generation refuses too
+    /// (the kind-only expected-owner check alone accepted it — the
+    /// finding's exact hole). On either mismatch the outcome is
+    /// [`TransitionalBridgeRescue::Refused`]: the operation surfaces its
+    /// typed ownership-changed error, never answers success carrying its
+    /// obsolete generation, and never restarts a bridge on the retired
+    /// instance (the resume caller would otherwise hand back its
+    /// removed-and-killed `Arc`). The under-ticket pre-commit leg
+    /// (`own_lifecycle_window = true`) passes no fence — the runner's
+    /// `Live` commit is still ahead — so the instance binding, the
+    /// killed check, and the map re-lookup remain its gates; the
+    /// post-commit callers (the fork/resume tails, the handoff runner's
+    /// re-check) always carry the committed fence.
+    ///
+    /// A [`TransitionalBridgeRescue::Refused`] never installs and never
+    /// pushes: the mover's teardown owns the cleanup (the kill/handoff
+    /// paths remove every key, set the killed flag, and abort the bridge
+    /// under the same locks this rescue re-verifies), and the OPERATION
+    /// surfaces its typed ownership-changed error — the stale-commit
+    /// path's shape — instead of answering success over the retired
+    /// session. A bounded respawn failure still WARNS and the operation
+    /// still succeeds (the session is registered and visible to the next
+    /// `Started` revival pass and fenced attaches — the revival pass's
+    /// failure handling, verbatim).
+    pub(crate) async fn rescue_transitional_bridge_after_commit(
+        &self,
+        durable: &str,
+        own_lifecycle_window: bool,
+        committed: &OpencodeSessionHandle,
+        committed_fence: Option<freshell_ownership::ObservedFence>,
+    ) -> TransitionalBridgeRescue {
+        // ep2-r5 test seam (`cfg(test)`-only): park BEFORE the map
+        // re-lookup — the window where a test can complete a same-key
+        // kill+replace while the rescue is in flight, so the re-lookup
+        // below then observes whichever session the mover left under the
+        // key. See [`Self::arm_rescue_lookup_stall`].
+        #[cfg(test)]
+        if let Some(gate) = self.take_rescue_lookup_stall(durable) {
+            let _ = gate.entered_tx.send(());
+            // Take the release receiver OUT of its Mutex before awaiting —
+            // the std guard is not Send and must not live across the await.
+            let release = gate
+                .release_rx
+                .lock()
+                .expect("rescue lookup stall latch mutex")
+                .take();
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+        }
+        // (a) The fresh map re-lookup — the retained-claim-alone rule (the
+        // revival pass's (3a)): a session whose map keys are gone was
+        // killed/handed off mid-operation and its teardown already aborted
+        // the bridge. Never act on the retained claim alone.
+        let session_arc = {
+            let map = self.sessions.lock().await;
+            map.get(durable).cloned()
+        };
+        let Some(session_arc) = session_arc else {
+            return TransitionalBridgeRescue::Refused;
+        };
+        // (a′) The committed-INSTANCE binding (ep2-r5): the re-lookup must
+        // return the SAME session instance the caller committed —
+        // `Arc::ptr_eq` against the caller's handle. A replacement resume
+        // under the same durable id is a brand-new object: adopting it
+        // would answer the operation's success over ITS OWN retired
+        // session while the replacement lives under the key (and the
+        // resume caller would hand back its removed-and-killed `Arc` for a
+        // later bridge restart). Refuse — the mover's teardown owns the
+        // original's cleanup and the replacement's own lifecycle owns the
+        // key now.
+        if !committed.ptr_eq(&session_arc) {
+            return TransitionalBridgeRescue::Refused;
+        }
+        // ep2-r3 test seam (`cfg(test)`-only): park the rescue in the exact
+        // window the fresheyes finding names — the session `Arc` is CLONED
+        // and the session lock is not yet taken — so a test can complete a
+        // real kill/handoff against the retained `Arc` before the rescue
+        // proceeds. See [`Self::arm_rescue_stall`].
+        #[cfg(test)]
+        if let Some(gate) = self.take_rescue_stall(durable) {
+            let _ = gate.entered_tx.send(());
+            // Take the release receiver OUT of its Mutex before awaiting —
+            // the std guard is not Send and must not live across the await.
+            let release = gate
+                .release_rx
+                .lock()
+                .expect("rescue release latch mutex")
+                .take();
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+        }
+        // (b) The ownership gate — the revival pass's (3b) shape: observe
+        // the CANONICAL state fresh, revive only Live{FreshAgent}, and arm
+        // the SAME adopt-guard the attach path uses so the coordinator's
+        // atomicity rides across the restart below. An unwired coordinator
+        // applies no gate (the pre-wiring legacy: the killed check and the
+        // map re-lookup are the authority).
+        let mut adopt_guard = None;
+        if !own_lifecycle_window && self.fresh_agent.ownership.is_some() {
+            let snap = self
+                .fresh_agent
+                .canonical_ownership_snapshot(PROVIDER, durable);
+            match snap.state {
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent =>
+                {
+                    // (b′) The committed-FENCE binding (ep2-r5): the
+                    // coordinator must still hold the CALLER's OWN era —
+                    // the observed `(epoch, generation)` must EQUAL the
+                    // pair the caller committed, not merely be a
+                    // same-kind Live. A replacement resume committed at a
+                    // strictly newer per-key generation (generations are
+                    // monotonic and never reset), so the equality refuses
+                    // exactly the shape the kind-only check accepted
+                    // before.
+                    let Some(committed_fence) = committed_fence else {
+                        // A post-commit rescue over a WIRED coordinator
+                        // with no committed fence has no era to verify —
+                        // fail closed, never restart into an unverified
+                        // ownership window. Unreachable for the real
+                        // callers (a wired registry grants every
+                        // own-commit caller a ticket; the handoff runner
+                        // always carries its committed pair).
+                        return TransitionalBridgeRescue::Refused;
+                    };
+                    if snap.epoch != committed_fence.epoch
+                        || snap.generation != committed_fence.generation
+                    {
+                        return TransitionalBridgeRescue::Refused;
+                    }
+                    let expected = freshell_ownership::OwnerIdentity {
+                        kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                        terminal_id: None,
+                        live_session_key: None,
+                        pid: None,
+                        ownership_id: None,
+                    };
+                    match crate::ownership_lane::arm_adopt_guard(
+                        &self.fresh_agent.ownership,
+                        PROVIDER,
+                        durable,
+                        &format!("transitional-rescue-{}", uuid::Uuid::new_v4()),
+                        &expected,
+                        freshell_ownership::ObservedFence {
+                            epoch: snap.epoch,
+                            generation: snap.generation,
+                        },
+                        "freshopencode/transitional-rescue",
+                    ) {
+                        crate::ownership_lane::LaneAttachGuard::Armed(guard) => {
+                            adopt_guard = Some(guard)
+                        }
+                        // The coordinator moved between the observe and the
+                        // arm — a lifecycle owns the window; skip, never
+                        // force.
+                        crate::ownership_lane::LaneAttachGuard::Refused => {
+                            return TransitionalBridgeRescue::Refused
+                        }
+                        // Unreachable with a wired registry (checked above);
+                        // kept total against the enum.
+                        crate::ownership_lane::LaneAttachGuard::Unwired => {}
+                    }
+                }
+                // Any transition (Handoff/Starting/Stopping/Fenced), a
+                // terminal owner, a vacant key, any other kind: someone
+                // else's window — never revive into it.
+                _ => return TransitionalBridgeRescue::Refused,
+            }
+        }
+        // (c) The session lock: the killed check, then the shared guarded
+        // restart tail (the per-session lock is held here — never the
+        // sessions-map guard; LB-01). The adopt-guard (b) covers the
+        // restart and releases at the return below.
+        let restarted = {
+            let mut session = session_arc.lock().await;
+            if session.killed.load(Ordering::SeqCst) {
+                // A kill/close/handoff teardown marked the session retired
+                // while this rescue held its pre-lock clone — never
+                // resurrect; the teardown owns the cleanup.
+                return TransitionalBridgeRescue::Refused;
+            }
+            self.restart_session_bridge_guarded(&mut session).await
+        };
+        drop(adopt_guard);
+        match restarted {
+            Ok(Some(real_id)) => {
+                self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
+                TransitionalBridgeRescue::Restarted
+            }
+            Ok(None) => TransitionalBridgeRescue::Healthy,
+            Err(err) => {
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %durable, error = %err,
+                    "freshagent.opencode.transitional_bridge_rescue_failed: the \
+                     post-commit bridge rescue's bounded daemon respawn failed — \
+                     the next Started signal or a fenced attach retries"
+                );
+                TransitionalBridgeRescue::RespawnFailed
+            }
+        }
+    }
+}
+
+/// The post-commit rescue's outcome (ep2-r3): the operation tail (the
+/// fork's reply, the resume's return, the handoff runner's post-commit
+/// re-check) consumes this to decide between its success path and its
+/// typed ownership-changed refusal. See
+/// [`FreshOpencodeState::rescue_transitional_bridge_after_commit`].
+pub(crate) enum TransitionalBridgeRescue {
+    /// The bridge was (re)started against the successor daemon and the
+    /// client got its one recovery snapshot (pushed by the rescue itself —
+    /// only actually-restarted bridges are ever pushed).
+    Restarted,
+    /// Nothing to do — the bridge is alive against the current daemon (or
+    /// the session is unmaterialized): the quiet no-op; the operation
+    /// succeeds unchanged.
+    Healthy,
+    /// The bounded daemon respawn failed — WARN-only; the operation still
+    /// succeeds (the registered session is visible to the next `Started`
+    /// revival pass and fenced attaches).
+    RespawnFailed,
+    /// The session was retired or transitioned between the commit and the
+    /// tail — its map keys are gone (a kill/handoff removed them), its
+    /// `killed` flag is set under the session lock, the map key now holds
+    /// a DIFFERENT session instance than the caller committed (a same-key
+    /// replacement), or the canonical ownership no longer holds the
+    /// caller's committed `(epoch, generation)` era (and is not this
+    /// operation's own lifecycle window): NEVER resurrect, never adopt
+    /// the replacement, never answer success carrying an obsolete
+    /// generation. The mover's teardown owns the cleanup; the operation
+    /// must surface its typed ownership-changed error instead of
+    /// answering success over the retired session.
+    Refused,
+}
+
+/// An opaque handle to ONE live freshopencode session instance (fresheyes
+/// ep2-r5): identity is the `Arc` pointer itself, so a same-key
+/// REPLACEMENT — another resume's brand-new session object under the
+/// SAME durable id — can never masquerade as the instance a caller
+/// committed. The handoff runner carries this out of its under-ticket
+/// resume (the Ok payload of
+/// [`FreshOpencodeState::opencode_resume_for_handoff`] → `start_target`)
+/// and hands it back to
+/// [`FreshOpencodeState::rescue_transitional_bridge_after_commit`],
+/// which verifies it with `Arc::ptr_eq` against the sessions map's
+/// current entry. The wrapped [`OpencodeSession`] stays private to this
+/// module; the runner only ever passes the handle through.
+#[derive(Clone)]
+pub(crate) struct OpencodeSessionHandle(Arc<TokioMutex<OpencodeSession>>);
+
+impl OpencodeSessionHandle {
+    /// Wrap the session instance a caller is committing (or has just
+    /// committed) under its durable id.
+    fn new(instance: Arc<TokioMutex<OpencodeSession>>) -> Self {
+        Self(instance)
+    }
+
+    /// The committed-instance binding (ep2-r5): true iff `current` IS the
+    /// session instance this handle was minted from.
+    fn ptr_eq(&self, current: &Arc<TokioMutex<OpencodeSession>>) -> bool {
+        Arc::ptr_eq(&self.0, current)
+    }
 }
 
 /// ISO-8601 / RFC-3339 millis-Z timestamp (matches `new Date().toISOString()`) for error
@@ -7196,18 +8609,43 @@ fn error_event(session_id: &str, message: &str) -> Value {
     json!({ "type": "freshAgent.error", "sessionId": session_id, "message": message })
 }
 
-/// `sdk.turn.complete → freshAgent.turn.complete` (sdk-events.ts:71-72; the status-guarded
-/// positive-completion chime, adapter.ts:377-381).
+/// `sdk.turn.complete → freshAgent.turn.complete` (sdk-events.ts:71-72; the
+/// unified turn-end attention edge — emitted for ANY turn end except a
+/// user-initiated interrupt, deliberately diverging from the legacy
+/// status-guarded positive-completion chime of adapter.ts:377-381).
 fn turn_complete_event(session_id: &str, at: i64) -> Value {
     json!({ "type": "freshAgent.turn.complete", "sessionId": session_id, "at": at })
+}
+
+/// Stamp the session's strictly-monotonic turn-complete clock and broadcast the
+/// unified `freshAgent.turn.complete` edge — the shared mint of
+/// [`settle_turn_outcome`]'s tail, so a later edge can never collide with or
+/// regress below an earlier one on the same session.
+fn mint_turn_complete_edge(
+    fresh_agent: &FreshAgentState,
+    real_id: &str,
+    last_turn_complete_at: &StdMutex<Option<i64>>,
+) {
+    let at = {
+        let mut guard = last_turn_complete_at
+            .lock()
+            .expect("last_turn_complete_at mutex");
+        let at = next_monotonic_turn_complete_at(*guard, now_ms());
+        *guard = Some(at);
+        at
+    };
+    fresh_agent.broadcast(&event_frame(real_id, turn_complete_event(real_id, at)));
 }
 
 /// The shared settle tail of a turn-scoped opencode pipeline (a send turn, a compact):
 /// broadcast the idle snapshot UNCONDITIONALLY (`emitStatus(state, 'idle')`,
 /// adapter.ts:371/384 — it flows whether the turn succeeded or errored), then the
-/// positive-completion `freshAgent.turn.complete` chime gated on a clean finish
-/// (`succeeded && !turn_aborted && !turn_errored`, adapter.ts:377), stamped by the
-/// session's monotonic turn-complete clock.
+/// UNIFIED `freshAgent.turn.complete` attention edge gated only on
+/// "the user did not interrupt" (`!turn_aborted`). A clean finish, a
+/// `session.error` turn (`turn_errored`), and a failed settle (`succeeded=false`:
+/// prompt-POST failure, `IdleTimeout`, `SidecarLost`) all ended a turn the user
+/// may not have been watching — one identical edge, no outcome on the wire —
+/// stamped by the session's monotonic turn-complete clock.
 fn settle_turn_outcome(
     fresh_agent: &FreshAgentState,
     real_id: &str,
@@ -7217,17 +8655,18 @@ fn settle_turn_outcome(
     last_turn_complete_at: &StdMutex<Option<i64>>,
 ) {
     fresh_agent.broadcast(&event_frame(real_id, snapshot_event(real_id, "idle")));
-    if succeeded && !turn_aborted.load(Ordering::SeqCst) && !turn_errored.load(Ordering::SeqCst) {
-        let at = {
-            let mut guard = last_turn_complete_at
-                .lock()
-                .expect("last_turn_complete_at mutex");
-            let at = next_monotonic_turn_complete_at(*guard, now_ms());
-            *guard = Some(at);
-            at
-        };
-        fresh_agent.broadcast(&event_frame(real_id, turn_complete_event(real_id, at)));
+    // Unified "needs attention": ANY turn end rings except a user-initiated
+    // interrupt (turn_aborted). A clean finish, a session.error turn
+    // (turn_errored), and a failed settle (succeeded=false: prompt-POST
+    // failure, IdleTimeout, SidecarLost) all ended a turn the user may not
+    // have been watching — one identical edge, no outcome on the wire.
+    if turn_aborted.load(Ordering::SeqCst) {
+        return;
     }
+    if !succeeded || turn_errored.load(Ordering::SeqCst) {
+        tracing::debug!(provider = PROVIDER, session_id = %real_id, "turn.settled_non_clean_unified_edge");
+    }
+    mint_turn_complete_edge(fresh_agent, real_id, last_turn_complete_at);
 }
 
 /// `freshAgent.session.materialized` (legacy reference: server/ws-handler.ts's
@@ -7235,7 +8674,12 @@ fn settle_turn_outcome(
 /// re-key frame. Shared by the materialize-on-send path and the tracked attach arm
 /// (Task 5: re-key a placeholder-addressed pane BEFORE its real-id-stamped ack
 /// snapshot, so the pane can correlate the ack it is about to receive).
-fn materialized_frame(previous_session_id: &str, real_id: &str) -> ServerMessage {
+fn materialized_frame(
+    previous_session_id: &str,
+    real_id: &str,
+    name_ref: Option<freshell_protocol::session_names::SessionNameRef>,
+    session_name: Option<freshell_protocol::session_names::SessionNameRecord>,
+) -> ServerMessage {
     ServerMessage::FreshAgentSessionMaterialized(FreshAgentSessionMaterialized {
         previous_session_id: previous_session_id.to_string(),
         provider: PROVIDER.to_string(),
@@ -7245,6 +8689,10 @@ fn materialized_frame(previous_session_id: &str, real_id: &str) -> ServerMessage
             provider: PROVIDER.to_string(),
             session_id: real_id.to_string(),
         }),
+        // Unified agent names: the post-transfer canonical projection — the
+        // bind commits BEFORE this frame publishes the identity.
+        name_ref,
+        session_name,
     })
 }
 
@@ -7591,6 +9039,200 @@ mod tests {
         }
     }
 
+    /// The failed-settle fake: like [`StatusPollFakeHttp`] (create mints a fresh
+    /// `ses_N`, everything else a benign 200 `{}`), but the send path's
+    /// `POST /session/:id/prompt_async` answers 500 — the deterministic
+    /// prompt-POST failure (`ServeError::Http`) that settles a turn with
+    /// `succeeded=false`, with no `session.error` SSE ever arriving.
+    struct PromptFailFakeHttp {
+        next_session: AtomicUsize,
+    }
+    impl PromptFailFakeHttp {
+        fn new() -> Self {
+            Self {
+                next_session: AtomicUsize::new(0),
+            }
+        }
+    }
+    impl ServeHttp for PromptFailFakeHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let is_prompt = req.url.contains("/prompt_async")
+                && matches!(req.method, freshell_opencode::serve::HttpMethod::Post);
+            // Precise create-match (the same predicate discipline as
+            // [`StatusPollFakeHttp`]): a loose `/session` contains() would also
+            // swallow the prompt POST this fake exists to fail.
+            let is_create = !is_prompt
+                && matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                && (req.url.ends_with("/session") || req.url.contains("/session?"));
+            let (status, body) = if is_prompt {
+                (500, b"prompt exploded".to_vec())
+            } else if is_create {
+                let n = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
+                (
+                    200,
+                    serde_json::to_vec(&json!({ "id": format!("ses_{n}"), "directory": null }))
+                        .unwrap(),
+                )
+            } else {
+                (200, b"{}".to_vec())
+            };
+            Box::pin(async move { Ok(ServeHttpResponse::new(status, body)) })
+        }
+    }
+
+    /// The failed-interrupt fixture (the-usual SDD delta-r1; silence
+    /// contract per delta-r2 DR2-1): like [`StatusPollFakeHttp`] (create
+    /// mints a fresh `ses_N`; status polls go busy → idle), but the
+    /// per-session `POST /session/:id/abort` answers 500 — the deterministic
+    /// `ServeError::Http` that drives
+    /// [`FreshOpencodeState::handle_interrupt`]'s Err arm (the SILENT
+    /// failed-abort path — a user-initiated interrupt never rings) while
+    /// the local turn task has already been taken + aborted.
+    struct AbortFailFakeHttp {
+        next_session: AtomicUsize,
+        last_created: StdMutex<Option<String>>,
+        status_polls: AtomicUsize,
+        busy_polls: usize,
+    }
+    impl AbortFailFakeHttp {
+        fn new(busy_polls: usize) -> Self {
+            Self {
+                next_session: AtomicUsize::new(0),
+                last_created: StdMutex::new(None),
+                status_polls: AtomicUsize::new(0),
+                busy_polls,
+            }
+        }
+    }
+    impl ServeHttp for AbortFailFakeHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let is_abort = req.url.contains("/abort")
+                && matches!(req.method, freshell_opencode::serve::HttpMethod::Post);
+            let is_status = req.url.contains("/session/status");
+            // Precise create-match (the same predicate discipline as
+            // [`StatusPollFakeHttp`]): a loose `/session` contains() would also
+            // swallow the abort POST this fake exists to fail.
+            let is_create = !is_status
+                && !is_abort
+                && matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                && (req.url.ends_with("/session") || req.url.contains("/session?"));
+            let (status, body) = if is_abort {
+                (500, b"abort exploded".to_vec())
+            } else if is_create {
+                let n = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
+                let id = format!("ses_{n}");
+                *self.last_created.lock().unwrap() = Some(id.clone());
+                (
+                    200,
+                    serde_json::to_vec(&json!({ "id": id, "directory": null })).unwrap(),
+                )
+            } else if is_status {
+                let poll_n = self.status_polls.fetch_add(1, Ordering::SeqCst);
+                let last = self.last_created.lock().unwrap().clone();
+                if poll_n < self.busy_polls {
+                    let id = last.unwrap_or_default();
+                    (
+                        200,
+                        serde_json::to_vec(&json!({ id: { "type": "busy" } })).unwrap(),
+                    )
+                } else {
+                    (200, b"{}".to_vec())
+                }
+            } else {
+                (200, b"{}".to_vec())
+            };
+            Box::pin(async move { Ok(ServeHttpResponse::new(status, body)) })
+        }
+    }
+
+    /// The focused-r2 FR2-3 fixture: models the DAEMON-SIDE turn lifecycle the
+    /// finding describes, on three test-controlled knobs.
+    /// - `POST /session/:id/abort` sets `abort_started` IMMEDIATELY (the test's
+    ///   deterministic signal that the interrupt's take block finished and the
+    ///   RPC leg began), then sleeps `abort_delay_ms`, then answers 500 — a
+    ///   slow-FAILING abort that keeps the Err arm pending while other traffic
+    ///   proceeds.
+    /// - `GET /session/status` reports `ses_1` busy while `daemon_busy` holds,
+    ///   `{}` after the test clears it — a session-AWARE status map (unlike
+    ///   [`AbortFailFakeHttp`]'s global poll counter, two consecutive drives
+    ///   each observe their own busy→idle transition), counted so the test can
+    ///   wait for a specific poll.
+    /// - Everything else answers 200 `{}` (the prompt POST fallback).
+    struct SlowAbortSessionFakeHttp {
+        abort_started: AtomicBool,
+        abort_delay_ms: u64,
+        daemon_busy: AtomicBool,
+        status_polls: AtomicUsize,
+    }
+    impl SlowAbortSessionFakeHttp {
+        fn new(abort_delay_ms: u64) -> Self {
+            Self {
+                abort_started: AtomicBool::new(false),
+                abort_delay_ms,
+                daemon_busy: AtomicBool::new(true),
+                status_polls: AtomicUsize::new(0),
+            }
+        }
+    }
+    impl ServeHttp for SlowAbortSessionFakeHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let is_abort = req.url.contains("/abort")
+                && matches!(req.method, freshell_opencode::serve::HttpMethod::Post);
+            let is_status = req.url.contains("/session/status");
+            if is_abort {
+                self.abort_started.store(true, Ordering::SeqCst);
+                let delay_ms = self.abort_delay_ms;
+                return Box::pin(async move {
+                    if delay_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+                    Ok(ServeHttpResponse::new(500, b"abort exploded".to_vec()))
+                });
+            }
+            let (status, body) = if is_status {
+                self.status_polls.fetch_add(1, Ordering::SeqCst);
+                if self.daemon_busy.load(Ordering::SeqCst) {
+                    (
+                        200,
+                        serde_json::to_vec(&json!({ "ses_1": { "type": "busy" } })).unwrap(),
+                    )
+                } else {
+                    (200, b"{}".to_vec())
+                }
+            } else {
+                (200, b"{}".to_vec())
+            };
+            Box::pin(async move { Ok(ServeHttpResponse::new(status, body)) })
+        }
+    }
+
     /// Fix Task #3 (defect 3): mimics a REAL `opencode serve` more faithfully than
     /// [`FakeHttp`] for the placeholder-snapshot regression below -- `POST /session`
     /// mints a fresh `ses_N` id and REMEMBERS it; a `GET /session/:id` (or its
@@ -7802,6 +9444,7 @@ mod tests {
 
     fn create_msg(request_id: &str) -> FreshAgentCreate {
         FreshAgentCreate {
+            naming_handle: None,
             observed_epoch: None,
             observed_generation: None,
             request_id: request_id.to_string(),
@@ -8059,6 +9702,70 @@ mod tests {
             Some(real_session_id),
             "a duplicate create must NOT reset the already-materialized session's \
              real_session_id back to None"
+        );
+    }
+
+    /// Unified agent names (Task 8 — the T2-M3/T4-M3 per-runtime lane pin):
+    /// the shared accepted-input callback — an accepted freshopencode send
+    /// feeds the naming authority ONE activity carrying the prompt text. The
+    /// materialization bind consumes the stashed handle BEFORE the feed, so
+    /// the first send's activity target is the pane's DURABLE `ses_*` id (the
+    /// correct fallback — a wrong stash key or a missed fallback would redden
+    /// this pin).
+    #[tokio::test]
+    async fn send_feeds_the_naming_authority_once_with_the_accepted_text() {
+        let (st, killed) = state().await;
+        let _ = &killed;
+        let sink = crate::naming::test_support::RecordingSink::new();
+        st.set_session_naming(sink.clone());
+
+        let mut create = create_msg("req-opencode-naming-send");
+        create.naming_handle = Some("handle-opencode-naming-send".to_string());
+        st.handle_create(create, None).await;
+        let placeholder = "freshopencode-req-opencode-naming-send";
+        st.handle_send(send_msg(placeholder, "Fix the sardine crash"))
+            .await;
+
+        // The feed fires once the turn was accepted; poll the sink bounded.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if !sink.activities.lock().unwrap().is_empty() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the accepted send feeds the naming authority");
+        let sessions = st.sessions.lock().await;
+        let session_arc = sessions
+            .get(placeholder)
+            .expect("placeholder session tracked after create")
+            .clone();
+        drop(sessions);
+        let durable_id = session_arc
+            .lock()
+            .await
+            .real_session_id
+            .clone()
+            .expect("send must have materialized a durable session");
+        let activities = sink.activities.lock().unwrap();
+        assert_eq!(activities.len(), 1, "{activities:?}");
+        assert_eq!(
+            activities[0].target,
+            freshell_protocol::session_names::SessionNameRef::Session {
+                provider: freshell_protocol::session_names::NamedProvider::Opencode,
+                session_id: durable_id.clone(),
+            }
+        );
+        assert_eq!(activities[0].mode, "freshopencode");
+        assert_eq!(
+            activities[0].first_user_message.as_deref(),
+            Some("Fix the sardine crash")
+        );
+        assert_eq!(
+            activities[0].reason,
+            crate::naming::NameActivityReason::AcceptedUserMessage
         );
     }
 
@@ -9487,6 +11194,28 @@ mod tests {
             Some("ses_1"),
             "fixture: the send materialized the durable id (and committed Live{{FreshAgent}})"
         );
+        // The materialize spawn's ownership commit (Live{FreshAgent} on the
+        // durable key) lands asynchronously AFTER the durable id itself;
+        // on a contended 2-core CI runner the test can outrun it (observed
+        // twice on CI: begin_handoff met a not-yet-Live key and the fixture
+        // assert panicked — never on the 96-core dev box). Poll the
+        // registry until the committed precondition is observable instead
+        // of assuming the spawn completed; the bound trips only if the
+        // commit never lands at all.
+        let mut commit_polls = 0u32;
+        loop {
+            let snap = registry.observe("opencode", "ses_1");
+            if matches!(snap.state, freshell_ownership::OwnershipState::Live { .. }) {
+                break;
+            }
+            commit_polls += 1;
+            assert!(
+                commit_polls < 10_000,
+                "fixture: the materialize spawn never committed Live{{FreshAgent}} \
+                 ownership for ses_1: {snap:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
         // The refusal precondition: a handoff owns the durable key's
         // transition, so the kill's fenced stop is typed-blocked.
         let freshell_ownership::BeginOutcome::Granted { .. } = registry.begin_handoff(
@@ -11498,11 +13227,26 @@ mod tests {
             },
         );
 
-        let owner = st
+        let (owner, committed_instance) = st
             .opencode_resume_for_handoff("ses_r27_oc", None, "handoff-op-r27", 9)
             .await
             .expect("the under-ticket target resume succeeds");
         assert_eq!(owner.kind, freshell_ownership::RuntimeOwnerKind::FreshAgent);
+        // ep2-r5: the under-ticket resume carries its committed session
+        // INSTANCE out with the identity — the exact `Arc` registered
+        // under the durable id (the runner's post-commit rescue re-check
+        // binds to it).
+        let registered = st
+            .sessions
+            .lock()
+            .await
+            .get("ses_r27_oc")
+            .cloned()
+            .expect("the under-ticket resume registered the target session");
+        assert!(
+            committed_instance.ptr_eq(&registered),
+            "the carried handle IS the registered session instance (ep2-r5)"
+        );
 
         let bindings = fake.bindings.lock().unwrap();
         let last = bindings
@@ -11870,6 +13614,8 @@ mod tests {
             create_request_id: Some("cr-lineage".into()),
             resolves_pending: Some("freshopencode-cr-lineage".into()),
             supersedes: None,
+            // Unified agent names: no naming fact on this ledger edge.
+            name_transition: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
@@ -11929,6 +13675,8 @@ mod tests {
             create_request_id: Some("cr-lineage-killed".into()),
             resolves_pending: Some("freshopencode-cr-lineage-killed".into()),
             supersedes: None,
+            // Unified agent names: no naming fact on this ledger edge.
+            name_transition: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
@@ -12764,6 +14512,8 @@ mod tests {
             create_request_id: Some("cr-lineage".into()),
             resolves_pending: Some("freshopencode-cr-lineage".into()),
             supersedes: None,
+            // Unified agent names: no naming fact on this ledger edge.
+            name_transition: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Replace(crate::BindProvenance {
                 client_instance_id: Some("client-old".into()),
                 device_id: Some("device-old".into()),
@@ -13032,6 +14782,8 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
+            // Unified agent names: no naming fact on this ledger edge.
+            name_transition: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Replace(crate::BindProvenance {
                 client_instance_id: Some("client-row".into()),
                 device_id: Some("device-row".into()),
@@ -13136,6 +14888,8 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
+            // Unified agent names: no naming fact on this ledger edge.
+            name_transition: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
@@ -13289,6 +15043,8 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
+            // Unified agent names: no naming fact on this ledger edge.
+            name_transition: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Replace(crate::BindProvenance {
                 client_instance_id: Some("client-row".into()),
                 device_id: Some("device-row".into()),
@@ -13376,6 +15132,8 @@ mod tests {
             create_request_id: Some("cr-row".into()),
             resolves_pending: None,
             supersedes: None,
+            // Unified agent names: no naming fact on this ledger edge.
+            name_transition: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Replace(crate::BindProvenance {
                 client_instance_id: Some("client-row".into()),
                 device_id: Some("device-row".into()),
@@ -13678,8 +15436,979 @@ mod tests {
         );
     }
 
+    /// The-usual SDD delta-r2 DR2-1 (REVERSAL of delta-r1's D1-1): a
+    /// user-initiated interrupt is SILENT even when the abort RPC fails. The
+    /// binding constraint "A user-initiated interrupt is silent" has NO
+    /// success qualifier — the user initiated and witnessed this turn end, so
+    /// a "needs attention" edge for the user's own action would be a false
+    /// alarm regardless of whether the abort RPC landed — and a user stop is
+    /// NOT among the enumerated unwitnessed outcomes
+    /// (finished/errored/max-turns/crashed/wedged-stuck/approval). This test
+    /// REPLACES `interrupt_with_a_failed_abort_rpc_rings_the_unified_attention_edge`,
+    /// which codified the refuted D1-1 interpretation (mint the detachment
+    /// because the local settle path is gone); do not re-invert it without the
+    /// delta-r2 ledger.
+    ///
+    /// DR5-1 (delta round 5) EXTENDS the contract to the full shape: the
+    /// silence covers only the INTERRUPT EVENT itself. The abort RPC FAILED,
+    /// so the daemon-side turn NEVER DIED — its LATER REAL natural end is a
+    /// turn end the user did not witness (the user believes the interrupt
+    /// stopped it) and MUST ring the identical unified edge. Pre-DR5-1 the
+    /// take block aborted the registered task — the ONLY observer of the
+    /// daemon-side turn's eventual idle — strangling that bell forever; the
+    /// fix takes the task WITHOUT aborting and restores it on the Err arm so
+    /// its own settle tail rings when the daemon goes idle.
+    ///
+    /// The cleared-flag property still holds: the Err arm resets
+    /// `turn_aborted` so a LATER turn's genuine settle rings, stamped fresh
+    /// on the session's monotonic turn-complete clock.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interrupt_with_a_failed_abort_rpc_is_silent() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        // The session-aware failed-abort fixture: `daemon_busy` holds the
+        // first turn deterministically LIVE (it can never settle on its own
+        // while busy — the turn task is provably live when the interrupt
+        // lands), and the per-session /abort POST answers 500 immediately —
+        // the handler deterministically takes the Err arm.
+        let http = Arc::new(SlowAbortSessionFakeHttp::new(0));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-int-silent"), None).await;
+        let placeholder = "freshopencode-req-int-silent";
+        // Hand-materialize (the FR1-2 test discipline — the session-aware
+        // fixture models the daemon-side turn lifecycle and does not mint
+        // create ids) so the send drives the durable `ses_1` directly.
+        {
+            let sessions = st.sessions.lock().await;
+            let session_arc = sessions.get(placeholder).expect("session tracked").clone();
+            drop(sessions);
+            session_arc.lock().await.real_session_id = Some("ses_1".to_string());
+        }
+        st.handle_send(send_msg(placeholder, "hello")).await;
+
+        // Interrupt promptly, while the turn task is deterministically LIVE
+        // (daemon_busy holds): the handler takes the LIVE turn task and the
+        // abort RPC fails (500).
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        st.handle_interrupt(FreshAgentInterrupt {
+            provider: AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        // INTERRUPT-EVENT SILENCE (DR2-1): no `freshAgent.turn.complete` may
+        // fire for the interrupt itself. The daemon turn is still busy (the
+        // restored drive keeps observing), so any edge inside this window
+        // could only be an interrupt-time mint, which the corrected
+        // contract forbids.
+        let mut edges = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
+            {
+                edges += 1;
+            }
+        }
+        assert_eq!(
+            edges, 0,
+            "a user-initiated interrupt is silent even when the abort RPC fails — no \
+             freshAgent.turn.complete may fire at interrupt time"
+        );
+
+        // The interrupt-time silence is total: the session's monotonic
+        // turn-complete clock is STILL UNSET — nothing minted for the
+        // interrupt event (checked here, before the natural end lands).
+        // Lock order: clone the session Arc out, drop the map guard, THEN
+        // lock the session.
+        {
+            let sessions = st.sessions.lock().await;
+            let session_arc = sessions.get(placeholder).expect("session tracked").clone();
+            drop(sessions);
+            let clock = session_arc
+                .lock()
+                .await
+                .last_turn_complete_at
+                .lock()
+                .expect("last_turn_complete_at mutex")
+                .is_none();
+            assert!(
+                clock,
+                "the silent interrupt must leave the session's turn-complete clock unset — \
+                 nothing minted an edge at interrupt time"
+            );
+        }
+
+        // DR5-1: the daemon turn's REAL natural completion MUST RING. The
+        // abort RPC failed, so the daemon-side turn kept running; the
+        // preserved (restored) observer drive polls to its natural idle
+        // (the test clears `daemon_busy` — the daemon-side turn ends) and
+        // its settle tail — with the Err arm's flag clear — rings the
+        // identical unified edge for the unwitnessed end. Bounded wait ~5s.
+        // Against pre-DR5-1 code this NEVER rings (the take block aborted
+        // the only observer).
+        http.daemon_busy.store(false, Ordering::SeqCst);
+        let first_at = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Ok(raw) => {
+                        let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                        if frame["type"] == "freshAgent.event"
+                            && frame["event"]["type"] == "freshAgent.turn.complete"
+                        {
+                            return frame["event"]["at"].as_i64().expect("numeric at");
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tokio::time::sleep(Duration::from_millis(5)).await
+                    }
+                }
+            }
+        })
+        .await
+        .expect(
+            "the daemon turn's later REAL natural end after the failed abort is an \
+             unwitnessed turn end that MUST ring (DR5-1)",
+        );
+        assert!(
+            first_at > 0,
+            "the daemon turn's recovered edge carries a finite positive monotonic `at`: {first_at}"
+        );
+
+        // The cleared-flag property (DR2-1's surviving purpose): a subsequent
+        // send's own settle must ring (the interrupt's stale flag must not
+        // swallow it) — stamped strictly monotonic AFTER the recovered first
+        // edge. Re-arm the daemon's busy state so the later drive observes
+        // genuine running activity before its idle (the fixture's busy map
+        // is the drive's only activity source), then end it.
+        http.daemon_busy.store(true, Ordering::SeqCst);
+        let poll_baseline = http.status_polls.load(Ordering::SeqCst);
+        st.handle_send(send_msg(placeholder, "second")).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while http.status_polls.load(Ordering::SeqCst) <= poll_baseline {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the later send never polled the daemon status"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        http.daemon_busy.store(false, Ordering::SeqCst);
+        let second_at = wait_for_turn_complete_at(&mut rx).await.expect(
+            "a later turn's genuine completion must not be swallowed by the stale interrupt flag",
+        );
+        assert!(
+            second_at > first_at,
+            "the later turn's edge is strictly monotonic after the recovered first edge: \
+             first={first_at} second={second_at}"
+        );
+    }
+
+    /// Wait (bounded) for the next `freshAgent.turn.complete` edge and return
+    /// its numeric `at`; `None` when none arrives inside the budget.
+    async fn wait_for_turn_complete_at(
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+    ) -> Option<i64> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                continue;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
+            {
+                return frame["event"]["at"].as_i64();
+            }
+        }
+    }
+
+    /// The-usual SDD delta-r2 DR2-1 (kept from delta-r1's bounded-mint era
+    /// under the corrected contract): interrupting a session whose turn
+    /// already ENDED (the registered task is finished — its settle rang the
+    /// natural end) must ring NO further edge even when the abort RPC fails.
+    /// Two protected properties: the earlier turn's natural edge was NOT
+    /// swallowed (it rang once, before the interrupt), and "a user-initiated
+    /// interrupt is silent" — no success qualifier — means nothing may add a
+    /// second bell for it.
     #[tokio::test]
-    async fn errored_turn_emits_no_turn_complete_but_forwards_the_error() {
+    async fn interrupt_with_a_failed_abort_rpc_after_the_turn_ended_rings_no_second_edge() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        // A short busy-poll count so the first turn settles on its own quickly;
+        // the /abort POST still answers 500 for the later interrupt.
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: Arc::new(AbortFailFakeHttp::new(2)),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-int-done"), None).await;
+        let placeholder = "freshopencode-req-int-done";
+        st.handle_send(send_msg(placeholder, "hello")).await;
+
+        // Wait for the turn's own settle edge — the natural end rang once.
+        let first_at = {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    panic!("the first turn never rang its natural settle edge");
+                }
+                let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                    continue;
+                };
+                let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                if frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "freshAgent.turn.complete"
+                {
+                    break frame["event"]["at"].as_i64().expect("numeric at");
+                }
+            }
+        };
+
+        // Deterministic finish barrier: the registered task handle (whose tail
+        // emitted the edge above) must read FINISHED before the interrupt runs,
+        // so the interrupt's take observes an already-finished task — no live
+        // turn to detach. Lock order: clone the session Arc out, drop the map
+        // guard, THEN lock the session.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let session_arc = st.sessions.lock().await.get(placeholder).cloned();
+            let finished = match session_arc {
+                Some(session_arc) => {
+                    let session = session_arc.lock().await;
+                    session
+                        .turn_task
+                        .as_ref()
+                        .is_none_or(|task| task.is_finished())
+                }
+                None => true,
+            };
+            if finished {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the turn task never reported finished"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Interrupt the ENDED session with the abort RPC failing: the
+        // interrupt must stay silent — no second bell for a turn that
+        // already rang.
+        st.handle_interrupt(FreshAgentInterrupt {
+            provider: AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        let mut second_edge: Option<serde_json::Value> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
+            {
+                second_edge = Some(frame);
+                break;
+            }
+        }
+        assert!(
+            second_edge.is_none(),
+            "a failed interrupt after the turn already ended must not mint a second edge \
+             (first edge at {first_at}): {second_edge:?}"
+        );
+    }
+
+    /// The-usual SDD delta-r2 DR2-1, reshaped for DR5-1 (delta round 5): a
+    /// turn whose natural settle rings DURING the interrupt's pending abort
+    /// RPC rings EXACTLY ONCE — its own natural edge, and the failed-abort
+    /// Err arm's DR5-1 suppressed-settle recovery mint adds NOTHING. The
+    /// DR5-1 Err arm mints ONLY when the taken task settled with the flag
+    /// set AND nothing rang in the window (the session clock unchanged since
+    /// the take); a tail that already passed its `turn_aborted` check rings
+    /// on its own and advances the clock, which is precisely the evidence
+    /// the Err arm's mint gate consumes to stay silent. Do not re-invert
+    /// this without the delta-r2 ledger.
+    ///
+    /// The mid-tail race window (a tail reading `turn_aborted` just before
+    /// the interrupt sets it — microseconds) cannot be hit deterministically;
+    /// this test injects the natural ring through the REAL mint helper at
+    /// the exact point the window covers — after the take block (proven via
+    /// the fake's `abort_started` knob, which flips only once the interrupt's
+    /// RPC leg begins) and before the Err arm runs (the slow abort's delay) —
+    /// modeling a settle tail that already passed its `turn_aborted` check
+    /// when the interrupt set the flag, whose mint an abort can no longer
+    /// un-ring.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interrupt_abort_failure_adds_no_edge_when_the_natural_settle_rings_during_the_join() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        // The slow-FAILING abort: `abort_started` flips the moment the
+        // interrupt's RPC leg begins (the take block is done — under DR5-1
+        // the take no longer aborts, so this knob is the deterministic
+        // interlock), then the POST sleeps 400ms before answering 500 — the
+        // Err arm runs only once the test has staged the raced natural ring.
+        let http = Arc::new(SlowAbortSessionFakeHttp::new(400));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-int-join"), None).await;
+        let placeholder = "freshopencode-req-int-join";
+
+        // The raced shape, built deterministically: a materialized session
+        // whose LIVE Send-kind turn task parks on a probe channel. Releasing
+        // the probe models the settle tail's COMPLETION during the pending
+        // RPC await (a finished drive observed its end); the tail's mint
+        // itself is staged below through the real mint helper, modeling a
+        // tail that already passed its `turn_aborted` check. Lock order:
+        // clone the session Arc out, drop the map guard, THEN lock the
+        // session.
+        let (probe_tx, probe_rx) = tokio::sync::oneshot::channel::<()>();
+        let clock = {
+            let sessions = st.sessions.lock().await;
+            let session_arc = sessions.get(placeholder).expect("session tracked").clone();
+            drop(sessions);
+            let mut session = session_arc.lock().await;
+            session.real_session_id = Some("ses_1".to_string());
+            session.turn_task = Some(TurnTask {
+                kind: TurnTaskKind::Send,
+                handle: tokio::spawn(async move {
+                    let _ = probe_rx.await;
+                }),
+                compact_settled_rx: None,
+                settling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            });
+            session.last_turn_complete_at.clone()
+        };
+
+        let interrupt = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_interrupt(FreshAgentInterrupt {
+                    provider: AgentProvider::Opencode,
+                    session_id: placeholder.to_string(),
+                    session_type: SessionType::Freshopencode,
+                    cwd: None,
+                })
+                .await
+            })
+        };
+
+        // Wait until the interrupt's RPC leg began: `abort_started` flips
+        // only after the take block's synchronous prefix (the flag set +
+        // the take WITHOUT an abort under DR5-1), so this is proof the
+        // interrupt holds the taken task and is parked inside the abort
+        // RPC's pending window.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !http.abort_started.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the interrupt never reached its abort RPC"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The raced NATURAL edge: a settle tail already past its
+        // `turn_aborted` check when the interrupt set the flag rings DURING
+        // the pending RPC window — the tail's own mint, which nothing can
+        // un-ring. The injection runs the real mint helper (the same
+        // clock-stamped broadcast the tail's mint segment performs).
+        mint_turn_complete_edge(&st.fresh_agent, "ses_1", &clock);
+
+        // The tail completes inside the window (a finished drive observed
+        // its end), then the abort RPC fails and the Err arm runs — with the
+        // clock ADVANCED, its suppressed-settle recovery mint must stay
+        // silent.
+        let _ = probe_tx.send(());
+        interrupt.await.expect("interrupt task");
+
+        // Exactly ONE edge total — the raced natural one. The Err arm must
+        // add NOTHING for a turn end that already rang.
+        let mut edges = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
+            {
+                edges += 1;
+            }
+        }
+        assert_eq!(
+            edges, 1,
+            "the raced natural settle rang once; the failed-interrupt Err arm's recovery mint \
+             must add no second edge for a turn end that already rang"
+        );
+    }
+
+    /// The-usual SDD delta round 5 DR5-1 (reshaping delta-r2 DR2-1's
+    /// exactly-one-edge expectation, which reshaped focused-r2 FR2-3): a
+    /// LATER send can legitimately start and settle during a slow/failed
+    /// abort (the interrupt handler releases the session lock across the
+    /// abort-RPC await). Under DR5-1 the earlier turn was only TAKEN, not
+    /// aborted — and the abort FAILED, so its daemon-side turn never died.
+    /// When the daemon goes idle BOTH real drives observe the end and BOTH
+    /// settles ring (the later send's dispatch-clear of `turn_aborted`
+    /// un-suppresses the earlier drive's tail): the earlier turn's later
+    /// REAL natural end after a failed abort is an unwitnessed turn end
+    /// that MUST ring — the adjudicated contract — and the later turn's end
+    /// rings its own. The interrupt EVENT itself and the Err arm add
+    /// NOTHING: the occupied restore slot is the documented DR5-1 corner
+    /// (the later send installed its own task during the RPC await, so the
+    /// earlier task is never put back — its end still rings through its own
+    /// settle tail, but the slot's abort-handle is lost), and the Err arm's
+    /// recovery mint stays silent because both natural rings advanced the
+    /// session clock inside the window.
+    ///
+    /// Built deterministically on the session-aware slow-abort fixture: the
+    /// earlier turn is a REAL send drive parked on daemon-busy status polls;
+    /// the fake's `abort_started` knob proves the interrupt's take block
+    /// finished (the take happened, the session lock released) and the RPC
+    /// leg began; a REAL second send then starts DURING the pending abort
+    /// RPC, and the daemon-side turn goes idle (the test clears
+    /// `daemon_busy`) so BOTH drives settle legitimately. Exactly TWO edges
+    /// total — one per real turn end, none from the Err arm.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interrupt_abort_failure_rings_both_real_turn_ends_and_the_err_arm_adds_nothing() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let http = Arc::new(SlowAbortSessionFakeHttp::new(400));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-int-fr23"), None).await;
+        let placeholder = "freshopencode-req-int-fr23";
+        // Hand-materialize (the FR1-2 test discipline) so both sends drive
+        // the durable id directly.
+        {
+            let sessions = st.sessions.lock().await;
+            let session_arc = sessions.get(placeholder).expect("session tracked").clone();
+            drop(sessions);
+            session_arc.lock().await.real_session_id = Some("ses_1".to_string());
+        }
+
+        // The EARLIER turn: a REAL send drive, parked on daemon-busy status
+        // polls (daemon_busy holds — the drive can never settle on its own,
+        // so it is deterministically still live when the interrupt takes it).
+        st.handle_send(send_msg(placeholder, "first")).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let interrupt = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_interrupt(FreshAgentInterrupt {
+                    provider: AgentProvider::Opencode,
+                    session_id: placeholder.to_string(),
+                    session_type: SessionType::Freshopencode,
+                    cwd: None,
+                })
+                .await
+            })
+        };
+
+        // Deterministic wait: the fake's `abort_started` knob flips the
+        // moment the interrupt's take block finished and the RPC leg began —
+        // the earlier drive is necessarily still live at that point (it
+        // cannot settle while daemon_busy holds).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !http.abort_started.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the interrupt never reached its abort RPC"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The LATER send: issued DURING the pending (slow, failing) abort
+        // RPC, exactly as the finding describes — the handler released the
+        // session lock across the await. Its dispatch clears the interrupt's
+        // stale `turn_aborted` flag, which is exactly what un-suppresses the
+        // earlier drive's settle tail below.
+        st.handle_send(send_msg(placeholder, "second")).await;
+
+        // Deterministic busy→idle: wait for the later send's first status
+        // poll (observed daemon activity, while daemon_busy still holds),
+        // then clear daemon_busy — the next polls read idle and BOTH drives
+        // settle legitimately, each ringing its own natural edge and
+        // advancing the session clock DURING the abort RPC's pending
+        // window.
+        let poll_baseline = http.status_polls.load(Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while http.status_polls.load(Ordering::SeqCst) <= poll_baseline {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the later send never polled the daemon status"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        http.daemon_busy.store(false, Ordering::SeqCst);
+
+        // BOTH natural rings land inside the pending window (bounded wait):
+        // the earlier turn's recovered end AND the later turn's own end —
+        // two identical unified edges, one per real unwitnessed turn end.
+        let mut edges_before_err = 0;
+        let mut ats: Vec<i64> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while edges_before_err < 2 {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
+            {
+                edges_before_err += 1;
+                ats.push(frame["event"]["at"].as_i64().expect("numeric at"));
+            }
+        }
+        assert_eq!(
+            edges_before_err, 2,
+            "both real turn ends ring during the pending abort window: the earlier turn's \
+             later REAL natural end after the failed abort (the DR5-1 adjudication) and the \
+             later turn's own end"
+        );
+        assert_eq!(ats.len(), 2);
+        assert!(
+            ats[1] > ats[0],
+            "the two edges share the session's strictly-monotonic clock: {ats:?}"
+        );
+
+        // The abort RPC fails after its delay; the Err arm runs and adds
+        // NOTHING: its recovery mint sees the clock ADVANCED (both natural
+        // rings stamped it inside the window) and stays silent, and the
+        // occupied restore slot (the later send's task) is the documented
+        // corner.
+        interrupt.await.expect("interrupt task");
+
+        let mut extra_edges = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
+            {
+                extra_edges += 1;
+            }
+        }
+        assert_eq!(
+            extra_edges, 0,
+            "the failed-interrupt Err arm adds no edge once both real turn ends already rang"
+        );
+    }
+
+    /// The-usual SDD delta round 5 DR5-1 (reshaping delta-r2 DR2-1's
+    /// `a_suppressed_settle_during_the_interrupt_take_stays_silent_when_the_abort_fails`,
+    /// which reshaped focused-r2 FR2-2a's flag-REACTIVE silence): the Err
+    /// arm's suppressed-settle recovery mint. A REAL opencode drive never
+    /// ends as a reaction to `turn_aborted` — it ends by OBSERVING the
+    /// daemon (idle, error, timeout). A drive that observes its end and
+    /// settles DURING the pending (failed) abort RPC reads the interrupt's
+    /// flag TRUE at settle time, so its own tail is suppressed — but the
+    /// daemon turn's end was REAL and unwitnessed (the abort FAILED; the
+    /// user believes the interrupt stopped it), so the Err arm mints
+    /// EXACTLY ONE edge through the shared `mint_turn_complete_edge`.
+    ///
+    /// Distinction from the DR2-1-banned fabricated edge: the banned mint
+    /// rang for a turn whose observer the take block had DESTROYED (no
+    /// completion was ever observed — a fabricated edge at interrupt time).
+    /// THIS mint rings at the Err arm, only for a task that provably
+    /// FINISHED during the RPC await (a finished drive observed its end)
+    /// and only when NOTHING else rang in the window (the session clock
+    /// unchanged since the take) — one bell for one real observed turn end.
+    /// The interrupt EVENT itself stays silent (pinned by
+    /// `interrupt_with_a_failed_abort_rpc_is_silent`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_settle_suppressed_during_the_failed_abort_rpc_await_rings_once_via_the_err_arm() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        // The slow-FAILING abort: `abort_started` flips once the interrupt's
+        // RPC leg begins (the take is done — under DR5-1 the take no longer
+        // aborts), then the POST sleeps 400ms before answering 500 — the
+        // suppressed settle lands deterministically INSIDE the pending
+        // window, before the Err arm runs.
+        let http = Arc::new(SlowAbortSessionFakeHttp::new(400));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-int-fr22a"), None).await;
+        let placeholder = "freshopencode-req-int-fr22a";
+
+        // The suppressed-settle shape, built deterministically: a LIVE
+        // Send-kind task parked on a probe channel. Releasing the probe
+        // after `abort_started` flips models a real drive that OBSERVED the
+        // daemon turn's end and settled inside the RPC window — a finished
+        // drive whose own tail was suppressed by the interrupt's flag (the
+        // raw parked future never mints; the suppression is what the flag
+        // would have done to the real tail). Lock order: clone the session
+        // Arc out, drop the map guard, THEN lock the session.
+        let (probe_tx, probe_rx) = tokio::sync::oneshot::channel::<()>();
+        {
+            let sessions = st.sessions.lock().await;
+            let session_arc = sessions.get(placeholder).expect("session tracked").clone();
+            drop(sessions);
+            let mut session = session_arc.lock().await;
+            session.real_session_id = Some("ses_1".to_string());
+            session.turn_task = Some(TurnTask {
+                kind: TurnTaskKind::Send,
+                handle: tokio::spawn(async move {
+                    let _ = probe_rx.await;
+                }),
+                compact_settled_rx: None,
+                settling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            });
+        }
+
+        let interrupt = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_interrupt(FreshAgentInterrupt {
+                    provider: AgentProvider::Opencode,
+                    session_id: placeholder.to_string(),
+                    session_type: SessionType::Freshopencode,
+                    cwd: None,
+                })
+                .await
+            })
+        };
+
+        // Deterministic wait: the RPC leg began (the take block is done),
+        // and the taken task is deterministically still live at that point.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !http.abort_started.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the interrupt never reached its abort RPC"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The suppressed settle: the drive observes its end and finishes
+        // INSIDE the pending RPC window — its own tail rings nothing (the
+        // flag holds), and the Err arm's recovery mint must ring exactly
+        // once for it.
+        let _ = probe_tx.send(());
+        interrupt.await.expect("interrupt task");
+
+        // EXACTLY ONE edge — the Err arm's recovery mint for the real,
+        // observed, unwitnessed turn end (never two: the interrupted event
+        // itself is silent, and nothing else rang in the window).
+        let mut edges = 0;
+        let mut saw_at: Option<i64> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
+            {
+                edges += 1;
+                saw_at = frame["event"]["at"].as_i64();
+            }
+        }
+        assert_eq!(
+            edges, 1,
+            "a settle suppressed by the interrupt's flag during the failed-abort RPC window \
+             rings EXACTLY ONCE via the Err arm's recovery mint"
+        );
+        let at = saw_at.expect("the recovery mint carries an at");
+        assert!(
+            at > 0,
+            "the recovery mint's `at` is a positive monotonic stamp: {at}"
+        );
+
+        // The mint stamped the session's shared clock (the strictly-
+        // monotonic timeline the next edge must follow).
+        {
+            let sessions = st.sessions.lock().await;
+            let session_arc = sessions.get(placeholder).expect("session tracked").clone();
+            drop(sessions);
+            let stamped = *session_arc
+                .lock()
+                .await
+                .last_turn_complete_at
+                .lock()
+                .expect("last_turn_complete_at mutex");
+            assert_eq!(
+                stamped,
+                Some(at),
+                "the recovery mint stamped the session's shared monotonic clock"
+            );
+        }
+    }
+
+    /// The-usual SDD delta round 5 DR5-1 (the Err arm's RESTORE branch): a
+    /// turn still RUNNING when the abort RPC fails is the daemon turn that
+    /// NEVER DIED — the interrupt must put its observer task BACK so the
+    /// later real natural end rings. The take (no abort) leaves the drive
+    /// alive; the Err arm clears the flag and restores the taken task into
+    /// the (empty) slot; when the daemon then goes idle the restored
+    /// drive's own settle tail rings the identical unified edge. Against
+    /// pre-DR5-1 code the take block aborted the observer, so the slot
+    /// stays empty and the daemon's idle NEVER rings.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_abort_restores_the_live_turn_task_so_its_later_natural_settle_rings() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        // The session-aware slow-abort fixture: `daemon_busy` holds the
+        // drive deterministically live (it can never settle on its own while
+        // busy), `abort_started` is the take-done interlock, and the /abort
+        // POST fails after its delay.
+        let http = Arc::new(SlowAbortSessionFakeHttp::new(200));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-int-restore"), None).await;
+        let placeholder = "freshopencode-req-int-restore";
+        // Hand-materialize (the FR1-2 test discipline) so the send drives
+        // the durable id directly.
+        {
+            let sessions = st.sessions.lock().await;
+            let session_arc = sessions.get(placeholder).expect("session tracked").clone();
+            drop(sessions);
+            session_arc.lock().await.real_session_id = Some("ses_1".to_string());
+        }
+
+        // The REAL send drive, parked on daemon-busy status polls —
+        // deterministically still live when the interrupt takes it and
+        // when the Err arm runs.
+        st.handle_send(send_msg(placeholder, "first")).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        st.handle_interrupt(FreshAgentInterrupt {
+            provider: AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        // The RESTORE pin: after the interrupt answered (the Err arm ran —
+        // the RPC failed after its delay), the taken task is BACK in the
+        // session's slot, still live. Lock order: clone the session Arc
+        // out, drop the map guard, THEN lock the session.
+        {
+            let sessions = st.sessions.lock().await;
+            let session_arc = sessions.get(placeholder).expect("session tracked").clone();
+            drop(sessions);
+            let session = session_arc.lock().await;
+            let task = session
+                .turn_task
+                .as_ref()
+                .expect("the Err arm restored the taken live turn task");
+            assert!(
+                !task.is_finished(),
+                "the restored task is the still-running observer drive"
+            );
+        }
+
+        // The daemon-side turn ends for real: clear `daemon_busy` — the
+        // restored drive's next status polls observe idle, its settle tail
+        // runs with the Err arm's flag CLEAR, and the unwitnessed end rings
+        // EXACTLY ONCE. Against pre-DR5-1 code the observer was aborted at
+        // take and this NEVER rings.
+        http.daemon_busy.store(false, Ordering::SeqCst);
+        let first_at = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Ok(raw) => {
+                        let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                        if frame["type"] == "freshAgent.event"
+                            && frame["event"]["type"] == "freshAgent.turn.complete"
+                        {
+                            return frame["event"]["at"].as_i64().expect("numeric at");
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tokio::time::sleep(Duration::from_millis(5)).await
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the restored observer's natural settle rings the daemon turn's real end (DR5-1)");
+        assert!(
+            first_at > 0,
+            "the restored settle's edge carries a positive monotonic `at`: {first_at}"
+        );
+
+        // Exactly-once: a further 300ms window hears NO second edge.
+        let mut extra_edges = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
+            {
+                extra_edges += 1;
+            }
+        }
+        assert_eq!(
+            extra_edges, 0,
+            "the restored observer's natural end rings exactly once — no Err-arm mint on top"
+        );
+    }
+
+    #[tokio::test]
+    async fn errored_turn_emits_the_error_and_the_unified_attention_edge() {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
         let deps = ServeDeps {
@@ -13722,7 +16451,7 @@ mod tests {
         });
 
         let mut saw_error = false;
-        let mut saw_complete = false;
+        let mut complete_at: Vec<i64> = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -13741,7 +16470,13 @@ mod tests {
                     assert_eq!(frame["event"]["message"], "boom");
                     saw_error = true;
                 }
-                Some("freshAgent.turn.complete") => saw_complete = true,
+                Some("freshAgent.turn.complete") => {
+                    // Unified signal: an errored turn end the user didn't witness
+                    // rings the SAME edge as a clean one — the pane resolves, the
+                    // at is monotonic.
+                    complete_at.push(frame["event"]["at"].as_i64().expect("numeric at"));
+                    break; // the turn's terminal frame; stop draining.
+                }
                 _ => {}
             }
         }
@@ -13750,9 +16485,93 @@ mod tests {
             saw_error,
             "the session.error SSE event must be forwarded as freshAgent.error"
         );
+        assert_eq!(
+            complete_at.len(),
+            1,
+            "an errored turn must emit the unified attention edge"
+        );
         assert!(
-            !saw_complete,
-            "an errored turn must never emit turn.complete"
+            complete_at[0] > 0,
+            "at must be a positive monotonic timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_settle_emits_the_unified_attention_edge() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: Arc::new(PromptFailFakeHttp::new()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-fail"), None).await;
+        let placeholder = "freshopencode-req-fail";
+        st.handle_send(send_msg(placeholder, "hello")).await;
+
+        // The prompt POST answers 500, so `run_turn` fails BEFORE any idle await
+        // and the settle tail runs with succeeded=false — the failed-settle leg
+        // of the unified signal (prompt-POST failure; IdleTimeout and
+        // SidecarLost settle through this same tail).
+        let mut saw_idle = false;
+        let mut complete_at: Vec<i64> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] != "freshAgent.event" {
+                continue;
+            }
+            match frame["event"]["type"].as_str() {
+                Some("freshAgent.session.snapshot") => {
+                    if let Some("idle") = frame["event"]["status"].as_str() {
+                        saw_idle = true;
+                    }
+                }
+                Some("freshAgent.turn.complete") => {
+                    // Unified signal: a turn that died mid-drive still ENDED —
+                    // the user may not have watched it, so it rings the SAME
+                    // edge as a clean finish, with a monotonic at.
+                    complete_at.push(frame["event"]["at"].as_i64().expect("numeric at"));
+                    break; // the turn's terminal frame; stop draining.
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            saw_idle,
+            "a failed settle must still broadcast the idle snapshot"
+        );
+        assert_eq!(
+            complete_at.len(),
+            1,
+            "a failed settle must emit the unified attention edge"
+        );
+        assert!(
+            complete_at[0] > 0,
+            "at must be a positive monotonic timestamp"
         );
     }
 
@@ -14324,104 +17143,25 @@ mod tests {
         (st, http, rx)
     }
 
-    /// The shared core behind every gated-compact harness variant: builds the
-    /// fake-HTTP serve manager with the passed config delta. `request_timeout`
-    /// overrides the serve request timeout ONLY when provided (the
-    /// delta-review round 6 extension timeout test needs a short one; every
-    /// other caller keeps the 30s default).
-    async fn compact_state_gated_cfg(
-        config_body: &str,
-        summarize_outcome: SummarizeOutcome,
-        summarize_gate: Option<Arc<tokio::sync::Notify>>,
-        config_gate: Option<Arc<tokio::sync::Notify>>,
-        request_timeout: Option<Duration>,
-    ) -> (
-        FreshOpencodeState,
-        Arc<CompactFakeHttp>,
-        tokio::sync::broadcast::Receiver<String>,
-        Arc<tokio::sync::broadcast::Sender<String>>,
-    ) {
-        let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
-        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx.clone()));
-        let http = Arc::new(CompactFakeHttp::new(
-            config_body.as_bytes().to_vec(),
-            summarize_outcome,
-            tx.subscribe(),
-            summarize_gate,
-            None,
-            config_gate,
-        ));
-        let deps = ServeDeps {
-            spawner: Arc::new(TrackedSpawner {
-                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            }),
-            http: http.clone(),
-            ports: Arc::new(FakeAllocator),
-            events: Arc::new(NoopEventSource),
-        };
-        let config = ServeConfig {
-            idle_poll_interval: Duration::from_millis(15),
-            request_timeout: request_timeout
-                .unwrap_or_else(|| ServeConfig::default().request_timeout),
-            ..ServeConfig::default()
-        };
-        let manager = OpencodeServeManager::new(deps, config);
-        manager
-            .ensure_started()
-            .await
-            .expect("healthy fake serve starts");
-        fresh_agent.set_manager_for_test(manager).await;
-        (FreshOpencodeState::new(fresh_agent), http, rx, Arc::new(tx))
-    }
-
-    /// [`compact_state_gated`]'s bus-sender variant (send-during-compact
-    /// queue, Task 3): ALSO returns the broadcast bus's sender. The
-    /// FIFO/order tests subscribe a SECOND, untouched receiver from it
-    /// BEFORE any handler runs — a broadcast channel buffers each
-    /// receiver INDEPENDENTLY, so that receiver keeps the run's TOTAL
-    /// emission order even while the first receiver's
-    /// `frames_until`/`drain_frames` calls consume their own buffer
-    /// (consumed frames are gone; the round-3 review's finding).
-    async fn compact_state_gated_tx(
-        config_body: &str,
-        summarize_outcome: SummarizeOutcome,
-        summarize_gate: Option<Arc<tokio::sync::Notify>>,
-        config_gate: Option<Arc<tokio::sync::Notify>>,
-    ) -> (
-        FreshOpencodeState,
-        Arc<CompactFakeHttp>,
-        tokio::sync::broadcast::Receiver<String>,
-        Arc<tokio::sync::broadcast::Sender<String>>,
-    ) {
-        compact_state_gated_cfg(
-            config_body,
-            summarize_outcome,
-            summarize_gate,
-            config_gate,
-            None,
-        )
-        .await
-    }
-
     /// Insert a directly-materialized session (no send drove it) with the given model.
+    ///
+    /// Task 4 fixture fidelity: a materialized session carries a LIVE
+    /// serve-SSE bridge in production (`bindServeStream` fires at
+    /// materialization), so the fixture spawns one through the same
+    /// [`FreshOpencodeState::spawn_serve_bridge`] the materialization path
+    /// uses — the daemon-loss watcher (now armed by `handle_compact`)
+    /// otherwise "revives" the bridgeless fixture at its arming-time level
+    /// pass and pushes idle-snapshot frames these tests never modeled.
     async fn insert_compact_session(st: &FreshOpencodeState, id: &str, model: Option<&str>) {
         let mut session =
             OpencodeSession::new(id.to_string(), None, model.map(str::to_string), None);
         session.real_session_id = Some(id.to_string());
+        let manager = st.fresh_agent.ensure_manager().await;
+        st.install_serve_bridge(&manager, &mut session, id).await;
         st.sessions
             .lock()
             .await
             .insert(id.to_string(), Arc::new(TokioMutex::new(session)));
-    }
-
-    /// The recorded-body needle probe: `RecordedRequest.body` is an
-    /// `Option<Value>` with NO Display, so assert on the serialized JSON
-    /// body as a whole (`None` serializes to `null` — the same parse
-    /// idiom the fake itself uses at its `body_value`).
-    fn r_body_contains(r: &RecordedRequest, needle: &str) -> bool {
-        serde_json::to_string(&r.body)
-            .unwrap_or_default()
-            .contains(needle)
     }
 
     /// Drain every buffered bus frame in arrival order (full parsed payloads).
@@ -16545,7 +19285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_serve_error_broadcasts_idle_and_a_loud_error_without_a_chime() {
+    async fn compact_serve_error_broadcasts_idle_a_loud_error_and_the_unified_chime() {
         let (st, http, mut rx) =
             compact_state(r#"{"model":null}"#, SummarizeOutcome::Answered500).await;
         insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
@@ -16553,7 +19293,8 @@ mod tests {
         st.handle_compact(compact_msg("ses_1")).await;
 
         // The failure settles on the detached drive (D1-F1): the terminal frame
-        // is the loud error (idle precedes it inside the settle tail).
+        // is the loud error (idle — and now the unified chime — precede it
+        // inside the settle tail).
         let frames = frames_until(&mut rx, |f| is_event(f, "freshAgent.error", None)).await;
         assert_eq!(http.summarize_requests().len(), 1, "the POST did land");
         assert!(
@@ -16583,12 +19324,15 @@ mod tests {
                 .contains("summarize exploded"),
             "the serve error text crosses the wire: {error_frame}"
         );
-        assert!(
-            !frames
-                .iter()
-                .any(|f| is_event(f, "freshAgent.turn.complete", None)),
-            "a serve error never fabricates a completion: {frames:?}"
-        );
+        // Unified signal: a compact that died on a serve error still ENDED a
+        // turn the user may not have watched — the SAME edge rings (before the
+        // loud error, inside the settle tail), with a monotonic at.
+        let chime = frames
+            .iter()
+            .find(|f| is_event(f, "freshAgent.turn.complete", None))
+            .expect("a failed settle must emit the unified attention edge");
+        let at = chime["event"]["at"].as_i64().expect("numeric at");
+        assert!(at > 0, "at must be a positive monotonic timestamp: {chime}");
     }
 
     // ── D1-F1: compact is turn-scoped — busy refusal + kill/interrupt ──────
@@ -16607,47 +19351,6 @@ mod tests {
         })
         .await
         .expect("the summarize POST lands within the budget");
-    }
-
-    /// Wait (bounded) until the fake has recorded a `prompt_async` POST
-    /// whose body contains `text` — the send-during-compact drain tests'
-    /// "the queued send actually POSTed" witness. Recording happens at
-    /// request ARRIVAL for every request (the same record-then-park
-    /// split the summarize arm uses), so a POST parked on the one-shot
-    /// prompt gate is still observable here. The POSTs happen inside
-    /// SPAWNED drive tasks — never assert them against a fixed sleep.
-    async fn await_abort_posted(http: &Arc<CompactFakeHttp>) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if http
-                    .recorded()
-                    .iter()
-                    .any(|r| r.method == "POST" && r.url.contains("/abort"))
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("the abort POST lands within the budget"));
-    }
-
-    async fn await_prompt_posted(http: &Arc<CompactFakeHttp>, text: &str) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if http
-                    .recorded()
-                    .iter()
-                    .any(|r| r.url.contains("prompt_async") && r_body_contains(r, text))
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("the prompt POST containing {text:?} lands within the budget"));
     }
 
     /// D1-F1(a): the composer stays interactive while a session is busy, so a
@@ -16794,230 +19497,6 @@ mod tests {
         );
     }
 
-    /// send-during-compact queue (Task 4): a `freshAgent.kill` (pane close/
-    /// retire) DROPS the queued sends under the phase-3 session lock —
-    /// atomic with `killed` — with one structured WARN per dropped entry
-    /// (a message must never silently disappear), and the dropped message
-    /// NEVER reaches the daemon (the drain's killed gate and the decrement
-    /// sites' self-gating spawns are the backstops for a drain mid-drive
-    /// racing the drop).
-    #[tokio::test]
-    async fn kill_with_a_queued_send_drops_it_with_a_warn_and_it_never_posts() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q5", Some("prov/model")).await;
-        let session_arc = st.sessions.lock().await.get("ses_q5").cloned().unwrap();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q5")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q5", "must die with the pane")),
-        )
-        .await;
-        assert!(
-            !session_arc.lock().await.pending_sends.is_empty(),
-            "fixture: the send queued behind the parked compact"
-        );
-
-        let (events, _guard) = info_capture::capture();
-
-        // The kill — the same inline FreshAgentKill literal the
-        // kill-mid-compact test above uses.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            st.handle_kill(FreshAgentKill {
-                observed_epoch: None,
-                observed_generation: None,
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q5".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            }),
-        )
-        .await
-        .expect("kill completes");
-
-        // (1) The queued message is gone and never POSTs (causally safe: the
-        // queue was dropped under the phase-3 lock; the drain's killed gate
-        // and the decrement sites' self-gating spawns never drive).
-        assert!(
-            !http
-                .recorded()
-                .iter()
-                .any(|r| r.url.contains("prompt_async")
-                    && r_body_contains(r, "must die with the pane")),
-            "kill drops the queue — the message must never reach the daemon"
-        );
-        assert!(
-            session_arc.lock().await.pending_sends.is_empty(),
-            "the drop emptied the queue"
-        );
-        // (2) The drop is observable: one WARN naming the dropped request
-        // (message + the structured request_id field).
-        let captured = events.lock().unwrap();
-        assert!(
-            captured
-                .iter()
-                .any(|e| e.message.contains("fresh_agent_send_dropped_on_kill")
-                    && format!("{:?}", e.fields).contains("req-must die with the pane")),
-            "every dropped entry is WARNed with its request id: {captured:?}"
-        );
-    }
-
-    /// send-during-compact queue (Task 4, the stranding heal — the round-2
-    /// review's finding): the kill's DURABLE_CLOSE_FAILED arm decrements
-    /// `close_pending` with `killed` NEVER set ("the session is resumable
-    /// exactly as if the kill never ran"). A compact that settles inside
-    /// the kill's awaited-close window parks its settle-tail drain behind
-    /// `close_pending > 0` — the drain returns. The decrement site's
-    /// POSITIVE drain re-trigger must heal it: the queued send drains with
-    /// NO further input from the test, no matter how long the close took.
-    #[tokio::test]
-    async fn a_queued_send_survives_a_clean_failed_kill_and_drains_after_the_close_gate_releases() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, mut rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
-        st.set_identity_sink(fake.clone());
-        insert_compact_session(&st, "ses_q6", Some("prov/model")).await;
-        let session_arc = st.sessions.lock().await.get("ses_q6").cloned().unwrap();
-
-        // 1. Park the compact (the standard gated rig), queue one send.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q6")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q6", "the stranded heal")),
-        )
-        .await;
-        assert!(
-            !session_arc.lock().await.pending_sends.is_empty(),
-            "fixture: the send queued behind the parked compact"
-        );
-
-        // 2. The kill whose durable close parks, then fails CLEAN (the
-        // minimal fake-side knob scripts the park-then-failure: no existing
-        // knob composes a park window with the Clean failure class —
-        // `set_fail_writes` answers immediately with no park window, and
-        // the retire stall parks but answers `Ok`, the SUCCESS arm).
-        let close_fail = fake.arm_retire_fail_park("opencode", "ses_q6");
-        let st2 = st.clone();
-        let mut kill = tokio::spawn(async move {
-            st2.handle_kill(FreshAgentKill {
-                observed_epoch: None,
-                observed_generation: None,
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q6".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            })
-            .await;
-        });
-        // The kill is deterministically inside its AWAITED durable close
-        // (the enumeration gate armed): the knob's `entered` fired when
-        // the batch call parked its answer.
-        let mut entered = false;
-        for _ in 0..100 {
-            if close_fail.entered.try_recv().is_ok() {
-                entered = true;
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(entered, "the kill parked inside its awaited durable close");
-        assert_eq!(
-            session_arc.lock().await.close_pending,
-            1,
-            "the kill's enumeration gate is armed while the close parks"
-        );
-
-        // 3. Release the summarize gate DURING the awaited-close window: the
-        // compact settles; its settle-tail drain spawns, observes
-        // `close_pending > 0`, and returns (the stranded leg).
-        summarize_gate.notify_waiters();
-        let _ = frames_until(&mut rx, |f| is_event(f, "freshAgent.turn.complete", None)).await;
-        // The settle tail emits its terminal frames and then spawns the
-        // drain in ONE synchronous stretch (no await between the
-        // turn.complete broadcast and the spawn), so on this current-thread
-        // runtime the drain IS spawned by the time frames_until returns —
-        // but the spawned task still needs a scheduler round to RUN and
-        // observe the armed gate: yield until it has returned.
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            !session_arc.lock().await.pending_sends.is_empty(),
-            "the settle-tail drain returned at the armed gate — the send is stranded"
-        );
-
-        // 4. The parked close answers CLEAN FAILURE: the kill completes with
-        // FreshAgentKilled{success:false, DURABLE_CLOSE_FAILED} (the
-        // pre-existing broadcast), `killed` stays false, and
-        // `close_pending` returns to 0 — the decrement site.
-        close_fail
-            .release
-            .send(())
-            .expect("release the parked close failure");
-        tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
-            .await
-            .expect("the kill completes")
-            .expect("kill task completed");
-
-        // THE HEAL: the queued prompt POSTs with NO further input from the
-        // test — the decrement site's drain_detached fired.
-        await_prompt_posted(&http, "the stranded heal").await;
-
-        // The kill answered failure and the session is resumable exactly as
-        // if the kill never ran.
-        let frames = drain_frames(&mut rx);
-        let killed_frame = frames
-            .iter()
-            .find(|f| f["type"] == "freshAgent.killed")
-            .expect("the kill answers freshAgent.killed");
-        assert_eq!(
-            killed_frame["success"], false,
-            "a Clean-failed durable close reports success:false: {killed_frame}"
-        );
-        assert_eq!(
-            killed_frame["code"], "DURABLE_CLOSE_FAILED",
-            "the failure class is the clean close failure: {killed_frame}"
-        );
-        assert!(
-            !session_arc.lock().await.killed.load(Ordering::SeqCst),
-            "a Clean-failed close must never mark the session killed"
-        );
-        assert_eq!(
-            session_arc.lock().await.close_pending,
-            0,
-            "the enumeration gate released"
-        );
-        assert!(
-            session_arc.lock().await.pending_sends.is_empty(),
-            "the healed drain emptied the queue"
-        );
-    }
-
     /// D1-F1(b), symmetric interrupt case: `freshAgent.interrupt` mid-compact
     /// sets `turn_aborted` BEFORE aborting the registered task and issues the
     /// best-effort serve abort — the pane hears the interrupt's idle and NEVER
@@ -17080,3122 +19559,6 @@ mod tests {
                 .unwrap_or(true),
             "the interrupt took + aborted the compact's registered task"
         );
-    }
-
-    /// The composer stays interactive while a session is busy, so a send CAN
-    /// arrive mid-compact. The send is QUEUED (FIFO, on the session's
-    /// `pending_sends`) instead of refused — the user's typed message is never
-    /// lost — with the client contract's immediate `freshAgent.send.accepted`
-    /// (the original requestId) and a structured WARN as the ONLY queue-time
-    /// side effects: no prompt POST fires while the compact is parked, the
-    /// compact's driving task stays the session's registered `turn_task`
-    /// (never stolen), and a later kill still aborts it without a fabricated
-    /// `freshAgent.turn.complete` (the kill also drops the queued entry).
-    #[tokio::test]
-    async fn send_during_an_in_flight_compact_is_queued_accepted_and_leaves_the_compact_owned() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, mut rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q1", Some("prov/model")).await;
-        // The compact drive: parked summarize = deterministic in-flight window.
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q1")),
-        )
-        .await
-        .expect("handle_compact returns after registering the detached drive");
-        await_summarize_posted(&http).await;
-
-        // WARN capture: the crate's real facility (user precedent :6807-6851).
-        let (events, _guard) = info_capture::capture();
-
-        // THE SEND — arrives while the compact drive is in flight.
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q1", "queued text")),
-        )
-        .await
-        .expect("handle_send queues inline (no refusal path)");
-
-        // (1) The client contract: immediate `freshAgent.send.accepted` with the
-        // original requestId (send_msg mints request_id = Some("req-queued text")).
-        // frames_until stops at the FIRST predicate match — one call pins the
-        // single expected acceptance.
-        let frames = frames_until(&mut rx, |f| {
-            f["type"] == "freshAgent.send.accepted" && f["requestId"] == "req-queued text"
-        })
-        .await;
-        assert!(
-            !frames.is_empty(),
-            "accepted carries the send's original requestId"
-        );
-
-        // (2) NO refusal: the D2-F1 nested INTERNAL_ERROR broadcast is gone.
-        assert!(
-            !drain_frames(&mut rx)
-                .iter()
-                .any(|f| is_event(f, "freshAgent.error", None)
-                    && f["event"]["code"] == "INTERNAL_ERROR"),
-            "the refusal must not fire — the send is queued"
-        );
-
-        // (3) NO prompt POST left the building while the compact is parked.
-        assert!(
-            !http
-                .recorded()
-                .iter()
-                .any(|r| r.url.contains("prompt_async") && r_body_contains(r, "queued text")),
-            "the queued send must NOT POST while the compact is in flight"
-        );
-
-        // (4) The compact's turn_task is untouched (the original test's
-        // ownership invariant, kept) and the send is parked FIFO.
-        {
-            let session_arc = st
-                .sessions
-                .lock()
-                .await
-                .get("ses_q1")
-                .cloned()
-                .expect("session present");
-            let session = session_arc.lock().await;
-            assert!(
-                session
-                    .turn_task
-                    .as_ref()
-                    .is_some_and(|t| t.kind == TurnTaskKind::Compact && !t.is_finished()),
-                "the compact still owns the session's turn_task"
-            );
-            assert_eq!(
-                session.pending_sends.len(),
-                1,
-                "the send is parked in the FIFO queue"
-            );
-        }
-
-        // (5) The structured WARN named the queueing (message + field).
-        {
-            let captured = events.lock().unwrap();
-            assert!(
-                captured
-                    .iter()
-                    .any(|e| e.message.contains("fresh_agent_send_queued_behind_compact")),
-                "queueing is observable in the structured log"
-            );
-        }
-
-        // (6) The kill tail of the replaced test stays: a kill mid-compact
-        // aborts the compact with no fabricated freshAgent.turn.complete and
-        // lands freshAgent.killed (kill also drops the queue — Task 4 adds the
-        // dropped-entry WARN).
-        let session_arc = st
-            .sessions
-            .lock()
-            .await
-            .get("ses_q1")
-            .cloned()
-            .expect("session present before the kill");
-        st.handle_kill(FreshAgentKill {
-            observed_epoch: None,
-            observed_generation: None,
-            provider: AgentProvider::Opencode,
-            session_id: "ses_q1".to_string(),
-            session_type: SessionType::Freshopencode,
-            cwd: None,
-        })
-        .await;
-        summarize_gate.notify_waiters();
-        tokio::time::sleep(Duration::from_millis(50)).await; // settle window
-
-        let frames = drain_frames(&mut rx);
-        assert!(
-            frames.iter().any(|f| f["type"] == "freshAgent.killed"),
-            "the kill frame lands: {frames:?}"
-        );
-        assert!(
-            !frames
-                .iter()
-                .any(|f| is_event(f, "freshAgent.turn.complete", None)),
-            "the aborted compact never fabricates a turn-complete: {frames:?}"
-        );
-        assert!(
-            session_arc
-                .lock()
-                .await
-                .turn_task
-                .as_ref()
-                .map(|t| t.is_finished())
-                .unwrap_or(true),
-            "the kill took + aborted the compact's registered task"
-        );
-    }
-
-    // ── send-during-compact queue: the drain (Task 3) ─────────────────────
-
-    /// The drain's FIFO + one-at-a-time + emission-order contract, end to
-    /// end. Two sends queued behind a parked compact; the release drains
-    /// them strictly one per settle tail: the compact's trailing `idle`
-    /// precedes the first send's `running`, the first send's trailing
-    /// `idle` precedes the second's `running` — pinned over the WHOLE
-    /// run's frame stream from a second receiver (the first receiver's
-    /// earlier frames_until/drain_frames calls consume their own buffer).
-    #[tokio::test]
-    async fn a_queued_send_drains_after_the_compact_settles_in_fifo_order() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        // The _tx variant exposes the bus sender: a SECOND, untouched
-        // receiver carries the total frame order for assertion (6) even
-        // though this test's earlier frames_until/drain_frames calls
-        // consume the first receiver (the round-3 review's finding).
-        let (st, http, mut rx, bus_tx) = compact_state_gated_tx(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        let mut order_rx = bus_tx.subscribe();
-        insert_compact_session(&st, "ses_q2", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q2")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-
-        // Arm the one-shot prompt park BEFORE the drain can fire.
-        let prompt_gate = http.arm_prompt_gate();
-
-        // TWO queued sends — FIFO order is the assertion target.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q2", "first queued")),
-        )
-        .await
-        .expect("queues inline");
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q2", "second queued")),
-        )
-        .await
-        .expect("queues inline");
-
-        // Both accepted at queue time. frames_until stops at the FIRST
-        // predicate match — wait for EACH requestId with its own call.
-        let _ = frames_until(&mut rx, |f| {
-            f["type"] == "freshAgent.send.accepted" && f["requestId"] == "req-first queued"
-        })
-        .await;
-        let _ = frames_until(&mut rx, |f| {
-            f["type"] == "freshAgent.send.accepted" && f["requestId"] == "req-second queued"
-        })
-        .await;
-
-        // Release: the compact POST answers, the drive settles, the drain runs.
-        summarize_gate.notify_waiters();
-
-        // (1) The FIRST drained send parks on the one-shot prompt gate.
-        await_prompt_posted(&http, "first queued").await;
-
-        // (2) ONE-AT-A-TIME (the design constraint, now PROVEN): while the
-        // first queued send is in flight (parked), the second has NOT
-        // started — the drain drives exactly one entry per settle tail.
-        assert!(
-            !http
-                .recorded()
-                .iter()
-                .any(|r| r.url.contains("prompt_async") && r_body_contains(r, "second queued")),
-            "one-at-a-time: the second queued send has not POSTed while the first is in flight"
-        );
-
-        // (3) Release the first send's prompt; its settle tail drives the
-        // second (bounded async waits: the POSTs happen inside spawned
-        // tasks — never assert them against a fixed sleep).
-        prompt_gate.notify_waiters();
-        await_prompt_posted(&http, "second queued").await;
-
-        // (4) Order on the recorded log: compact BEFORE first, first BEFORE
-        // second (FIFO).
-        let recorded = http.recorded();
-        let summarize_ix = recorded
-            .iter()
-            .position(|r| r.url.contains("summarize"))
-            .expect("summarize POST recorded");
-        let first_ix = recorded
-            .iter()
-            .position(|r| r.url.contains("prompt_async") && r_body_contains(r, "first queued"))
-            .expect("first queued send drained");
-        let second_ix = recorded
-            .iter()
-            .position(|r| r.url.contains("prompt_async") && r_body_contains(r, "second queued"))
-            .expect("second queued send drained");
-        assert!(
-            summarize_ix < first_ix,
-            "drain waits for the compact settle"
-        );
-        assert!(first_ix < second_ix, "FIFO order");
-
-        // (5) The queue drains completely and the pane settles idle —
-        // wait for EACH drive's trailing idle with its own bounded call
-        // (frames_until stops at the FIRST match, and the first call
-        // would otherwise return on the compact's already-buffered idle
-        // while the second send's drive is still in flight): the
-        // compact's, the first send's, then the second send's. All
-        // three landed = the queue drained and the pane settled.
-        for _ in 0..3 {
-            let _ = frames_until(&mut rx, |f| {
-                is_event(f, "freshAgent.session.snapshot", Some("idle"))
-            })
-            .await;
-        }
-        let session_arc = st.sessions.lock().await.get("ses_q2").cloned().unwrap();
-        assert!(session_arc.lock().await.pending_sends.is_empty());
-
-        // (6) THE EMISSION-ORDER CONTRACT (the round-2 review's ordering
-        // finding): over the WHOLE run's frame stream, each drive's trailing
-        // idle precedes the next drive's running — the compact settles (idle)
-        // before send #1 starts (running), and send #1 settles before send #2
-        // starts. One drain_frames at the end gives the total emission
-        // order; positional assertions on the running/idle snapshot lists.
-        // Drain the SECOND receiver — the first receiver's earlier
-        // frames_until/drain_frames calls already consumed its frames, so
-        // the full emission order survives only in order_rx.
-        let all_frames = drain_frames(&mut order_rx);
-        let running_ix: Vec<usize> = all_frames
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| is_event(f, "freshAgent.session.snapshot", Some("running")))
-            .map(|(i, _)| i)
-            .collect();
-        let idle_ix: Vec<usize> = all_frames
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| is_event(f, "freshAgent.session.snapshot", Some("idle")))
-            .map(|(i, _)| i)
-            .collect();
-        // This rig emits exactly 3 runnings (compact, send 1, send 2) and 3
-        // idles — assert the counts, then the cross-drive ordering.
-        assert_eq!(running_ix.len(), 3, "compact + two sends each ran once");
-        assert_eq!(idle_ix.len(), 3, "each drive settled once");
-        assert!(
-            idle_ix[0] < running_ix[1],
-            "the compact's trailing idle precedes the first queued send's running"
-        );
-        assert!(
-            idle_ix[1] < running_ix[2],
-            "the first send's trailing idle precedes the second queued send's running"
-        );
-    }
-
-    /// MUST #4 (the client contract): a fresh send arriving while older
-    /// entries are still queued appends — never drives ahead of them.
-    /// The exact window: a live (unsettled) SEND drive with an
-    /// already-queued entry the drain has not popped yet.
-    #[tokio::test]
-    async fn a_send_arriving_behind_pending_queue_entries_appends_fifo() {
-        let (st, _http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            None,
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q2b", Some("prov/model")).await;
-        let session_arc = st.sessions.lock().await.get("ses_q2b").cloned().unwrap();
-        {
-            let mut session = session_arc.lock().await;
-            // Plant the live SEND drive + the pending older entry white-box
-            // (same-crate test style): the drain has not popped it.
-            session.turn_task = Some(TurnTask {
-                kind: TurnTaskKind::Send,
-                handle: tokio::spawn(std::future::pending::<()>()),
-                compact_settled_rx: None,
-                settling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            });
-            session
-                .pending_sends
-                .push_back(send_msg("ses_q2b", "older entry"));
-        }
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q2b", "newer entry")),
-        )
-        .await
-        .expect("appends behind pending entries");
-        let session = session_arc.lock().await;
-        let texts: Vec<String> = session
-            .pending_sends
-            .iter()
-            .map(|m| m.text.clone())
-            .collect();
-        assert_eq!(
-            texts,
-            vec!["older entry".to_string(), "newer entry".to_string()],
-            "a send behind pending queue entries appends in FIFO order"
-        );
-    }
-
-    /// The settling-flag gate semantics, planted deterministically.
-    #[tokio::test]
-    async fn a_settling_registration_does_not_block_the_drain_but_a_live_one_does() {
-        let (st, _http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            None,
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q2c", Some("prov/model")).await;
-        let session_arc = st.sessions.lock().await.get("ses_q2c").cloned().unwrap();
-        // (a) live (unsettling) registration → the drain returns without popping.
-        {
-            let mut session = session_arc.lock().await;
-            session.turn_task = Some(TurnTask {
-                kind: TurnTaskKind::Compact,
-                handle: tokio::spawn(std::future::pending::<()>()),
-                compact_settled_rx: None,
-                settling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            });
-            session.pending_sends.push_back(send_msg("ses_q2c", "held"));
-        }
-        st.drain_pending_sends("ses_q2c").await;
-        assert_eq!(
-            session_arc.lock().await.pending_sends.len(),
-            1,
-            "a live registration blocks the drain"
-        );
-        // (b) settling registration → the drain pops and drives (the drive
-        // itself POSTs to the fake — this rig has no coordinator wired, so
-        // the unfenced entry proceeds exactly like the direct path).
-        {
-            let mut session = session_arc.lock().await;
-            session.turn_task = Some(TurnTask {
-                kind: TurnTaskKind::Compact,
-                handle: tokio::spawn(std::future::pending::<()>()),
-                compact_settled_rx: None,
-                settling: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            });
-        }
-        st.drain_pending_sends("ses_q2c").await;
-        assert!(
-            session_arc.lock().await.pending_sends.is_empty(),
-            "a settling registration is past its emissions — the drain proceeds"
-        );
-    }
-
-    /// Same rig; park the compact, queue one send, then interrupt. The
-    /// aborted compact's own settle tail NEVER runs (TurnTask doc
-    /// :199-201), so the drain must fire from handle_interrupt after
-    /// abort_and_settle — the queued prompt POST is the proof.
-    #[tokio::test]
-    async fn an_interrupted_compact_still_drains_the_queued_send() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q3", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q3")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q3", "survives the interrupt")),
-        )
-        .await;
-        // The inline FreshAgentInterrupt literal the interrupt lifecycle
-        // test uses (same field shape, adapted to ses_q3).
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_interrupt(FreshAgentInterrupt {
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q3".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            }),
-        )
-        .await
-        .expect("interrupt answers");
-        await_prompt_posted(&http, "survives the interrupt").await;
-    }
-
-    /// Delta-review round 3: the FAILED daemon-side abort path. The
-    /// interrupt's Err arm must NOT dispatch parked sends — the daemon
-    /// may still be executing the interrupted turn, and firing a prompt
-    /// into that window could lose or reorder the message. The deferral
-    /// holds EVERY drain trigger off (the interrupt's own, the queue
-    /// arm's push-armed drain) and is WARN-observable; a LATER
-    /// interrupt whose daemon-side abort SUCCEEDS proves the quiesce,
-    /// disarms the deferral, and delivers the queue in FIFO order.
-    #[tokio::test]
-    async fn a_failed_daemon_abort_defers_the_drain_until_a_successful_interrupt() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q8", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q8")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        // TWO queued sends: the second's push-armed drain is the extra
-        // trigger that must ALSO be held off during the orphan window.
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q8", "first deferred")),
-        )
-        .await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q8", "second deferred")),
-        )
-        .await;
-
-        let (events, _guard) = info_capture::capture();
-
-        // The daemon-side abort FAILS — the Err arm arms the deferral.
-        http.arm_abort_fail();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_interrupt(FreshAgentInterrupt {
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q8".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            }),
-        )
-        .await
-        .expect("interrupt answers (abort fails)");
-
-        // The daemon-side compact completes in the fake; NOTHING local
-        // observes it — the parked prompts must STILL not have POSTed
-        // (the deferral holds every trigger). Let any spawned drain
-        // reach its gate check before asserting absence.
-        summarize_gate.notify_waiters();
-        for _ in 0..25 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        {
-            let captured = events.lock().unwrap();
-            assert!(
-                captured.iter().any(|e| e
-                    .message
-                    .contains("fresh_agent_interrupt_abort_failed_queue_deferred")),
-                "the deferral is WARN-observable"
-            );
-        }
-        assert!(
-            !http.recorded().iter().any(|r| {
-                r.url.contains("prompt_async")
-                    && (r_body_contains(r, "first deferred") || r_body_contains(r, "second deferred"))
-            }),
-            "a failed daemon-side abort must defer the drain — no parked prompt POSTs into the orphan window"
-        );
-        // A LATER interrupt whose daemon-side abort SUCCEEDS proves the
-        // quiesce: disarm + drain → the queue delivers in FIFO order.
-        http.clear_abort_fail();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_interrupt(FreshAgentInterrupt {
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q8".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            }),
-        )
-        .await
-        .expect("interrupt answers (abort succeeds)");
-        await_prompt_posted(&http, "first deferred").await;
-        await_prompt_posted(&http, "second deferred").await;
-        let recorded = http.recorded();
-        let first_ix = recorded
-            .iter()
-            .position(|r| r.url.contains("prompt_async") && r_body_contains(r, "first deferred"))
-            .expect("first deferred drained");
-        let second_ix = recorded
-            .iter()
-            .position(|r| r.url.contains("prompt_async") && r_body_contains(r, "second deferred"))
-            .expect("second deferred drained");
-        assert!(first_ix < second_ix, "the recovered queue delivers FIFO");
-        let session_arc = st.sessions.lock().await.get("ses_q8").cloned().unwrap();
-        assert!(
-            session_arc.lock().await.pending_sends.is_empty(),
-            "the recovered queue drains completely"
-        );
-    }
-
-    /// Delta-review round 4: the deferral is NOT permanent. The serve
-    /// bridge observes the daemon's own session-IDLE event — the proven
-    /// end of the orphaned daemon-side turn — and
-    /// [`FreshOpencodeState::observe_daemon_idle`] (the exact function
-    /// the bridge calls on a `Snapshot::Idle`) releases the latch and
-    /// delivers the parked queue AUTOMATICALLY, FIFO, with the release
-    /// WARN-observable. No manual interrupt required.
-    #[tokio::test]
-    async fn the_daemon_idle_observation_releases_the_interrupt_deferral_and_delivers() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q9", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q9")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q9", "first auto")),
-        )
-        .await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q9", "second auto")),
-        )
-        .await;
-
-        let (events, _guard) = info_capture::capture();
-        http.arm_abort_fail();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_interrupt(FreshAgentInterrupt {
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q9".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            }),
-        )
-        .await
-        .expect("interrupt answers (abort fails)");
-        {
-            let captured = events.lock().unwrap();
-            assert!(
-                captured.iter().any(|e| e
-                    .message
-                    .contains("fresh_agent_interrupt_abort_failed_queue_deferred")),
-                "the deferral is WARN-observable"
-            );
-        }
-
-        // The daemon-side compact eventually settles; the bridge observes
-        // the interrupted turn's running and then its idle (the
-        // delivery-order identity) — the AUTOMATIC release + delivery:
-        FreshOpencodeState::observe_daemon_running(&st, "ses_q9", "ses_q9").await;
-        FreshOpencodeState::observe_daemon_idle(&st, "ses_q9", "ses_q9").await;
-        await_prompt_posted(&http, "first auto").await;
-        await_prompt_posted(&http, "second auto").await;
-        {
-            let captured = events.lock().unwrap();
-            assert!(
-                captured.iter().any(|e| e
-                    .message
-                    .contains("fresh_agent_interrupt_orphan_released_by_daemon_idle")),
-                "the release is WARN-observable"
-            );
-        }
-        let recorded = http.recorded();
-        let first_ix = recorded
-            .iter()
-            .position(|r| r.url.contains("prompt_async") && r_body_contains(r, "first auto"))
-            .expect("first auto delivered");
-        let second_ix = recorded
-            .iter()
-            .position(|r| r.url.contains("prompt_async") && r_body_contains(r, "second auto"))
-            .expect("second auto delivered");
-        assert!(first_ix < second_ix, "the released queue delivers FIFO");
-        let session_arc = st.sessions.lock().await.get("ses_q9").cloned().unwrap();
-        assert!(
-            session_arc.lock().await.pending_sends.is_empty(),
-            "the released queue drains completely"
-        );
-    }
-
-    /// Delta-review round 4: an interrupt on an UNMATERIALIZED session
-    /// takes the early-return path — the teardown-start latch arming is
-    /// undone there, so a later compact queue can never be poisoned by a
-    /// deferral latch with no daemon-side turn behind it.
-    #[tokio::test]
-    async fn an_unmaterialized_interrupt_does_not_poison_the_deferral_latch() {
-        let (st, _http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            None,
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q10", Some("prov/model")).await;
-        let session_arc = st.sessions.lock().await.get("ses_q10").cloned().unwrap();
-        // Unmaterialize white-box: no real durable id → the interrupt's
-        // early-return path.
-        session_arc.lock().await.real_session_id = None;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_interrupt(FreshAgentInterrupt {
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q10".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            }),
-        )
-        .await
-        .expect("interrupt answers (unmaterialized early return)");
-        {
-            let session = session_arc.lock().await;
-            assert!(
-                !session.orphaned_daemon_turn.load(Ordering::SeqCst),
-                "the latch is not left armed by the unmaterialized early return"
-            );
-        }
-        // And the drain still works afterward (the poisoning regression's
-        // observable): park an entry white-box and drive it.
-        {
-            let mut session = session_arc.lock().await;
-            session
-                .pending_sends
-                .push_back(send_msg("ses_q10", "after the early return"));
-        }
-        st.drain_pending_sends("ses_q10").await;
-        assert!(
-            session_arc.lock().await.pending_sends.is_empty(),
-            "a later queue is not poisoned — the drain drives"
-        );
-    }
-
-    /// Delta-review round 5: the bridge's idle broadcast is gated on
-    /// genuine session quiescence. The same daemon idle is consumed
-    /// independently by the drive's await_idle — a bridge-side idle
-    /// processed AFTER the next queued send has started (the scheduling
-    /// race the round-5 reviewer identified) must be SUPPRESSED: a
-    /// stale trailing idle would flip the client's flush gate mid-send,
-    /// flushing another message into the send-overwrites-send direct
-    /// path and breaking one-at-a-time. The live drive's own settle
-    /// tail owns the authoritative idle.
-    #[tokio::test]
-    async fn a_stale_bridge_idle_during_a_live_queued_send_is_suppressed() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, mut rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q11", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q11")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        // Two queued sends; the one-shot prompt gate parks the FIRST
-        // drained send (the FIFO rig's deterministic in-flight window).
-        let prompt_gate = http.arm_prompt_gate();
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q11", "first live")),
-        )
-        .await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q11", "second live")),
-        )
-        .await;
-
-        // Release: the compact settles (its settle tail broadcasts the
-        // AUTHORITATIVE idle — a legitimate one, it precedes the next
-        // running), the drain drives the first send, and its prompt
-        // PARKS — the first send is LIVE.
-        summarize_gate.notify_waiters();
-        await_prompt_posted(&http, "first live").await;
-        // Consume everything the legitimate flow emitted up to here.
-        let _ = drain_frames(&mut rx);
-
-        // The bridge now processes the daemon's idle for the COMPACT —
-        // the stale duplicate racing the live queued send. It MUST be
-        // suppressed: NO new frame lands while the first send is live.
-        FreshOpencodeState::observe_daemon_idle(&st, "ses_q11", "ses_q11").await;
-        for _ in 0..25 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            drain_frames(&mut rx).is_empty(),
-            "the stale bridge-side idle is suppressed while the first queued send is live — no new frame may land"
-        );
-        // And the queue is still parked (nothing drove past the live send).
-        assert!(!http
-            .recorded()
-            .iter()
-            .any(|r| { r.url.contains("prompt_async") && r_body_contains(r, "second live") }));
-
-        // Release the first send's prompt: it settles (its settle tail
-        // broadcasts the AUTHORITATIVE idle), the second drives, and the
-        // run completes with the emission-order contract intact.
-        prompt_gate.notify_waiters();
-        await_prompt_posted(&http, "second live").await;
-        let _ = frames_until(&mut rx, |f| {
-            is_event(f, "freshAgent.session.snapshot", Some("idle"))
-        })
-        .await;
-        let session_arc = st.sessions.lock().await.get("ses_q11").cloned().unwrap();
-        assert!(session_arc.lock().await.pending_sends.is_empty());
-    }
-
-    /// Focused-review episode 1 round 1: the quiescence decision and the
-    /// idle emission are ONE critical section — the mutex-release
-    /// handoff race. A bridge idle observed on a quiescent session and
-    /// a concurrently-arriving send are serialized by the SESSION LOCK:
-    /// tokio's Mutex is fair (FIFO), so with the helper queued FIRST
-    /// and a handle_send queued SECOND behind a held lock, the helper
-    /// must emit its idle BEFORE the send registers/emits running —
-    /// never the stale interleaving this gate exists to prevent.
-    /// Multi-thread flavor: the woken send runs on another worker the
-    /// moment the lock handoff happens, so a broadcast-after-release
-    /// bug has real workers to lose against; with the fix the running
-    /// can only follow the idle.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_bridge_idle_broadcast_is_atomic_with_send_registration() {
-        let (st, http, mut rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            None,
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q12", Some("prov/model")).await;
-        // Hold the session lock so both waiters queue in a known order.
-        let session_arc = st.sessions.lock().await.get("ses_q12").cloned().unwrap();
-        let _held = session_arc.lock().await;
-
-        let helper = {
-            let st = st.clone();
-            let id = "ses_q12".to_string();
-            tokio::spawn(async move {
-                FreshOpencodeState::observe_daemon_idle(&st, &id, &id).await;
-            })
-        };
-        // Yield so the helper parks on the session lock FIRST.
-        tokio::task::yield_now().await;
-        let sender = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                let _ = st
-                    .handle_send(send_msg("ses_q12", "the handoff send"))
-                    .await;
-            })
-        };
-        // Yield so the send parks SECOND (tokio Mutex grants FIFO).
-        tokio::task::yield_now().await;
-        // Release the held lock: the helper acquires, decides quiescent,
-        // and emits its idle INSIDE the critical section; only then may
-        // the send register + emit its running.
-        // Park the send's prompt POST (single-use gate): its settle
-        // idle cannot exist until released, so any idle observed while
-        // parked is a stale bridge emission racing the registration —
-        // the exact interleaving this critical section forbids.
-        let prompt_gate = http.arm_prompt_gate();
-        drop(_held);
-        let _ = sender.await;
-        await_prompt_posted(&http, "the handoff send").await;
-        let _ = helper.await;
-
-        let idle = |f: &Value| is_event(f, "freshAgent.session.snapshot", Some("idle"));
-        let running = |f: &Value| is_event(f, "freshAgent.session.snapshot", Some("running"));
-        let pre = drain_frames(&mut rx);
-        assert!(!pre.is_empty(), "the handoff produced frames");
-        if idle(&pre[0]) {
-            // Helper-first: the idle emission is atomic with the
-            // quiescence decision — the send's running can only follow.
-            let running_ix = pre
-                .iter()
-                .position(running)
-                .expect("the send's running landed");
-            assert!(
-                running_ix > 0,
-                "the helper's idle precedes the send's running — the emission is atomic with the decision"
-            );
-            assert!(
-                !pre.iter().skip(1).any(idle),
-                "no second idle may exist while the send is still parked"
-            );
-        } else {
-            assert!(
-                running(&pre[0]),
-                "unexpected first frame — neither idle nor running"
-            );
-            assert!(
-                !pre.iter().any(idle),
-                "sender-first means the helper observed the live send inside its critical section and SUPPRESSED — an idle while the send is still parked is a stale emission that raced the registration"
-            );
-        }
-
-        // Release the POST: the send settles, exactly one settle idle.
-        prompt_gate.notify_waiters();
-        let settle = frames_until(&mut rx, |f| {
-            is_event(f, "freshAgent.session.snapshot", Some("idle"))
-        })
-        .await;
-        let remaining = drain_frames(&mut rx);
-        let late_idles = remaining.iter().filter(|f| idle(f)).count();
-        assert_eq!(
-            late_idles, 0,
-            "the settle idle is consumed exactly once — no late stale emissions"
-        );
-        assert!(settle.iter().any(idle));
-    }
-
-    /// Delta-review round 6 (extension) Major 2: the daemon reporting idle
-    /// while the session-scoped abort request is STILL IN FLIGHT must NOT
-    /// release the deferral latch — `handle_interrupt` drops the session
-    /// lock to await the abort, and a release in that window dispatches
-    /// the parked prompt before the abort has settled; the daemon's late
-    /// abort processing can then cancel that freshly-dispatched prompt
-    /// after it left `pending_sends`, with no requeue or correlated
-    /// failure — losing the message. The release defers to the abort's
-    /// settlement (its Ok arm drains; its ambiguous-failure arm keeps
-    /// the round-3 deferral).
-    #[tokio::test]
-    async fn the_daemon_idle_release_defers_to_an_in_flight_abort() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q13", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q13")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q13", "deferred behind the abort")),
-        )
-        .await;
-
-        // The interrupt's daemon-side abort parks at the gate: the abort
-        // request is IN FLIGHT (recorded, unsettled).
-        let abort_gate = http.arm_abort_gate();
-        let interrupt = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    st.handle_interrupt(FreshAgentInterrupt {
-                        provider: AgentProvider::Opencode,
-                        session_id: "ses_q13".to_string(),
-                        session_type: SessionType::Freshopencode,
-                        cwd: None,
-                    }),
-                )
-                .await
-            })
-        };
-        await_abort_posted(&http).await;
-
-        // The daemon reports idle while the abort is in flight (the old
-        // compact's turn ended on its own). The release must DEFER: the
-        // latch stays armed and no parked prompt dispatches into the
-        // abort's settlement window.
-        FreshOpencodeState::observe_daemon_idle(&st, "ses_q13", "ses_q13").await;
-        for _ in 0..25 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            !http
-                .recorded()
-                .iter()
-                .any(|r| r.url.contains("prompt_async")),
-            "no parked prompt may dispatch while the abort request is still in flight — the release defers to the abort's settlement"
-        );
-        {
-            let session_arc = st.sessions.lock().await.get("ses_q13").cloned().unwrap();
-            assert!(
-                session_arc
-                    .lock()
-                    .await
-                    .orphaned_daemon_turn
-                    .load(Ordering::SeqCst),
-                "the deferral latch stays armed while the abort is in flight"
-            );
-        }
-
-        // The abort settles 200: the Ok arm disarms + drains — the parked
-        // prompt delivers AFTER the abort, never into its window.
-        abort_gate.notify_waiters();
-        interrupt
-            .await
-            .expect("interrupt task lives")
-            .expect("interrupt answers within the budget");
-        await_prompt_posted(&http, "deferred behind the abort").await;
-        let abort_ix = http
-            .recorded()
-            .iter()
-            .position(|r| r.method == "POST" && r.url.contains("/abort"))
-            .expect("the abort POST is recorded");
-        let prompt_ix = http
-            .recorded()
-            .iter()
-            .position(|r| r.url.contains("prompt_async"))
-            .expect("the parked prompt drained");
-        assert!(
-            abort_ix < prompt_ix,
-            "the abort settled before the parked prompt dispatched"
-        );
-        let session_arc = st.sessions.lock().await.get("ses_q13").cloned().unwrap();
-        let session = session_arc.lock().await;
-        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
-        assert!(session.pending_sends.is_empty());
-    }
-
-    /// Delta-review round 6 (extension) Major 1: an abort request TIMEOUT is
-    /// the failure flavor that kills the sidecar (`DiscardOnTimeout::Yes` →
-    /// `discard_running` + `Lost` to every session) — by construction no
-    /// daemon-side writer can remain, so the deferral latch must NOT survive
-    /// it (the old code left it armed forever: the bridge ignores `Lost`,
-    /// the emitter closes, and no idle can ever release the queue again —
-    /// parked messages strand). The timeout arm disarms + drains: the
-    /// parked message either delivers (post-revival) or fails with the
-    /// normal typed send-failure path — it never strands silently.
-    #[tokio::test]
-    async fn an_abort_timeout_discards_the_sidecar_and_still_drains_the_queue() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, _rx, _tx) = compact_state_gated_cfg(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-            Some(Duration::from_millis(150)),
-        )
-        .await;
-        insert_compact_session(&st, "ses_q14", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q14")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q14", "survives the timeout")),
-        )
-        .await;
-
-        let (events, _guard) = info_capture::capture();
-        // The daemon-side abort NEVER resolves — the request times out at
-        // the serve request_timeout (150ms) and the sidecar is discarded.
-        http.arm_abort_hang();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            st.handle_interrupt(FreshAgentInterrupt {
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q14".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            }),
-        )
-        .await
-        .expect("interrupt answers after the abort timeout");
-
-        await_prompt_posted(&http, "survives the timeout").await;
-        {
-            let captured = events.lock().unwrap();
-            assert!(
-                captured
-                    .iter()
-                    .any(|e| e.message.contains("fresh_agent_interrupt_abort_no_writer")),
-                "the timeout's no-writer settlement is WARN-observable"
-            );
-        }
-        let session_arc = st.sessions.lock().await.get("ses_q14").cloned().unwrap();
-        let session = session_arc.lock().await;
-        assert!(
-            !session.orphaned_daemon_turn.load(Ordering::SeqCst),
-            "the timeout flavor leaves no daemon-side writer — the latch cannot survive it"
-        );
-        assert!(session.pending_sends.is_empty());
-    }
-
-    /// Focused episode 2 round 1, Major 1: an abort refused at the connect
-    /// phase (`Undelivered`) proves only that the ABORT never reached the
-    /// daemon — it says nothing about the already-accepted daemon-side
-    /// turn, which may still be running. It must DEFER exactly like a
-    /// 500-answered abort (the round-3 semantics); a later daemon idle is
-    /// the proven quiesce that releases + delivers.
-    #[tokio::test]
-    async fn an_undelivered_abort_defers_like_a_failed_abort() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q15", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q15")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q15", "waits out the refusal")),
-        )
-        .await;
-
-        let (events, _guard) = info_capture::capture();
-        http.arm_abort_refused();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            st.handle_interrupt(FreshAgentInterrupt {
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q15".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            }),
-        )
-        .await
-        .expect("interrupt answers after the refused abort");
-
-        for _ in 0..25 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            !http
-                .recorded()
-                .iter()
-                .any(|r| r.url.contains("prompt_async")),
-            "an undelivered abort defers like a failed one — the daemon-side turn may still be running"
-        );
-        {
-            let captured = events.lock().unwrap();
-            assert!(
-                captured.iter().any(|e| e
-                    .message
-                    .contains("fresh_agent_interrupt_abort_failed_queue_deferred")),
-                "the refusal keeps the round-3 deferral WARN"
-            );
-        }
-        let session_arc = st.sessions.lock().await.get("ses_q15").cloned().unwrap();
-        assert!(
-            session_arc
-                .lock()
-                .await
-                .orphaned_daemon_turn
-                .load(Ordering::SeqCst),
-            "the deferral latch stays armed"
-        );
-
-        // The daemon later reports the interrupted turn's running and
-        // then its idle (the delivery-order identity) — the PROVEN quiesce
-        // releases + delivers (round-4 semantics).
-        FreshOpencodeState::observe_daemon_running(&st, "ses_q15", "ses_q15").await;
-        FreshOpencodeState::observe_daemon_idle(&st, "ses_q15", "ses_q15").await;
-        await_prompt_posted(&http, "waits out the refusal").await;
-        let session_arc = st.sessions.lock().await.get("ses_q15").cloned().unwrap();
-        let session = session_arc.lock().await;
-        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
-        assert!(session.pending_sends.is_empty());
-    }
-
-    /// Focused episode 2 round 1, Major 2: with two rapid interrupts, the
-    /// FIRST abort to settle must NOT clear the latch + drain while the
-    /// second abort is still in flight — the second abort's late
-    /// processing could cancel the freshly dispatched prompt after it
-    /// left the queue. The LAST in-flight abort's settlement owns the
-    /// release.
-    #[tokio::test]
-    async fn the_last_in_flight_abort_owns_the_queue_release() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q16", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q16")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q16", "behind both aborts")),
-        )
-        .await;
-
-        // Interrupt A's abort parks on the one-shot gate (in flight);
-        // interrupt B's abort answers 200 immediately.
-        let abort_gate = http.arm_abort_gate();
-        let interrupt_a = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    st.handle_interrupt(FreshAgentInterrupt {
-                        provider: AgentProvider::Opencode,
-                        session_id: "ses_q16".to_string(),
-                        session_type: SessionType::Freshopencode,
-                        cwd: None,
-                    }),
-                )
-                .await
-            })
-        };
-        await_abort_posted(&http).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            st.handle_interrupt(FreshAgentInterrupt {
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q16".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            }),
-        )
-        .await
-        .expect("interrupt B answers (abort 200)");
-        for _ in 0..25 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            !http
-                .recorded()
-                .iter()
-                .any(|r| r.url.contains("prompt_async")),
-            "B's SUCCESSFUL abort must not drain while A's abort is still in flight — the LAST settlement owns the release"
-        );
-        {
-            let session_arc = st.sessions.lock().await.get("ses_q16").cloned().unwrap();
-            assert!(
-                session_arc
-                    .lock()
-                    .await
-                    .orphaned_daemon_turn
-                    .load(Ordering::SeqCst),
-                "the deferral latch stays armed until the last abort settles"
-            );
-        }
-
-        // A's abort settles 200 — the LAST settlement clears + drains.
-        abort_gate.notify_waiters();
-        interrupt_a
-            .await
-            .expect("interrupt A task lives")
-            .expect("interrupt A answers within the budget");
-        await_prompt_posted(&http, "behind both aborts").await;
-        let session_arc = st.sessions.lock().await.get("ses_q16").cloned().unwrap();
-        let session = session_arc.lock().await;
-        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
-        assert!(session.pending_sends.is_empty());
-    }
-
-    /// Focused episode 2 round 1, Major 3: a daemon idle observed DURING
-    /// an abort window is remembered, not discarded — if the abort then
-    /// settles with an ambiguous failure (HTTP 500), the already-seen
-    /// idle is the proven quiesce that releases + delivers; without the
-    /// memory the queue would strand (the compact's only idle edge is
-    /// gone and no later event can release it).
-    #[tokio::test]
-    async fn an_idle_observed_during_an_abort_window_releases_on_its_ambiguous_failure() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q17", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q17")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q17", "waits for the memory")),
-        )
-        .await;
-
-        // The abort parks (in flight) AND will answer 500 when released.
-        let abort_gate = http.arm_abort_gate();
-        http.arm_abort_fail();
-        let interrupt = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    st.handle_interrupt(FreshAgentInterrupt {
-                        provider: AgentProvider::Opencode,
-                        session_id: "ses_q17".to_string(),
-                        session_type: SessionType::Freshopencode,
-                        cwd: None,
-                    }),
-                )
-                .await
-            })
-        };
-        await_abort_posted(&http).await;
-
-        // The daemon reports the interrupted turn's RUNNING and then
-        // its idle DURING the abort window — the delivery-order identity
-        // (episode 2 round 5, Major 2): an idle is proof only when it
-        // FOLLOWS a delivered running. Deferred (episode 2 round 1,
-        // Major 2) but REMEMBERED (episode 2 round 1, Major 3).
-        FreshOpencodeState::observe_daemon_running(&st, "ses_q17", "ses_q17").await;
-        FreshOpencodeState::observe_daemon_idle(&st, "ses_q17", "ses_q17").await;
-        for _ in 0..25 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            !http
-                .recorded()
-                .iter()
-                .any(|r| r.url.contains("prompt_async")),
-            "the release defers to the abort's settlement"
-        );
-
-        // The abort settles AMBIGUOUSLY (500) — the remembered idle is
-        // the proven quiesce: release + deliver (no stranding on the
-        // compact's only idle edge having already fired).
-        abort_gate.notify_waiters();
-        interrupt
-            .await
-            .expect("interrupt task lives")
-            .expect("interrupt answers within the budget");
-        await_prompt_posted(&http, "waits for the memory").await;
-        let session_arc = st.sessions.lock().await.get("ses_q17").cloned().unwrap();
-        let session = session_arc.lock().await;
-        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
-        assert!(session.pending_sends.is_empty());
-    }
-
-    /// Focused episode 2 round 2, Major 1: a successful abort that is NOT
-    /// the last in flight must not broadcast `idle` — the unchanged client
-    /// flushes its composer queue on that idle, and with the interrupt
-    /// having removed the turn task and the server queue possibly empty,
-    /// `handle_send` dispatches the flushed message DIRECTLY (never
-    /// passing through the drain gate) — the remaining in-flight abort
-    /// can then cancel it at the daemon after the client removed it from
-    /// its queue: silent typed-message loss. The idle broadcast, like
-    /// every other release action, is owned by the LAST settlement.
-    #[tokio::test]
-    async fn no_idle_broadcast_while_a_sibling_abort_is_in_flight() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, mut rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q18", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q18")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q18", "behind both aborts")),
-        )
-        .await;
-
-        let abort_gate = http.arm_abort_gate();
-        let interrupt_a = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    st.handle_interrupt(FreshAgentInterrupt {
-                        provider: AgentProvider::Opencode,
-                        session_id: "ses_q18".to_string(),
-                        session_type: SessionType::Freshopencode,
-                        cwd: None,
-                    }),
-                )
-                .await
-            })
-        };
-        await_abort_posted(&http).await;
-        // B's abort answers 200 immediately — NOT the last in flight.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            st.handle_interrupt(FreshAgentInterrupt {
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q18".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            }),
-        )
-        .await
-        .expect("interrupt B answers (abort 200, not last)");
-        for _ in 0..25 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        let frames = drain_frames(&mut rx);
-        assert!(
-            !frames.iter().any(|f| {
-                is_event(f, "freshAgent.session.snapshot", Some("idle"))
-            }),
-            "a not-last abort settlement must not broadcast idle — the client would flush its composer queue straight into the sibling abort's cancellation window"
-        );
-
-        // A's abort settles 200 — the LAST settlement broadcasts idle and
-        // delivers the queue.
-        abort_gate.notify_waiters();
-        interrupt_a
-            .await
-            .expect("interrupt A task lives")
-            .expect("interrupt A answers within the budget");
-        let _ = frames_until(&mut rx, |f| {
-            is_event(f, "freshAgent.session.snapshot", Some("idle"))
-        })
-        .await;
-        await_prompt_posted(&http, "behind both aborts").await;
-        let session_arc = st.sessions.lock().await.get("ses_q18").cloned().unwrap();
-        let session = session_arc.lock().await;
-        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
-        assert!(session.pending_sends.is_empty());
-    }
-
-    /// Focused episode 2 round 2, Major 2: a `Transport` abort failure is
-    /// MID-EXCHANGE ambiguous — the daemon may still apply the abort after
-    /// the client saw the failure — so a remembered idle does NOT prove it
-    /// is safe to drain: the daemon could apply the old abort to the
-    /// freshly dispatched prompt. Transport keeps the round-3 deferral
-    /// (WARN-observable, released by a LATER idle or a successful
-    /// interrupt); only request-SETTLED flavors (Http answered 500, Decode
-    /// answered garbage) may consume the remembered idle.
-    #[tokio::test]
-    async fn a_transport_abort_failure_does_not_trust_the_remembered_idle() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q19", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q19")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q19", "waits out the ambiguity")),
-        )
-        .await;
-
-        let (events, _guard) = info_capture::capture();
-        let abort_gate = http.arm_abort_gate();
-        http.arm_abort_ambiguous();
-        let interrupt = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    st.handle_interrupt(FreshAgentInterrupt {
-                        provider: AgentProvider::Opencode,
-                        session_id: "ses_q19".to_string(),
-                        session_type: SessionType::Freshopencode,
-                        cwd: None,
-                    }),
-                )
-                .await
-            })
-        };
-        await_abort_posted(&http).await;
-
-        // The daemon idles during the abort window — remembered (Major 3,
-        // episode 2 round 1) but NOT trusted for a Transport settlement
-        // (the live status map says busy — the compact still runs in
-        // this fiction, and the recovery watcher's polls agree).
-        http.arm_status_busy("ses_q19", 1000);
-        FreshOpencodeState::observe_daemon_idle(&st, "ses_q19", "ses_q19").await;
-        for _ in 0..25 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            !http
-                .recorded()
-                .iter()
-                .any(|r| r.url.contains("prompt_async")),
-            "the release defers to the abort's settlement"
-        );
-
-        // The abort settles with a mid-exchange reset — the daemon may
-        // still apply it, so the remembered idle must NOT be consumed.
-        abort_gate.notify_waiters();
-        interrupt
-            .await
-            .expect("interrupt task lives")
-            .expect("interrupt answers within the budget");
-        for _ in 0..25 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            !http
-                .recorded()
-                .iter()
-                .any(|r| r.url.contains("prompt_async")),
-            "a Transport failure is mid-exchange ambiguous — the remembered idle does not authorize draining while the daemon may still apply the abort"
-        );
-        {
-            let captured = events.lock().unwrap();
-            assert!(
-                captured.iter().any(|e| e
-                    .message
-                    .contains("fresh_agent_interrupt_abort_failed_queue_deferred")),
-                "the Transport settlement keeps the round-3 deferral WARN"
-            );
-        }
-        let session_arc = st.sessions.lock().await.get("ses_q19").cloned().unwrap();
-        assert!(
-            session_arc
-                .lock()
-                .await
-                .orphaned_daemon_turn
-                .load(Ordering::SeqCst),
-            "the deferral latch stays armed after the Transport settlement"
-        );
-
-        // A LATER daemon idle — following the interrupted turn's
-        // running (the delivery-order identity), with the abort long
-        // settled and the daemon truly quiesced — is the proven release:
-        // deliver.
-        FreshOpencodeState::observe_daemon_running(&st, "ses_q19", "ses_q19").await;
-        FreshOpencodeState::observe_daemon_idle(&st, "ses_q19", "ses_q19").await;
-        await_prompt_posted(&http, "waits out the ambiguity").await;
-        let session_arc = st.sessions.lock().await.get("ses_q19").cloned().unwrap();
-        let session = session_arc.lock().await;
-        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
-        assert!(session.pending_sends.is_empty());
-    }
-
-    /// Focused episode 2 round 2, Major 3: an OVERLAPPING interrupt must
-    /// not erase the idle evidence remembered inside the open abort
-    /// window. If A's abort is in flight, the daemon idles (remembered),
-    /// B arms (the old code reset the memory on every arming), and both
-    /// aborts settle with answered 500s, the LAST settlement must still
-    /// hold the evidence — otherwise the queue strands on the compact's
-    /// already-fired only idle edge. The memory's reset point is TURN
-    /// REGISTRATION (a new turn invalidates old idle evidence), never an
-    /// interrupt arming.
-    #[tokio::test]
-    async fn an_overlapping_interrupt_does_not_erase_the_remembered_idle() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q20", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q20")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q20", "needs the surviving memory")),
-        )
-        .await;
-
-        let abort_gate = http.arm_abort_gate();
-        http.arm_abort_fail();
-        let interrupt_a = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    st.handle_interrupt(FreshAgentInterrupt {
-                        provider: AgentProvider::Opencode,
-                        session_id: "ses_q20".to_string(),
-                        session_type: SessionType::Freshopencode,
-                        cwd: None,
-                    }),
-                )
-                .await
-            })
-        };
-        await_abort_posted(&http).await;
-
-        // The daemon reports the interrupted turn's RUNNING and then
-        // idles during A's abort window — the delivery-order identity
-        // (round 5, Major 2) makes the idle proof; it is remembered.
-        FreshOpencodeState::observe_daemon_running(&st, "ses_q20", "ses_q20").await;
-        FreshOpencodeState::observe_daemon_idle(&st, "ses_q20", "ses_q20").await;
-        // B arms while A's abort is still in flight; B's abort answers 500
-        // immediately (not the last — defers to A's settlement).
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            st.handle_interrupt(FreshAgentInterrupt {
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q20".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            }),
-        )
-        .await
-        .expect("interrupt B answers (abort 500, not last)");
-        for _ in 0..25 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            !http
-                .recorded()
-                .iter()
-                .any(|r| r.url.contains("prompt_async")),
-            "B's settlement is not the last — the release defers to A"
-        );
-
-        // A's abort settles 500 — the LAST settlement — and must find the
-        // memory INTACT (an overlapping arming erased it pre-fix): consume,
-        // release, deliver.
-        abort_gate.notify_waiters();
-        interrupt_a
-            .await
-            .expect("interrupt A task lives")
-            .expect("interrupt A answers within the budget");
-        await_prompt_posted(&http, "needs the surviving memory").await;
-        let session_arc = st.sessions.lock().await.get("ses_q20").cloned().unwrap();
-        let session = session_arc.lock().await;
-        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
-        assert!(session.pending_sends.is_empty());
-    }
-
-    /// Focused episode 2 round 3, Major 1: an idle observed during an
-    /// abort window must not BROADCAST either — with the message still in
-    /// the CLIENT's UX queue the server queue is EMPTY, the interrupt
-    /// removed the turn task, so the observation is "quiescent" and the
-    /// broadcast would flush the client queue straight into
-    /// handle_send's direct path (which never consults abort_in_flight)
-    /// while the abort is still unsettled — the outstanding abort can
-    /// cancel the flushed prompt after the client removed it from its
-    /// queue. The in-flight branch defers BOTH the release and the
-    /// broadcast to the settlement.
-    #[tokio::test]
-    async fn an_idle_observed_during_an_abort_window_never_broadcasts() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, mut rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q21", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q21")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-
-        // No queued SERVER send: pending_sends stays empty (the message
-        // this scenario cares about sits in the client's UX queue).
-        let abort_gate = http.arm_abort_gate();
-        let interrupt = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    st.handle_interrupt(FreshAgentInterrupt {
-                        provider: AgentProvider::Opencode,
-                        session_id: "ses_q21".to_string(),
-                        session_type: SessionType::Freshopencode,
-                        cwd: None,
-                    }),
-                )
-                .await
-            })
-        };
-        await_abort_posted(&http).await;
-
-        // The daemon idles during the abort window. With the turn taken
-        // and the queue empty this observation is "quiescent" — the old
-        // code broadcast the idle, flushing the client queue into the
-        // unsettled abort's cancellation window.
-        FreshOpencodeState::observe_daemon_idle(&st, "ses_q21", "ses_q21").await;
-        for _ in 0..25 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        let frames = drain_frames(&mut rx);
-        assert!(
-            !frames
-                .iter()
-                .any(|f| is_event(f, "freshAgent.session.snapshot", Some("idle"))),
-            "an idle observed during an abort window must not broadcast — the client would flush its composer queue into the unsettled abort"
-        );
-
-        // The abort settles 200 — the LAST settlement owns the idle
-        // broadcast.
-        abort_gate.notify_waiters();
-        interrupt
-            .await
-            .expect("interrupt task lives")
-            .expect("interrupt answers within the budget");
-        let _ = frames_until(&mut rx, |f| {
-            is_event(f, "freshAgent.session.snapshot", Some("idle"))
-        })
-        .await;
-    }
-
-    /// Focused episode 2 round 3, Major 3: a not-last SUCCESSFUL abort
-    /// must record its proven quiesce (the daemon ANSWERED — the session
-    /// was provably settled at that moment) instead of discarding it. If
-    /// the LAST sibling then settles with an answered failure (HTTP 500
-    /// here; Undelivered the same shape), the settlement consumes the
-    /// earlier sibling's proof and delivers — instead of leaving the
-    /// latch armed forever for a window whose turn was already settled.
-    #[tokio::test]
-    async fn an_earlier_sibling_ok_abort_satisfies_the_last_failed_settlement() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q22", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q22")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q22", "needs the earlier proof")),
-        )
-        .await;
-
-        let abort_gate = http.arm_abort_gate();
-        let interrupt_a = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    st.handle_interrupt(FreshAgentInterrupt {
-                        provider: AgentProvider::Opencode,
-                        session_id: "ses_q22".to_string(),
-                        session_type: SessionType::Freshopencode,
-                        cwd: None,
-                    }),
-                )
-                .await
-            })
-        };
-        await_abort_posted(&http).await;
-        // B's abort answers 200 immediately — NOT the last in flight.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            st.handle_interrupt(FreshAgentInterrupt {
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q22".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            }),
-        )
-        .await
-        .expect("interrupt B answers (abort 200, not last)");
-        for _ in 0..25 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            !http
-                .recorded()
-                .iter()
-                .any(|r| r.url.contains("prompt_async")),
-            "B's not-last settlement deferred the release to A — as designed"
-        );
-
-        // A's abort settles 500 — the LAST settlement. It must find the
-        // quiesce proof B's answered abort recorded, consume it, and
-        // deliver — not defer a window whose turn B already proved
-        // settled. (The fail knob is read at RESPONSE time, so arming it
-        // here only affects A's parked request.)
-        http.arm_abort_fail();
-        abort_gate.notify_waiters();
-        interrupt_a
-            .await
-            .expect("interrupt A task lives")
-            .expect("interrupt A answers within the budget");
-        await_prompt_posted(&http, "needs the earlier proof").await;
-        let session_arc = st.sessions.lock().await.get("ses_q22").cloned().unwrap();
-        let session = session_arc.lock().await;
-        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
-        assert!(session.pending_sends.is_empty());
-    }
-
-    /// Focused episode 2 round 3, Major 4: a mixed ordering — the FIRST
-    /// abort times out (killing the sidecar: no daemon-side writer can
-    /// remain, the latch disarms, but the drain defers to the last
-    /// settlement), and the LAST abort then settles with a mid-exchange
-    /// Transport failure against the just-killed daemon. The last
-    /// settlement must recognize the INHERITED no-writer state (latch
-    /// already disarmed by the timeout — the sidecar is dead, no
-    /// retro-abort is possible) and drain, not defer forever (and the
-    /// old code's debug_assert panicked here).
-    #[tokio::test]
-    async fn a_timeout_then_transport_last_still_drains_the_inherited_no_writer_window() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, _rx, _tx) = compact_state_gated_cfg(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-            Some(Duration::from_millis(150)),
-        )
-        .await;
-        insert_compact_session(&st, "ses_q23", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q23")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q23", "survives the mixed window")),
-        )
-        .await;
-
-        // A's abort takes the one-shot HANG (times out at 150ms, kills
-        // the sidecar, NOT the last in flight); B's abort parks on the
-        // gate and answers a mid-exchange reset (Transport) on release.
-        http.arm_abort_hang();
-        let abort_gate = http.arm_abort_gate();
-        http.arm_abort_ambiguous();
-        let interrupt_a = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    st.handle_interrupt(FreshAgentInterrupt {
-                        provider: AgentProvider::Opencode,
-                        session_id: "ses_q23".to_string(),
-                        session_type: SessionType::Freshopencode,
-                        cwd: None,
-                    }),
-                )
-                .await
-            })
-        };
-        await_abort_posted(&http).await;
-        let interrupt_b = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    st.handle_interrupt(FreshAgentInterrupt {
-                        provider: AgentProvider::Opencode,
-                        session_id: "ses_q23".to_string(),
-                        session_type: SessionType::Freshopencode,
-                        cwd: None,
-                    }),
-                )
-                .await
-            })
-        };
-        // Positive sync (focused episode 2 round 4, Minor 3): wait for
-        // B's abort POST to be recorded — B is parked on the gate and A's
-        // 150ms timeout cannot make A the last settlement.
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let aborts = http
-                    .recorded()
-                    .iter()
-                    .filter(|r| r.method == "POST" && r.url.contains("/abort"))
-                    .count();
-                if aborts >= 2 {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("both abort POSTs land within the budget");
-        // A settles with the TIMEOUT (not the last — B is still parked):
-        // the sidecar is discarded, the latch disarms, no drain yet.
-        interrupt_a
-            .await
-            .expect("interrupt A task lives")
-            .expect("interrupt A answers after the abort timeout");
-        assert!(
-            !http
-                .recorded()
-                .iter()
-                .any(|r| r.url.contains("prompt_async")),
-            "A's not-last timeout defers the drain to the last settlement"
-        );
-
-        // B settles with the mid-exchange reset — the LAST settlement,
-        // into the INHERITED no-writer window: the sidecar the timeout
-        // killed cannot retro-apply anything, so the queue drains.
-        abort_gate.notify_waiters();
-        interrupt_b
-            .await
-            .expect("interrupt B task lives")
-            .expect("interrupt B answers within the budget");
-        await_prompt_posted(&http, "survives the mixed window").await;
-        let session_arc = st.sessions.lock().await.get("ses_q23").cloned().unwrap();
-        let session = session_arc.lock().await;
-        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
-        assert!(session.pending_sends.is_empty());
-    }
-
-    /// Focused episode 2 round 4, Major 2: the LAST no-writer settlement
-    /// (the abort timeout killed the sidecar) must emit the idle snapshot
-    /// the abort window suppressed — with the typed message still solely
-    /// in the CLIENT's UX queue the server drain is a no-op, and without
-    /// the frame the client stays busy forever (it cannot flush, and
-    /// hidden panes do not poll).
-    #[tokio::test]
-    async fn an_abort_timeout_still_emits_the_idle_snapshot() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, mut rx, _tx) = compact_state_gated_cfg(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-            Some(Duration::from_millis(150)),
-        )
-        .await;
-        insert_compact_session(&st, "ses_q24", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q24")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-
-        // NO queued server send: the typed message sits solely in the
-        // client's UX queue — the drain is a no-op and the idle frame is
-        // the only thing that lets the client recover.
-        http.arm_abort_hang();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            st.handle_interrupt(FreshAgentInterrupt {
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q24".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            }),
-        )
-        .await
-        .expect("interrupt answers after the abort timeout");
-
-        let _ = frames_until(&mut rx, |f| {
-            is_event(f, "freshAgent.session.snapshot", Some("idle"))
-        })
-        .await;
-        let session_arc = st.sessions.lock().await.get("ses_q24").cloned().unwrap();
-        assert!(!session_arc
-            .lock()
-            .await
-            .orphaned_daemon_turn
-            .load(Ordering::SeqCst));
-    }
-
-    /// Focused episode 2 round 4, Major 3: an idle delivered during an
-    /// abort window can be a STALE duplicate from the previous turn (the
-    /// interrupted turn's own `running` follows it in stream order). A
-    /// running delivery after the recorded proof invalidates it: the
-    /// failed-abort settlement must NOT consume the stale proof and
-    /// dispatch into the still-running daemon-side compact. The next
-    /// FRESH idle (the real end of the interrupted turn) releases.
-    #[tokio::test]
-    async fn a_stale_idle_then_running_does_not_release_on_the_failed_abort() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q25", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q25")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q25", "waits for a fresh idle")),
-        )
-        .await;
-
-        let abort_gate = http.arm_abort_gate();
-        http.arm_abort_fail();
-        let interrupt = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    st.handle_interrupt(FreshAgentInterrupt {
-                        provider: AgentProvider::Opencode,
-                        session_id: "ses_q25".to_string(),
-                        session_type: SessionType::Freshopencode,
-                        cwd: None,
-                    }),
-                )
-                .await
-            })
-        };
-        await_abort_posted(&http).await;
-
-        // The bridge delivers a STALE idle (from the previous turn)
-        // during the window and THEN the interrupted turn's own running
-        // (stream order). The stale idle follows no delivered running
-        // and the live status map says busy — it records nothing.
-        http.arm_status_busy("ses_q25", 1000);
-        FreshOpencodeState::observe_daemon_idle(&st, "ses_q25", "ses_q25").await;
-        FreshOpencodeState::observe_daemon_running(&st, "ses_q25", "ses_q25").await;
-        for _ in 0..25 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            !http
-                .recorded()
-                .iter()
-                .any(|r| r.url.contains("prompt_async")),
-            "no dispatch before the abort settles"
-        );
-
-        // The abort settles 500 — the STALE proof must not be consumed
-        // (the busy guard holds): no dispatch into the possibly-live
-        // daemon-side compact.
-        abort_gate.notify_waiters();
-        interrupt
-            .await
-            .expect("interrupt task lives")
-            .expect("interrupt answers within the budget");
-        for _ in 0..25 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            !http
-                .recorded()
-                .iter()
-                .any(|r| r.url.contains("prompt_async")),
-            "a stale idle followed by running is not proof the interrupted turn ended — the settlement must not consume it"
-        );
-        let session_arc = st.sessions.lock().await.get("ses_q25").cloned().unwrap();
-        assert!(
-            session_arc
-                .lock()
-                .await
-                .orphaned_daemon_turn
-                .load(Ordering::SeqCst),
-            "the deferral holds until a FRESH idle"
-        );
-
-        // The interrupted turn REALLY ends — the fresh idle (following
-        // its running) releases and delivers.
-        FreshOpencodeState::observe_daemon_idle(&st, "ses_q25", "ses_q25").await;
-        await_prompt_posted(&http, "waits for a fresh idle").await;
-        let session_arc = st.sessions.lock().await.get("ses_q25").cloned().unwrap();
-        let session = session_arc.lock().await;
-        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
-        assert!(session.pending_sends.is_empty());
-    }
-
-    /// Focused episode 2 round 4, Minor 1: an Undelivered LAST settlement
-    /// consumes the earlier sibling's ANSWERED-abort proof (the strong
-    /// proof) and delivers — that abort never reached the daemon, so no
-    /// retro-hazard, and the sibling's answer already settled the turn.
-    #[tokio::test]
-    async fn an_undelivered_last_settlement_consumes_the_earlier_answered_proof() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q26", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q26")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q26", "delivers on the strong proof")),
-        )
-        .await;
-
-        let abort_gate = http.arm_abort_gate();
-        let interrupt_a = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    st.handle_interrupt(FreshAgentInterrupt {
-                        provider: AgentProvider::Opencode,
-                        session_id: "ses_q26".to_string(),
-                        session_type: SessionType::Freshopencode,
-                        cwd: None,
-                    }),
-                )
-                .await
-            })
-        };
-        await_abort_posted(&http).await;
-        // B's abort answers 200 — NOT the last: records the STRONG proof.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            st.handle_interrupt(FreshAgentInterrupt {
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q26".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            }),
-        )
-        .await
-        .expect("interrupt B answers (abort 200, not last)");
-        // Focused episode 2 round 5, Major 3: the daemon's resulting
-        // idle arrives while A is still in flight — it must NOT erase
-        // (downgrade) B's strong proof. (Delivered after a running — the
-        // interrupted turn's — so it records the weak proof too; the
-        // strong marker survives.)
-        FreshOpencodeState::observe_daemon_running(&st, "ses_q26", "ses_q26").await;
-        FreshOpencodeState::observe_daemon_idle(&st, "ses_q26", "ses_q26").await;
-        for _ in 0..25 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            !http
-                .recorded()
-                .iter()
-                .any(|r| r.url.contains("prompt_async")),
-            "B's not-last settlement deferred the release to A — as designed"
-        );
-
-        // A's parked abort is released as Undelivered — the LAST
-        // settlement consumes the strong proof and delivers.
-        http.arm_abort_refused();
-        abort_gate.notify_waiters();
-        interrupt_a
-            .await
-            .expect("interrupt A task lives")
-            .expect("interrupt A answers within the budget");
-        await_prompt_posted(&http, "delivers on the strong proof").await;
-        let session_arc = st.sessions.lock().await.get("ses_q26").cloned().unwrap();
-        let session = session_arc.lock().await;
-        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
-        assert!(session.pending_sends.is_empty());
-    }
-
-    /// Focused episode 2 round 5, Major 2: the settle-before-running
-    /// interleaving — a STALE idle (following no delivered running) is
-    /// recorded as nothing; the abort then settles Http-500 BEFORE the
-    /// bridge delivers the interrupted turn's running. The settlement
-    /// must NOT consume any proof (there is none); the queue waits for
-    /// the interrupted turn's OWN idle — which follows its running — to
-    /// release through the round-4 path. Pre-fix the stale idle was
-    /// recorded and consumed, dispatching into the still-running compact.
-    #[tokio::test]
-    async fn a_stale_idle_before_the_running_delivery_never_releases_on_the_failed_abort() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q27", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q27")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q27", "waits for the real idle")),
-        )
-        .await;
-
-        let abort_gate = http.arm_abort_gate();
-        http.arm_abort_fail();
-        let interrupt = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    st.handle_interrupt(FreshAgentInterrupt {
-                        provider: AgentProvider::Opencode,
-                        session_id: "ses_q27".to_string(),
-                        session_type: SessionType::Freshopencode,
-                        cwd: None,
-                    }),
-                )
-                .await
-            })
-        };
-        await_abort_posted(&http).await;
-
-        // The bridge delivers the STALE idle (from the previous turn —
-        // following NO delivered running, and the live status map says
-        // busy because the compact still runs): records NOTHING.
-        http.arm_status_busy("ses_q27", 1000);
-        FreshOpencodeState::observe_daemon_idle(&st, "ses_q27", "ses_q27").await;
-
-        // The abort settles 500 BEFORE the interrupted turn's running is
-        // delivered — the settlement finds no proof and defers (the
-        // pre-fix code consumed the stale idle and dispatched into the
-        // still-running compact).
-        abort_gate.notify_waiters();
-        interrupt
-            .await
-            .expect("interrupt task lives")
-            .expect("interrupt answers within the budget");
-        for _ in 0..25 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            !http
-                .recorded()
-                .iter()
-                .any(|r| r.url.contains("prompt_async")),
-            "a stale idle that follows no delivered running is not proof — the settlement must not consume it"
-        );
-        let session_arc = st.sessions.lock().await.get("ses_q27").cloned().unwrap();
-        assert!(
-            session_arc
-                .lock()
-                .await
-                .orphaned_daemon_turn
-                .load(Ordering::SeqCst),
-            "the deferral holds until the interrupted turn's own idle"
-        );
-
-        // The interrupted turn's running and then its OWN idle arrive (the
-        // delivery-order identity): the round-4 release path delivers.
-        FreshOpencodeState::observe_daemon_running(&st, "ses_q27", "ses_q27").await;
-        FreshOpencodeState::observe_daemon_idle(&st, "ses_q27", "ses_q27").await;
-        await_prompt_posted(&http, "waits for the real idle").await;
-        let session_arc = st.sessions.lock().await.get("ses_q27").cloned().unwrap();
-        let session = session_arc.lock().await;
-        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
-        assert!(session.pending_sends.is_empty());
-    }
-
-    /// Delta-review round 7 (extension): the post-settlement stale-idle
-    /// race in the round-4 release path — a failed abort settles (the
-    /// counter is zero, the latch armed), and the NEXT delivered idle
-    /// must still prove it belongs to the interrupted turn. With normal
-    /// bridge lag the stale previous-turn idle can arrive AFTER the
-    /// settlement, following no delivered running: the old code
-    /// released on it and drained into the still-running compact. The
-    /// delivery-order identity now applies here too — only an idle that
-    /// follows a delivered running may release; the interrupted turn's
-    /// own idle (which follows its running) delivers.
-    #[tokio::test]
-    async fn a_stale_idle_after_a_failed_abort_settlement_does_not_release() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q28", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q28")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q28", "waits out the bridge lag")),
-        )
-        .await;
-
-        // The abort FAILS (answered 500) and settles — counter zero,
-        // latch armed, the queue deferred.
-        http.arm_abort_fail();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            st.handle_interrupt(FreshAgentInterrupt {
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q28".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            }),
-        )
-        .await
-        .expect("interrupt answers (abort 500)");
-        let session_arc = st.sessions.lock().await.get("ses_q28").cloned().unwrap();
-        assert!(
-            session_arc
-                .lock()
-                .await
-                .orphaned_daemon_turn
-                .load(Ordering::SeqCst),
-            "the failed abort defers the queue"
-        );
-
-        // A STALE idle (from the previous turn) arrives after the
-        // settlement, following NO delivered running: it must NOT
-        // release — the compact may still be running (the live status
-        // map says busy).
-        http.arm_status_busy("ses_q28", 1000);
-        FreshOpencodeState::observe_daemon_idle(&st, "ses_q28", "ses_q28").await;
-        for _ in 0..25 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            !http
-                .recorded()
-                .iter()
-                .any(|r| r.url.contains("prompt_async")),
-            "a stale idle arriving after the settlement follows no running — it must not release the queue"
-        );
-        let session_arc = st.sessions.lock().await.get("ses_q28").cloned().unwrap();
-        assert!(
-            session_arc
-                .lock()
-                .await
-                .orphaned_daemon_turn
-                .load(Ordering::SeqCst),
-            "the deferral holds"
-        );
-
-        // The interrupted turn's OWN idle — following its delivered
-        // running — is the proven release: deliver.
-        FreshOpencodeState::observe_daemon_running(&st, "ses_q28", "ses_q28").await;
-        FreshOpencodeState::observe_daemon_idle(&st, "ses_q28", "ses_q28").await;
-        await_prompt_posted(&http, "waits out the bridge lag").await;
-        let session_arc = st.sessions.lock().await.get("ses_q28").cloned().unwrap();
-        let session = session_arc.lock().await;
-        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
-        assert!(session.pending_sends.is_empty());
-    }
-
-    /// Focused episode 3 round 1: the identity's blind spot — the
-    /// running edge can be GENUINELY missed (the SSE transport reconnects
-    /// without replaying missed events; a lagged broadcast drops them).
-    /// When the interrupted turn's REAL terminal idle arrives after a
-    /// failed abort settled, with no running ever delivered, the
-    /// delivery-order identity alone would reject it and strand the
-    /// queue forever. The authoritative fallback: the daemon's LIVE
-    /// status map says the session is idle NOW — the release proceeds.
-    #[tokio::test]
-    async fn a_missed_running_edge_does_not_strand_the_real_terminal_idle() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q29", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q29")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q29", "survives the reconnect")),
-        )
-        .await;
-
-        // The abort FAILS (answered 500) and settles — counter zero,
-        // latch armed, the queue deferred.
-        http.arm_abort_fail();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            st.handle_interrupt(FreshAgentInterrupt {
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q29".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            }),
-        )
-        .await
-        .expect("interrupt answers (abort 500)");
-
-        // The compact's running was LOST (a reconnect or lag — never
-        // delivered), but its REAL terminal idle arrives: no running
-        // preceded it, and the daemon's LIVE status map says idle (the
-        // daemon-side turn ended; the aborted local drive never consumed
-        // the seeded busy budget) — the poll fallback authorizes the
-        // release and the queue delivers.
-        http.clear_status_busy("ses_q29");
-        FreshOpencodeState::observe_daemon_idle(&st, "ses_q29", "ses_q29").await;
-        await_prompt_posted(&http, "survives the reconnect").await;
-        let session_arc = st.sessions.lock().await.get("ses_q29").cloned().unwrap();
-        let session = session_arc.lock().await;
-        assert!(
-            !session.orphaned_daemon_turn.load(Ordering::SeqCst),
-            "the missed-running terminal idle releases — no strand"
-        );
-        assert!(session.pending_sends.is_empty());
-    }
-
-    /// Focused episode 3 round 2, Major 1: a RETRYING compact is RUNNING
-    /// by the canonical classifier ("busy" AND "retry") — the missed-
-    /// running fallback must NOT treat it as settled and drain into it.
-    /// Only when the daemon's live status is neither busy nor retry (the
-    /// turn actually ended) does the release proceed.
-    #[tokio::test]
-    async fn a_retrying_compact_is_running_and_does_not_release_the_queue() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q30", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q30")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q30", "waits out the retry")),
-        )
-        .await;
-
-        // The abort FAILS (answered 500) and settles — counter zero,
-        // latch armed.
-        http.arm_abort_fail();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            st.handle_interrupt(FreshAgentInterrupt {
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q30".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            }),
-        )
-        .await
-        .expect("interrupt answers (abort 500)");
-
-        // The compact is RETRYING (no running was ever delivered — the
-        // missed-running path), and the daemon's live status map says
-        // "retry": a RUNNING state. The terminal-looking idle must NOT
-        // release — draining into a retrying compact is the loss the
-        // queue exists to prevent.
-        http.arm_status_retry("ses_q30");
-        FreshOpencodeState::observe_daemon_idle(&st, "ses_q30", "ses_q30").await;
-        for _ in 0..25 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            !http
-                .recorded()
-                .iter()
-                .any(|r| r.url.contains("prompt_async")),
-            "a retrying compact is running — the canonical classifier must not mistake it for settled"
-        );
-        let session_arc = st.sessions.lock().await.get("ses_q30").cloned().unwrap();
-        assert!(
-            session_arc
-                .lock()
-                .await
-                .orphaned_daemon_turn
-                .load(Ordering::SeqCst),
-            "the deferral holds while the compact retries"
-        );
-
-        // The compact finally settles — the live status map reports
-        // neither busy nor retry — and the release delivers.
-        http.clear_status_busy("ses_q30");
-        FreshOpencodeState::observe_daemon_idle(&st, "ses_q30", "ses_q30").await;
-        await_prompt_posted(&http, "waits out the retry").await;
-        let session_arc = st.sessions.lock().await.get("ses_q30").cloned().unwrap();
-        let session = session_arc.lock().await;
-        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
-        assert!(session.pending_sends.is_empty());
-    }
-
-    /// Focused episode 3 round 3, Major 2: a TRANSIENT status-poll failure
-    /// must not permanently consume a genuine terminal idle — the
-    /// interrupted compact's only idle edge already fired, so no later
-    /// observation will re-try. The bounded-backoff retry ladder
-    /// re-polls; once the poll succeeds (the daemon idle) the release
-    /// and delivery happen WITHOUT any further idle event.
-    #[tokio::test]
-    async fn a_transient_status_poll_failure_does_not_strand_the_terminal_idle() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q31", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q31")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q31", "survives the poll failure")),
-        )
-        .await;
-
-        // The abort FAILS (answered 500) and settles — counter zero,
-        // latch armed.
-        http.arm_abort_fail();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            st.handle_interrupt(FreshAgentInterrupt {
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q31".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            }),
-        )
-        .await
-        .expect("interrupt answers (abort 500)");
-
-        // The compact's real terminal idle arrives with the running edge
-        // missed; the live poll FAILS transitively (one mid-exchange
-        // error). The retry ladder must re-poll and deliver WITHOUT any
-        // further idle event (the only idle edge already fired).
-        http.clear_status_busy("ses_q31");
-        http.arm_status_poll_failures(1);
-        FreshOpencodeState::observe_daemon_idle(&st, "ses_q31", "ses_q31").await;
-        await_prompt_posted(&http, "survives the poll failure").await;
-        let session_arc = st.sessions.lock().await.get("ses_q31").cloned().unwrap();
-        let session = session_arc.lock().await;
-        assert!(
-            !session.orphaned_daemon_turn.load(Ordering::SeqCst),
-            "the recovery watcher concluded the terminal idle — no strand"
-        );
-        assert!(session.pending_sends.is_empty());
-    }
-
-    /// Focused episode 3 round 4: the round-3 ladder stopped on a busy
-    /// answer — so a terminal idle MISSED in the supported SSE
-    /// reconnect/lag windows stranded the queue forever (no local turn
-    /// task, no further idle event, the latch blocking every drain).
-    /// The recovery watcher now owns it: a busy/retry verdict arms the
-    /// automatic poll watcher, which delivers WITHOUT any further idle
-    /// event once the daemon's live status settles.
-    #[tokio::test]
-    async fn a_missed_terminal_idle_is_recovered_by_the_poll_watcher() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q32", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q32")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q32", "needs the watcher")),
-        )
-        .await;
-
-        // The abort FAILS (answered 500) and settles — counter zero,
-        // latch armed.
-        http.arm_abort_fail();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            st.handle_interrupt(FreshAgentInterrupt {
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q32".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            }),
-        )
-        .await
-        .expect("interrupt answers (abort 500)");
-
-        // A stale idle polls BUSY (the compact still runs) — the verdict
-        // arms the automatic watcher.
-        http.arm_status_busy("ses_q32", 5);
-        FreshOpencodeState::observe_daemon_idle(&st, "ses_q32", "ses_q32").await;
-        for _ in 0..25 {
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            !http
-                .recorded()
-                .iter()
-                .any(|r| r.url.contains("prompt_async")),
-            "the busy verdict releases nothing"
-        );
-
-        // The compact settles and its terminal idle is MISSED entirely —
-        // no observe call, no idle event. The watcher's live polling
-        // drains the busy budget, sees the daemon settle, and delivers
-        // automatically.
-        await_prompt_posted(&http, "needs the watcher").await;
-        let session_arc = st.sessions.lock().await.get("ses_q32").cloned().unwrap();
-        let session = session_arc.lock().await;
-        assert!(
-            !session.orphaned_daemon_turn.load(Ordering::SeqCst),
-            "the watcher recovered the missed terminal idle — no strand"
-        );
-        assert!(session.pending_sends.is_empty());
-    }
-
-    /// Delta-review round 8 (extension 2), Major: the deferral ITSELF
-    /// arms the recovery watcher — arming only from an arriving idle
-    /// event left the compact's sole terminal idle LOST in the supported
-    /// SSE reconnect/lag window undiscovered: no observe, no watcher,
-    /// no polling, every drain blocked. Here NO idle event ever arrives;
-    /// the deferral's own watcher polls the daemon and delivers.
-    #[tokio::test]
-    async fn a_failed_abort_deferral_arms_the_recovery_watcher_by_itself() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q33", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q33")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q33", "needs no idle event at all")),
-        )
-        .await;
-
-        // The abort FAILS (answered 500) and settles — the deferral
-        // WARNs and arms the recovery watcher. NO idle observation is
-        // ever made: the compact's sole terminal idle is LOST to the
-        // supported reconnect/lag window.
-        http.arm_abort_fail();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            st.handle_interrupt(FreshAgentInterrupt {
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q33".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            }),
-        )
-        .await
-        .expect("interrupt answers (abort 500)");
-        let session_arc = st.sessions.lock().await.get("ses_q33").cloned().unwrap();
-        assert!(
-            session_arc
-                .lock()
-                .await
-                .orphaned_daemon_turn
-                .load(Ordering::SeqCst),
-            "the deferral holds the queue"
-        );
-
-        // The deferral-armed watcher polls the daemon's live status: the
-        // compact's seeded busy budget drains, the daemon settles, and
-        // the queue delivers — with NO idle event ever observed.
-        await_prompt_posted(&http, "needs no idle event at all").await;
-        let session_arc = st.sessions.lock().await.get("ses_q33").cloned().unwrap();
-        let session = session_arc.lock().await;
-        assert!(
-            !session.orphaned_daemon_turn.load(Ordering::SeqCst),
-            "the deferral-armed watcher recovered the lost terminal idle"
-        );
-        assert!(session.pending_sends.is_empty());
-    }
-
-    /// Delta-review round 8 (extension 2), Minor: the recovery watcher
-    /// STOPS when kill (or handoff) removes the session — the old loop
-    /// kept polling + broadcasting stale idle frames every 250ms for up
-    /// to ten minutes, and a quickly resumed pane using the same durable
-    /// id received those obsolete frames.
-    #[tokio::test]
-    async fn the_recovery_watcher_stops_when_the_session_is_killed() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, mut rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q34", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q34")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q34", "parked when the pane dies")),
-        )
-        .await;
-
-        // The abort FAILS and settles — the deferral arms the watcher.
-        http.arm_abort_fail();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            st.handle_interrupt(FreshAgentInterrupt {
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q34".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            }),
-        )
-        .await
-        .expect("interrupt answers (abort 500)");
-
-        // KILL the session — the watcher must stop; no stale idle frames
-        // may reach a later pane reusing this durable id.
-        st.sessions.lock().await.remove("ses_q34");
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_kill(FreshAgentKill {
-                observed_epoch: None,
-                observed_generation: None,
-                provider: AgentProvider::Opencode,
-                session_id: "ses_q34".to_string(),
-                session_type: SessionType::Freshopencode,
-                cwd: None,
-            }),
-        )
-        .await;
-        // Let several watcher ticks pass.
-        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
-        let frames = drain_frames(&mut rx);
-        assert!(
-            !frames.iter().any(|f| {
-                is_event(f, "freshAgent.session.snapshot", Some("idle"))
-                    && f["sessionId"] == "ses_q34"
-            }),
-            "a killed session's watcher must not broadcast stale idle frames"
-        );
-    }
-
-    /// Same rig with SummarizeOutcome::Answered500 + the gate (fixture
-    /// companion edit A makes the 500 arm park like OkAnswered — without
-    /// it, the compact settles before the send arrives and the queue is
-    /// never exercised). Queue a send while parked, release, the compact
-    /// FAILS — the settle tail still runs → the drain still fires.
-    #[tokio::test]
-    async fn a_queued_send_drains_after_a_failed_compact_too() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (st, http, mut rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::Answered500,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q4", Some("prov/model")).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_q4")),
-        )
-        .await
-        .expect("compact registers");
-        await_summarize_posted(&http).await;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q4", "drains past the failure")),
-        )
-        .await;
-        summarize_gate.notify_waiters();
-        // The failure is LOUD (pre-existing), and the queued send STILL drains.
-        let _ = frames_until(&mut rx, |f| {
-            is_event(f, "freshAgent.error", None) && f["event"]["code"] == "OPENCODE_COMPACT_FAILED"
-        })
-        .await;
-        await_prompt_posted(&http, "drains past the failure").await;
-    }
-
-    /// Task 5: the drain-time fence re-validation. The send is enqueued
-    /// with a CURRENTLY VALID observed pair (the old shape seeded an
-    /// already-stale generation, which an enqueue-only validation would
-    /// have refused identically — vacuous for the drain-time guarantee —
-    /// delta-review round 9, extension 2). Ownership then ADVANCES while
-    /// the entry still sits QUEUED: the test holds the session's
-    /// per-session mutex across the compact's settle, so the drain — the
-    /// drain-time revalidation itself — parks on the mutex BEFORE it
-    /// validates the captured pair, and the stop + re-grant (the handoff
-    /// class: stop the Live record with the CURRENT pair, then commit a
-    /// NEW Live at the next generation — generations are monotonic per
-    /// key) lands in exactly the window the drain-time revalidation
-    /// exists to close: after the fence's capture, before its atomic
-    /// validation. The registry's transition APIs structurally answer
-    /// BlockedHandoff under an armed attach window, so the transition
-    /// must land after the compact's own guard released at its dispatch
-    /// boundary — the post-settle revalidation slot, where a real
-    /// lifecycle move races the queued drain. The enqueued send is
-    /// PROVEN accepted with no early refusal (the revalidation is at
-    /// DRAIN time, not enqueue), and the drain-time refusal is TYPED and
-    /// REQUEST-CORRELATED: a top-level `error` frame carrying the
-    /// send's requestId (the send_error idiom — the wire `error.code` is
-    /// always INTERNAL_ERROR, the typed code rides in the message),
-    /// never an uncorrelated session-scoped broadcast. The refused entry
-    /// never POSTs, is discarded (never retried), and the queue
-    /// CONTINUES: an unfenced send queued behind it drains and POSTs
-    /// (the direct send path's parse-only tolerance — the queue is never
-    /// stricter than the path it re-enters).
-    #[tokio::test]
-    async fn a_stale_queued_fence_refuses_typed_at_drain_and_the_queue_continues() {
-        // Same gated rig, plus a coordinator registry seeded Live{FreshAgent}
-        // on the durable key — the SAME seeding the parked-compact tests use
-        // (the compact itself MUST be fenced with the current pair: an
-        // unfenced compact against a Live{FreshAgent} key is the typed
-        // FENCE_REQUIRED refusal and the drive never spawns).
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (mut st, http, mut rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q6", Some("prov/model")).await;
-        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
-        st.set_ownership(Arc::clone(&registry));
-        seed_live_fresh_owner(&registry, "ses_q6"); // Live{FreshAgent} at generation G
-        let (epoch, generation) = fenced_observed(&registry, "ses_q6"); // the current pair
-
-        // The compact, FENCED with the current pair.
-        let mut compact = compact_msg("ses_q6");
-        (compact.observed_epoch, compact.observed_generation) = (epoch, generation);
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact),
-        )
-        .await
-        .expect("compact registers (fenced)");
-        await_summarize_posted(&http).await;
-
-        // (1) A CURRENTLY VALID observed pair: the send is ACCEPTED into
-        // the queue while the compact is parked — no early refusal (an
-        // enqueue-only validation would be indistinguishable from the
-        // drain-time one, so the acceptance-while-parked is the load-
-        // bearing half of this proof).
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg_fenced(
-                "ses_q6",
-                "valid at enqueue",
-                epoch,
-                generation,
-            )),
-        )
-        .await;
-        {
-            let session_arc = st.sessions.lock().await.get("ses_q6").cloned().unwrap();
-            assert_eq!(
-                session_arc.lock().await.pending_sends.len(),
-                1,
-                "the valid-at-enqueue send is queued behind the parked compact"
-            );
-        }
-        let early = drain_frames(&mut rx);
-        assert!(
-            !early
-                .iter()
-                .any(|f| f["type"] == "error" && f["requestId"] == "req-valid at enqueue"),
-            "no refusal before the drain — the revalidation happens at DRAIN time: {early:?}"
-        );
-
-        // (2) An UNFENCED send queues behind it — the queue-continues
-        // probe (the direct send path's parse-only tolerance; the queue
-        // is never stricter than the path it re-enters).
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q6", "unfenced one")),
-        )
-        .await;
-        {
-            let session_arc = st.sessions.lock().await.get("ses_q6").cloned().unwrap();
-            assert_eq!(
-                session_arc.lock().await.pending_sends.len(),
-                2,
-                "the queue holds the fenced and the unfenced entries"
-            );
-        }
-
-        // (3) THE PARK: hold the session's per-session mutex across the
-        // settle. Every drain (the enqueue-triggered ones and the
-        // compact's settle-tail one) parks ON the mutex before it can
-        // reach the captured pair's validation — an async park, so the
-        // runtime, the compact's own settle bookkeeping, and the test
-        // itself all keep making progress.
-        let session_arc = st.sessions.lock().await.get("ses_q6").cloned().unwrap();
-        let session_guard = session_arc.lock().await;
-        summarize_gate.notify_waiters();
-
-        // (4) THE STALE WINDOW: the entry still sits QUEUED, and
-        // ownership ADVANCES under it — the Live record (stoppable with
-        // the CURRENT pair the send also observed) is stopped to Vacant
-        // and a NEW start-commit grants Live at a newer generation (the
-        // handoff class — generations are monotonic per key). The
-        // compact's op guard releases at its dispatch boundary — a
-        // ≤5ms witness-watch the drive task runs on its own scheduling —
-        // so the stop uses the registry's OWN retryable-refusal
-        // discipline: `BlockedHandoff` is the typed "retry after the
-        // attach completes" answer, and the bounded retry loop IS the
-        // wait (the grant proves the window freed; each 5ms sleep also
-        // yields the runtime so the drive task's watcher can run and
-        // drop the guard). No drain has armed an attach guard (they are
-        // all parked on the mutex), so once the compact's guard is down
-        // the transition window is free — deterministic.
-        let stop_gen = {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                match registry.begin_stop(
-                    PROVIDER,
-                    "ses_q6",
-                    "op-q6-advance",
-                    &freshell_ownership::StopClaim {
-                        expected_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
-                        expected_runtime: None,
-                        observed: freshell_ownership::ObservedFence {
-                            epoch: registry.boot_epoch(),
-                            generation: generation
-                                .expect("the seeded Live pair carries a generation"),
-                        },
-                    },
-                    "test",
-                    freshell_ownership::now_epoch_ms(),
-                ) {
-                    freshell_ownership::StopOutcome::Granted { generation } => break generation,
-                    freshell_ownership::StopOutcome::BlockedHandoff { .. } => {
-                        assert!(
-                            tokio::time::Instant::now() < deadline,
-                            "the current-pair stop never granted — the compact's \
-                             guard never released its attach window"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                    }
-                    other => panic!("the current-pair stop must begin: {other:?}"),
-                }
-            }
-        };
-        assert_eq!(
-            registry.commit_stop(PROVIDER, "ses_q6", "op-q6-advance", stop_gen),
-            freshell_ownership::CommitOutcome::Committed
-        );
-        seed_live_fresh_owner(&registry, "ses_q6");
-        let still_no_early = drain_frames(&mut rx);
-        assert!(
-            !still_no_early
-                .iter()
-                .any(|f| f["type"] == "error" && f["requestId"] == "req-valid at enqueue"),
-            "the advancement alone refuses nothing — the queue holds the entry: {still_no_early:?}"
-        );
-
-        // (5) Release the mutex: the settle completes, the drain runs,
-        // and the captured pair is validated ATOMICALLY — the
-        // advanced-past entry is refused AT DRAIN, TYPED and
-        // REQUEST-CORRELATED: a top-level `error` frame carrying its
-        // requestId. The wire `error.code` is always INTERNAL_ERROR (the
-        // send_error idiom); the typed code rides in the MESSAGE —
-        // assert the requestId and the guard's stale wording
-        // (STALE_OP_GUARD_MESSAGE) in the message, never a wire code.
-        drop(session_guard);
-        let frames = frames_until(&mut rx, |f| {
-            f["type"] == "error" && f["requestId"] == "req-valid at enqueue"
-        })
-        .await;
-        assert!(
-            frames.iter().any(|f| f["message"]
-                .to_string()
-                .to_lowercase()
-                .contains("newer ownership generation")),
-            "the drain-time stale-fence refusal carries the guard's stale-fence message: {frames:?}"
-        );
-        // (6) It never POSTs.
-        assert!(
-            !http
-                .recorded()
-                .iter()
-                .any(|r| r.url.contains("prompt_async") && r_body_contains(r, "valid at enqueue")),
-            "the refused stale entry must never reach the prompt POST"
-        );
-        // (7) The queue CONTINUES: the unfenced entry drains and POSTs.
-        await_prompt_posted(&http, "unfenced one").await;
-        let session_arc = st.sessions.lock().await.get("ses_q6").cloned().unwrap();
-        assert!(
-            session_arc.lock().await.pending_sends.is_empty(),
-            "the refused entry was discarded; the unfenced entry drained"
-        );
-        // (8) The never-POSTs guarantee holds for the DRAIN'S WHOLE
-        // LIFETIME, not just the refusal instant: the queue is empty (the
-        // drain loop has fully settled) and the continuation entry has
-        // POSTed, so a faulty drain that emits the refusal but falls
-        // through or asynchronously dispatches the stale entry afterward
-        // is caught HERE (focused episode 5 round 1) — the stale prompt
-        // must still be absent, never mutating the newer owner's turn
-        // history.
-        assert!(
-            !http
-                .recorded()
-                .iter()
-                .any(|r| r.url.contains("prompt_async") && r_body_contains(r, "valid at enqueue")),
-            "the refused stale entry must never reach the prompt POST, even after \
-             the drain has fully settled and the continuation entry POSTed"
-        );
-    }
-
-    /// Task 5: the settled tolerance pin — an UNFENCED queued send (the
-    /// legacy client shape: no observed pair on the wire message) queued
-    /// behind a fenced compact on a WIRED Live key proceeds at drain
-    /// exactly like the direct send path: the queue re-enters the send
-    /// path and is not stricter than the path it re-enters. The op
-    /// guard's no-laundering discipline (an unfenced None against a Live
-    /// key is the typed FENCE_REQUIRED refusal) binds the
-    /// history-RESTRUCTURING lanes (compact/rollback/fork), not the
-    /// append-a-turn send lane — `handle_send`'s direct path is
-    /// fence-parse-only, and the drain matches it.
-    #[tokio::test]
-    async fn an_unfenced_queued_send_drains_like_a_direct_send_against_a_wired_owner() {
-        let summarize_gate = Arc::new(tokio::sync::Notify::new());
-        let (mut st, http, _rx) = compact_state_gated(
-            r#"{"model":null}"#,
-            SummarizeOutcome::OkAnswered,
-            Some(summarize_gate.clone()),
-            None,
-        )
-        .await;
-        insert_compact_session(&st, "ses_q7", Some("prov/model")).await;
-        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
-        st.set_ownership(Arc::clone(&registry));
-        seed_live_fresh_owner(&registry, "ses_q7");
-        let (epoch, generation) = fenced_observed(&registry, "ses_q7");
-        let mut compact = compact_msg("ses_q7");
-        (compact.observed_epoch, compact.observed_generation) = (epoch, generation);
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_compact(compact),
-        )
-        .await
-        .expect("compact registers (fenced)");
-        await_summarize_posted(&http).await;
-        // UNFENCED (send_msg sends no observed pair).
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q7", "unfenced but queued")),
-        )
-        .await;
-        summarize_gate.notify_waiters();
-        await_prompt_posted(&http, "unfenced but queued").await;
-        let session_arc = st.sessions.lock().await.get("ses_q7").cloned().unwrap();
-        assert!(session_arc.lock().await.pending_sends.is_empty());
     }
 
     // ── freshAgent.fork (AGENT-07, approval-respond Task 5) ────────────────
@@ -22773,5 +22136,5537 @@ mod tests {
             .expect("a binding row re-snapshot");
         assert_eq!(last.settings.model.as_deref(), Some("prov/mdl-b"));
         assert_eq!(last.settings.effort.as_deref(), Some("low"));
+    }
+
+    // ── Task 4 (opencode daemon-death recovery): the runtime-level self-heal ──
+    //
+    // 2026-09-20 incident: the shared daemon died and NOTHING told the panes —
+    // no status edge, no respawn, no bridge revival; panes dead-ended on the
+    // snapshot 409. The runtime self-heal must make daemon loss observable and
+    // recoverable per session (mirroring the freshcodex onExit self-heal).
+    // (LB-02: revival is LEVEL-TRIGGERED — it runs on arming and on every
+    // `Started`, never dependent on having observed `Lost`.)
+
+    /// A serve whose "exit" is test-controlled: `exited()` reports `Some(0)`
+    /// once the shared flag is set (the Task 3 selfheal fixture shape) — the
+    /// flag-driven daemon death both the manager's exit watcher and the
+    /// runtime's loss listener observe.
+    struct FlagExitProcess {
+        exited: Arc<AtomicBool>,
+    }
+    impl ServeProcess for FlagExitProcess {
+        fn exited(&self) -> Option<i32> {
+            self.exited.load(Ordering::SeqCst).then_some(0)
+        }
+        fn take_fatal_startup_error(&self) -> Option<String> {
+            None
+        }
+        fn kill(&self) {}
+    }
+
+    /// Every generation hands out a [`FlagExitProcess`] sharing the flag;
+    /// spawns counted (the respawn accounting the fenced-attach test asserts).
+    struct FlagExitSpawner {
+        exited: Arc<AtomicBool>,
+        spawns: Arc<AtomicUsize>,
+    }
+    impl ProcessSpawner for FlagExitSpawner {
+        fn spawn(&self, _req: SpawnRequest) -> Result<Box<dyn ServeProcess>, String> {
+            self.spawns.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(FlagExitProcess {
+                exited: self.exited.clone(),
+            }))
+        }
+    }
+
+    /// Task 4 harness: a state wired to a STARTED selfheal-config fake manager
+    /// (tiny watch + backoff knobs so the manager's own backoff-guarded re-warm
+    /// runs at test speed) whose daemon's death is flag-controlled, plus the
+    /// bus receiver every frame assertion reads.
+    async fn selfheal_state(
+        backoff_initial_ms: u64,
+        backoff_max_ms: u64,
+    ) -> (
+        FreshOpencodeState,
+        tokio::sync::broadcast::Receiver<String>,
+        Arc<AtomicBool>,
+        Arc<AtomicUsize>,
+        OpencodeServeManager,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(256);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let exited = Arc::new(AtomicBool::new(false));
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let deps = ServeDeps {
+            spawner: Arc::new(FlagExitSpawner {
+                exited: exited.clone(),
+                spawns: spawns.clone(),
+            }),
+            http: Arc::new(FakeHttp {
+                next_session: AtomicUsize::new(0),
+            }),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(20),
+            daemon_watch_interval: Duration::from_millis(10),
+            re_warm_backoff_initial_ms: backoff_initial_ms,
+            re_warm_backoff_max_ms: backoff_max_ms,
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager.clone()).await;
+        (
+            FreshOpencodeState::new(fresh_agent),
+            rx,
+            exited,
+            spawns,
+            manager,
+        )
+    }
+
+    /// The session's durable `ses_*` id (the fixture must have materialized).
+    async fn real_session_id_of(st: &FreshOpencodeState, placeholder: &str) -> String {
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("tracked").clone()
+        };
+        let durable = session_arc
+            .lock()
+            .await
+            .real_session_id
+            .clone()
+            .expect("the session materialized");
+        durable
+    }
+
+    /// Is the session's serve-SSE bridge live? False for an unmapped id (a
+    /// killed/handed-off session) and for a mapped session whose bridge is
+    /// dead/absent — the exact predicate the revival pass restarts on.
+    async fn session_serve_bridge_alive(st: &FreshOpencodeState, id: &str) -> bool {
+        let Some(session_arc) = st.sessions.lock().await.get(id).cloned() else {
+            return false;
+        };
+        let session = session_arc.lock().await;
+        session
+            .serve_bridge
+            .as_ref()
+            .map(|b| !b.is_finished())
+            .unwrap_or(false)
+    }
+
+    /// Bounded wait until the coordinator shows the durable id Live under a
+    /// FRESH-AGENT owner (the materialization commit the revival/attach gates
+    /// consult).
+    async fn await_freshagent_live(
+        registry: &Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+        durable: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if matches!(
+                registry.observe("opencode", durable).state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+            ) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the materialization's Live{{FreshAgent}} commit never landed for {durable}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Model the committed-terminal-handoff shape: `begin_handoff` (granted)
+    /// then `commit_live` under a TERMINAL owner — the exact pair of calls a
+    /// finished terminal handoff leaves behind in the coordinator.
+    async fn commit_terminal_owner(
+        registry: &Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+        durable: &str,
+    ) {
+        let operation_id = format!("handoff-{durable}");
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
+            "opencode",
+            durable,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            &operation_id,
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("the handoff begin must grant for {durable}")
+        };
+        assert!(
+            matches!(
+                registry.commit_live(
+                    "opencode",
+                    durable,
+                    &operation_id,
+                    generation,
+                    freshell_ownership::OwnerIdentity {
+                        kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                        terminal_id: Some(format!("t-{durable}")),
+                        live_session_key: None,
+                        pid: None,
+                        ownership_id: None,
+                    },
+                ),
+                freshell_ownership::CommitOutcome::Committed
+            ),
+            "the terminal owner commit must land for {durable}"
+        );
+    }
+
+    /// Materialize one session through the REAL create+send path and settle
+    /// its turn locally (the existing IdleTimeout-shaped seam) so the only
+    /// frames after it are the machinery under test. Returns
+    /// (placeholder, durable).
+    async fn materialized_selfheal_session(
+        st: &FreshOpencodeState,
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        req: &str,
+    ) -> (String, String) {
+        st.handle_create(create_msg(req), None).await;
+        let placeholder = format!("freshopencode-{req}");
+        st.handle_send(send_msg(&placeholder, "materialize")).await;
+        let durable = real_session_id_of(st, &placeholder).await;
+        st.settle_local_turn_task_for_test(&placeholder).await;
+        let _ = drain_frames(rx);
+        (placeholder, durable)
+    }
+
+    /// Task 4 contract: the incident's silent half — a daemon that dies must
+    /// (a) fan a TYPED `OPENCODE_DAEMON_LOST` edge out to every MATERIALIZED
+    /// session (the dismissible banner + busy-clear the client folds through
+    /// the generic `sessionError` path), exactly ONE edge per session even
+    /// though the map is DUAL-KEYED (placeholder + durable id → the SAME
+    /// session), (b) NEVER chime (a crash is not a positive completion), and
+    /// (c) after the manager's backoff-guarded respawn, restart the dead
+    /// bridge and push the `status:"idle"` snapshot the client treats as a
+    /// transcript refetch.
+    #[tokio::test]
+    async fn daemon_loss_fans_out_a_typed_edge_then_revives_bridges_after_respawn() {
+        let (st, mut rx, exited, _spawns, manager) = selfheal_state(5, 50).await;
+
+        let (_placeholder, durable) =
+            materialized_selfheal_session(&st, &mut rx, "req-daemon-loss").await;
+        // Fixture honesty: the session is dual-keyed — the dedupe contract's
+        // whole point (two map keys, ONE materialized session).
+        assert_eq!(
+            st.sessions.lock().await.len(),
+            2,
+            "fixture: placeholder + durable keys both map the session"
+        );
+
+        exited.store(true, Ordering::SeqCst); // the daemon dies
+
+        // THE TYPED EDGE (the incident's missing half).
+        let loss_frames = frames_until(&mut rx, |f| {
+            f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.error"
+                && f["event"]["code"] == "OPENCODE_DAEMON_LOST"
+        })
+        .await;
+        let edge = loss_frames.last().expect("the matching edge");
+        assert_eq!(edge["provider"], "opencode");
+        assert_eq!(edge["sessionType"], "freshopencode");
+        assert_eq!(edge["sessionId"].as_str(), Some(durable.as_str()));
+        assert_eq!(edge["event"]["sessionId"].as_str(), Some(durable.as_str()));
+        assert_eq!(
+            edge["event"]["message"].as_str(),
+            Some(
+                "The opencode serve daemon was lost unexpectedly - it is restarting automatically."
+            )
+        );
+
+        exited.store(false, Ordering::SeqCst); // the re-warm's respawn now succeeds
+
+        // `DaemonSignal::Started` → the LEVEL-TRIGGERED revival: the dead
+        // bridge restarts and the client sees the snapshot-invalidating idle
+        // push (never a remembered-`Lost` heuristic).
+        let revive_frames = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                && f["sessionId"].as_str() == Some(durable.as_str())
+        })
+        .await;
+
+        // NO chime ever accompanies a daemon loss, and the DUAL-KEYED session
+        // got exactly ONE edge — audit the whole post-loss window.
+        let mut all = loss_frames;
+        all.extend(revive_frames);
+        all.extend(drain_frames(&mut rx));
+        let edges = all
+            .iter()
+            .filter(|f| {
+                f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == "freshAgent.error"
+                    && f["event"]["code"] == "OPENCODE_DAEMON_LOST"
+                    && f["sessionId"].as_str() == Some(durable.as_str())
+            })
+            .count();
+        assert_eq!(
+            edges, 1,
+            "exactly ONE loss edge for the dual-keyed session: {all:?}"
+        );
+        assert!(
+            all.iter()
+                .all(|f| f["event"]["type"] != "freshAgent.turn.complete"),
+            "a daemon loss is never a positive completion — no chime: {all:?}"
+        );
+
+        assert!(
+            session_serve_bridge_alive(&st, &durable).await,
+            "the bridge must be restarted after the respawn"
+        );
+        assert!(
+            manager.base_url().await.is_some(),
+            "the manager's backoff-guarded re-warm respawned the daemon"
+        );
+    }
+
+    /// Delta round 2 (fresheyes Major — the doomed-bridge revival race): the
+    /// manager's loss path clears the running entry, fans `Lost`, and
+    /// re-warms INDEPENDENTLY of the per-session bridge tasks — a bridge
+    /// task still draining its closed channel when the new daemon's
+    /// `Started` revival pass runs was treated as healthy (task liveness
+    /// alone), so the pass answered `Ok(None)`: no restart, no recovery
+    /// snapshot, and the pane dead-ended on NO bridge. The interleaving is
+    /// forced to its extreme here: the session's bridge is a task that
+    /// never finishes on its own (the real bridge's draining window
+    /// between consuming `Lost` and observing channel-closed, held open
+    /// past any revival pass), the daemon generation moves A→B underneath
+    /// it, and the `Started`-driven revival pass must nevertheless
+    /// RESTART the bridge bound to the new daemon and push the client's
+    /// recovery snapshot.
+    #[tokio::test]
+    async fn revival_restarts_a_bridge_still_draining_from_a_lost_daemon_generation() {
+        let (st, mut rx, exited, _spawns, manager) = selfheal_state(5, 50).await;
+
+        let (_placeholder, durable) =
+            materialized_selfheal_session(&st, &mut rx, "req-doomed-bridge").await;
+
+        // THE DOOMED BRIDGE: swap the materialized session's live bridge for
+        // a stand-in task that never finishes on its own — a bridge
+        // provably ALIVE (so the pre-fix liveness check is fooled) yet
+        // doomed (its daemon is about to be lost). The drop-guard records
+        // the abort the restart owes the superseded task: a restart that
+        // merely dropped the handle would leak the still-draining task.
+        let doomed_aborted = Arc::new(AtomicBool::new(false));
+        struct AbortWitness(Arc<AtomicBool>);
+        impl Drop for AbortWitness {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let witness = doomed_aborted.clone();
+        {
+            let session_arc = st
+                .sessions
+                .lock()
+                .await
+                .get(&durable)
+                .cloned()
+                .expect("the materialized session is tracked under its durable id");
+            let mut session = session_arc.lock().await;
+            if let Some(old) = session.serve_bridge.take() {
+                old.abort();
+            }
+            session.serve_bridge = Some(tokio::spawn(async move {
+                let _abort_witness = AbortWitness(witness);
+                std::future::pending::<()>().await
+            }));
+        }
+
+        exited.store(true, Ordering::SeqCst); // daemon generation A dies
+
+        // The loss completes — the typed edge proves the watcher's Lost arm
+        // ran (lose_daemon cleared the running entry before the edge was
+        // fanned, and scheduled the re-warm).
+        let loss_frames = frames_until(&mut rx, |f| {
+            f["type"] == "freshAgent.event"
+                && f["event"]["code"] == "OPENCODE_DAEMON_LOST"
+                && f["sessionId"].as_str() == Some(durable.as_str())
+        })
+        .await;
+
+        exited.store(false, Ordering::SeqCst); // the re-warm's respawn now succeeds
+
+        // `DaemonSignal::Started` → the LEVEL-TRIGGERED revival pass runs
+        // while the doomed bridge task is provably STILL ALIVE. It must
+        // not be fooled by task liveness: the bridge is bound to the LOST
+        // daemon generation, so it restarts against the new daemon and
+        // pushes the snapshot-invalidating idle frame (the client's
+        // transcript refetch). On the pre-fix code this never arrives —
+        // the pass sees the unfinished task, answers Ok(None), and the
+        // session is left with NO bridge.
+        let revive_frames = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                && f["sessionId"].as_str() == Some(durable.as_str())
+        })
+        .await;
+
+        // The restart ABORTED the superseded draining task (bounded wait —
+        // the abort drop is scheduler-side).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !doomed_aborted.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the revival restart must abort the doomed draining bridge task"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The session now holds a NEW live bridge, bound to the respawned
+        // daemon.
+        assert!(
+            session_serve_bridge_alive(&st, &durable).await,
+            "the doomed bridge was replaced by a live bridge bound to the new daemon"
+        );
+        assert!(
+            manager.base_url().await.is_some(),
+            "the manager's backoff-guarded re-warm respawned the daemon"
+        );
+
+        // Exactly ONE recovery snapshot for the actually-restarted bridge
+        // (a later level-triggered pass must no-op against the now-current
+        // bridge — push only to actually-restarted bridges), and NO chime
+        // anywhere in the post-loss window.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut all = loss_frames;
+        all.extend(revive_frames);
+        all.extend(drain_frames(&mut rx));
+        let pushes = all
+            .iter()
+            .filter(|f| {
+                is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                    && f["sessionId"].as_str() == Some(durable.as_str())
+            })
+            .count();
+        assert_eq!(
+            pushes, 1,
+            "exactly ONE recovery snapshot for the restarted bridge: {all:?}"
+        );
+        assert!(
+            all.iter()
+                .all(|f| f["event"]["type"] != "freshAgent.turn.complete"),
+            "a daemon loss is never a positive completion — no chime: {all:?}"
+        );
+    }
+
+    /// Bounded wait until the session's serve-SSE bridge reaches the wanted
+    /// liveness — the ep2-r2 transitional-window fixture's observable (the
+    /// bridge's death by channel-close and its rescue are both scheduler-side
+    /// events, so the fixture polls instead of racing them).
+    async fn await_bridge_liveness(
+        st: &FreshOpencodeState,
+        id: &str,
+        want_alive: bool,
+        what: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if session_serve_bridge_alive(st, id).await == want_alive {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for the {id} bridge to be {}: {what}",
+                if want_alive { "alive" } else { "dead" }
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// ep2-r2 fresheyes Major (the transitional-window dead bridge): the
+    /// generation-fenced bridge is installed BEFORE the forked child is
+    /// published in `sessions` or committed `Live` (materialization remains
+    /// `Starting`), so a daemon loss that captures the fresh bridge's sender
+    /// inside that window leaves the child with a dead bridge and NO
+    /// recovery trigger: B's one-shot `Started` revival pass either cannot
+    /// see the child (unpublished) or deliberately skips its transitional
+    /// ownership state, and the re-warm's fast path (B already running)
+    /// emits no second `Started`. The operation still answers success — a
+    /// pane with a permanently dead event bridge.
+    ///
+    /// The interleaving, forced deterministically through the REAL paths:
+    /// the child's binding-row write parks the fork between its map
+    /// publication and its `Live` commit (`arm_binding_stall`); while
+    /// parked, daemon A dies through the REAL watcher arm (the take sweeps
+    /// the child's just-subscribed sender — the fanned `Lost` closes the
+    /// bridge's channel and the task exits), B re-warms, and B's one-shot
+    /// `Started` revival pass runs: it rescues the PARENT (`Live`) — and,
+    /// because the pass visits the sorted durable ids ("ses_child" before
+    /// "ses_parent"), the parent's rescue PROVES the pass already visited
+    /// and SKIPPED the `Starting` child. Releasing the park lets the
+    /// commit land, and the operation must not answer success over the
+    /// dead bridge: the post-commit rescue tail restarts it against B and
+    /// pushes the client's recovery snapshot (exactly one; no chime
+    /// anywhere).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transitional_fork_child_survives_a_daemon_loss_in_its_starting_window() {
+        // The selfheal manager shape (flag-controlled daemon death,
+        // test-speed watch/backoff knobs) over a FORK-serving HTTP fake.
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(256);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let exited = Arc::new(AtomicBool::new(false));
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let deps = ServeDeps {
+            spawner: Arc::new(FlagExitSpawner {
+                exited: exited.clone(),
+                spawns: spawns.clone(),
+            }),
+            http: Arc::new(ForkFakeHttp::child_ok()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(20),
+            daemon_watch_interval: Duration::from_millis(10),
+            re_warm_backoff_initial_ms: 5,
+            re_warm_backoff_max_ms: 50,
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager.clone()).await;
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        insert_fork_parent(&st, "ses_parent", Some("/parent/cwd"), None, None).await;
+        seed_live_fresh_owner(&registry, "ses_parent");
+        // Arm the runtime's daemon-loss watcher (production arms it at the
+        // first WS entry point; the fork lane does not, so arm it here). Its
+        // arming-time level pass bridges the bridgeless parent; drain that
+        // push so the frames below are only the machinery under test.
+        st.ensure_daemon_loss_watcher().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = drain_frames(&mut rx);
+        assert!(
+            session_serve_bridge_alive(&st, "ses_parent").await,
+            "fixture: the arming-time pass bridged the parent"
+        );
+
+        // Park the fork between the child's map publication and its `Live`
+        // commit: the child's binding-row write stalls behind the release.
+        let stall = fake.arm_binding_stall("opencode", "ses_child");
+        let (sink, captured) = capturing_sink();
+
+        // The mid-fork mover: once the fork parks, drive the finding's
+        // exact interleaving through the REAL loss/re-warm/revival paths,
+        // prove the revival pass skipped the transitional child, then
+        // release the park.
+        let mover_state = st.clone();
+        let mover_manager = manager.clone();
+        let mover_exited = exited.clone();
+        let mover = tokio::spawn(async move {
+            stall
+                .entered
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("the fork parks between the child's publication and its Live commit");
+            // Daemon A dies. The loss completes: the take cleared the
+            // running slot (the sweep ran inside the same critical
+            // section)...
+            mover_exited.store(true, Ordering::SeqCst);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while mover_manager.base_url().await.is_some() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "A's loss must take the running entry within the budget"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // ...and the fanned `Lost` + dropped swept senders closed BOTH
+            // bridges' channels: the parent's A-era bridge and the parked
+            // child's (the loss captured the child's just-subscribed
+            // sender — the finding's premise).
+            await_bridge_liveness(
+                &mover_state,
+                "ses_parent",
+                false,
+                "A's loss drains the parent's A-era bridge",
+            )
+            .await;
+            await_bridge_liveness(
+                &mover_state,
+                "ses_child",
+                false,
+                "A's loss drains the parked child's bridge (its sender was swept)",
+            )
+            .await;
+            mover_exited.store(false, Ordering::SeqCst);
+            // B re-warms and its one-shot `Started` revival pass runs: the
+            // PARENT (Live) is rescued. The pass visits "ses_child" FIRST
+            // (sorted ids), so the parent's rescue proves the pass already
+            // visited — and skipped — the transitional child.
+            await_bridge_liveness(
+                &mover_state,
+                "ses_parent",
+                true,
+                "B's Started revival rescues the Live parent",
+            )
+            .await;
+            assert!(
+                !session_serve_bridge_alive(&mover_state, "ses_child").await,
+                "fixture: the Started revival deliberately skipped the Starting \
+                 child — the dead transitional bridge the tail must rescue"
+            );
+            stall.release.send(()).expect("release the parked fork");
+        });
+
+        let mut fork_request = fork_msg("ses_parent", "fork-req-trans", None);
+        (
+            fork_request.observed_epoch,
+            fork_request.observed_generation,
+        ) = fenced_observed(&registry, "ses_parent");
+        st.handle_fork(fork_request, None, sink).await;
+        mover.await.expect("the mover completed the interleaving");
+
+        // The operation SUCCEEDED — the finding's premise: a successful
+        // forked reply over the dead transitional bridge.
+        let captured = captured.lock().expect("captured mutex").clone();
+        assert_eq!(
+            captured.len(),
+            1,
+            "the fork answers exactly one frame: {captured:?}"
+        );
+        assert!(
+            matches!(captured[0], ServerMessage::FreshAgentForked { .. }),
+            "the forked reply landed: {captured:?}"
+        );
+        await_freshagent_live(&registry, "ses_child").await;
+
+        // THE BRIDGE: the pane must not dead-end — the child ends up with a
+        // LIVE bridge bound to the successor daemon (RED on HEAD: the
+        // skipped revival left the dead A-era task in place and nothing
+        // ever restarted it).
+        assert!(
+            session_serve_bridge_alive(&st, "ses_child").await,
+            "the fork must not answer success over a dead bridge — the \
+             transitional child's bridge was killed by the daemon loss and \
+             no revival trigger ever came (ep2-r2)"
+        );
+
+        // THE RECOVERY SNAPSHOT: the client's transcript-refetch push for
+        // the actually-restarted bridge.
+        let revive_frames = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                && f["sessionId"].as_str() == Some("ses_child")
+        })
+        .await;
+        let mut all = revive_frames;
+        all.extend(drain_frames(&mut rx));
+        let pushes = all
+            .iter()
+            .filter(|f| {
+                is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                    && f["sessionId"].as_str() == Some("ses_child")
+            })
+            .count();
+        assert_eq!(
+            pushes, 1,
+            "exactly ONE recovery snapshot for the rescued child: {all:?}"
+        );
+        let edges = all
+            .iter()
+            .filter(|f| {
+                f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == "freshAgent.error"
+                    && f["event"]["code"] == "OPENCODE_DAEMON_LOST"
+                    && f["sessionId"].as_str() == Some("ses_child")
+            })
+            .count();
+        assert_eq!(
+            edges, 1,
+            "exactly ONE typed loss edge for the child: {all:?}"
+        );
+        assert!(
+            all.iter()
+                .all(|f| f["event"]["type"] != "freshAgent.turn.complete"),
+            "a daemon loss is never a positive completion — no chime: {all:?}"
+        );
+        assert!(
+            manager.base_url().await.is_some(),
+            "fixture: the successor daemon B serves"
+        );
+        let _ = spawns;
+    }
+
+    /// ep2-r3 fresheyes Major (the rescue can resurrect a killed/handed-off
+    /// session): the post-commit rescue clones the session `Arc` out of the
+    /// map, releases the map lock, and takes the session lock WITHOUT
+    /// rechecking `killed`, map membership, or ownership — a kill/handoff
+    /// that completes in that window (killed flag set, every map key
+    /// removed, the coordinator's stop committed) leaves the rescue
+    /// holding a RETIRED session whose absent bridge it then "restarts": a
+    /// detached fresh-agent bridge for the killed session, an idle-snapshot
+    /// push over the retired session, and the operation answering SUCCESS
+    /// over it.
+    ///
+    /// The interleaving, forced deterministically through the `cfg(test)`
+    /// rescue stall: the fork child's rescue fires `entered` right after its
+    /// map-lookup clone and parks; while held, a REAL `freshAgent.kill` of
+    /// the child COMPLETES (killed flag, every map key, the coordinator's
+    /// Vacant commit — the ownership observation's refusal input); only
+    /// then is the rescue released. It must REFUSE — no bridge install, no
+    /// snapshot push — and the fork must answer its stale-commit
+    /// ownership-changed error frame, never `FreshAgentForked`. Pre-fix,
+    /// the released rescue installed a fresh bridge on the killed child
+    /// (its detached task kept broadcasting for the retired session) and
+    /// pushed the idle snapshot, and the fork answered success.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_landing_between_the_rescue_lookup_and_its_lock_never_resurrects_the_fork_child()
+    {
+        // The selfheal manager shape (the daemon never dies in this test —
+        // the KILL is the mover) over a FORK-serving HTTP fake.
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(256);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let exited = Arc::new(AtomicBool::new(false));
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let deps = ServeDeps {
+            spawner: Arc::new(FlagExitSpawner {
+                exited: exited.clone(),
+                spawns: spawns.clone(),
+            }),
+            http: Arc::new(ForkFakeHttp::child_ok()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(20),
+            daemon_watch_interval: Duration::from_millis(10),
+            re_warm_backoff_initial_ms: 60_000,
+            re_warm_backoff_max_ms: 120_000,
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager.clone()).await;
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        insert_fork_parent(&st, "ses_parent", Some("/parent/cwd"), None, None).await;
+        seed_live_fresh_owner(&registry, "ses_parent");
+
+        // Park the child's post-commit rescue between its map-lookup clone
+        // and its session-lock take.
+        let stall = st.arm_rescue_stall("ses_child");
+        let (sink, captured) = capturing_sink();
+        let st2 = st.clone();
+        let mut fork_request = fork_msg("ses_parent", "fork-ep2r3", None);
+        (
+            fork_request.observed_epoch,
+            fork_request.observed_generation,
+        ) = fenced_observed(&registry, "ses_parent");
+        let fork = tokio::spawn(async move { st2.handle_fork(fork_request, None, sink).await });
+
+        stall
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the rescue parks between its map-lookup clone and its session-lock take");
+
+        // The concurrent kill, driven through the REAL path to completion:
+        // the killed flag, EVERY map key aliasing the child, the bridge
+        // abort, and the coordinator's Stopping→Vacant commit.
+        st.handle_kill(FreshAgentKill {
+            provider: AgentProvider::Opencode,
+            session_id: "ses_child".to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+            observed_epoch: None,
+            observed_generation: None,
+        })
+        .await;
+        assert!(
+            !st.has_live_session("ses_child").await,
+            "fixture: the kill removed every map key for the child"
+        );
+        assert!(
+            !matches!(
+                st.ownership_snapshot("opencode", "ses_child").state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+            ),
+            "fixture: the coordinator no longer holds the child Live{{FreshAgent}}"
+        );
+
+        // Release the parked rescue: its `Arc` was cloned BEFORE the kill —
+        // only the re-checks (killed/map/ownership) can stop a resurrection.
+        stall.release.send(()).expect("release the parked rescue");
+        fork.await.expect("the fork settles");
+
+        // THE operation outcome: the stale-commit ownership-changed error
+        // frame — never a successful FreshAgentForked over the retired
+        // child (pre-fix: the fork answered success here).
+        let captured = captured.lock().expect("captured mutex").clone();
+        assert_eq!(
+            captured.len(),
+            1,
+            "the fork answers exactly one frame: {captured:?}"
+        );
+        match &captured[0] {
+            ServerMessage::FreshAgentForked { .. } => panic!(
+                "the fork answered success over a session the concurrent kill \
+                 retired — the rescue resurrected it (ep2-r3)"
+            ),
+            ServerMessage::FreshAgentEvent(event) => {
+                assert_eq!(
+                    event.event["code"], "INTERNAL_ERROR",
+                    "the refusal is the stale-commit error frame: {:?}",
+                    captured[0]
+                );
+                assert!(
+                    event.event["message"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("session ownership changed during fork"),
+                    "the stale-commit ownership-changed error frame: {:?}",
+                    captured[0]
+                );
+            }
+            other => panic!("unexpected fork answer: {other:?}"),
+        }
+
+        // NO bridge was installed for the retired child: a REAL dispatch
+        // through the manager's emitter map reaches no resurrected bridge —
+        // no freshAgent frame for the killed session (pre-fix: the detached
+        // bridge translated the dispatch and broadcast for it).
+        manager.dispatch_event(
+            freshell_opencode::events::parse_serve_event(&json!({
+                "type": "session.idle",
+                "properties": { "sessionID": "ses_child" }
+            }))
+            .expect("parseable serve event"),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let all = drain_frames(&mut rx);
+        assert!(
+            all.iter().all(
+                |f| !(is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                    && f["sessionId"].as_str() == Some("ses_child"))
+            ),
+            "no recovery-snapshot push for the retired child: {all:?}"
+        );
+        assert!(
+            !all.iter()
+                .any(|f| f["type"] == "freshAgent.event"
+                    && f["sessionId"].as_str() == Some("ses_child")),
+            "no resurrected bridge frame for the killed session: {all:?}"
+        );
+        // The coordinator's post-kill state stands — nothing re-registered
+        // the child.
+        assert!(
+            !matches!(
+                st.ownership_snapshot("opencode", "ses_child").state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+            ),
+            "the kill's coordinator commit stands — the rescue never re-owns the child"
+        );
+        let _ = (exited, spawns);
+    }
+
+    /// The same interleaving on the RESUME leg, with the coordinator UNWIRED
+    /// — the killed-check floor: nothing but the session's `killed` flag (set
+    /// under the session lock by the kill's phase 3) and the map re-lookup
+    /// stand between the released rescue and a resurrection. The resume must
+    /// surface its typed ownership-changed error instead of handing back a
+    /// session the concurrent kill retired.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_landing_between_the_rescue_lookup_and_its_lock_fails_the_resume_typed() {
+        // The selfheal fixture answers the cold resume's GET /session/:id
+        // with a benign `{}` row; NO registry is wired (the unwired lane —
+        // the killed check is the only gate), and the daemon never dies.
+        let (st, mut rx, exited, spawns, manager) = selfheal_state(60_000, 120_000).await;
+        let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        // Park the rebuilt session's post-commit rescue between its
+        // map-lookup clone and its session-lock take.
+        let stall = st.arm_rescue_stall("ses_resume");
+        let st2 = st.clone();
+        let resume = tokio::spawn(async move {
+            st2.resume_durable_session("ses_resume", None, None, None, None)
+                .await
+        });
+
+        stall
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the rescue parks between its map-lookup clone and its session-lock take");
+
+        // The concurrent kill, through the REAL path, to completion.
+        st.handle_kill(FreshAgentKill {
+            provider: AgentProvider::Opencode,
+            session_id: "ses_resume".to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+            observed_epoch: None,
+            observed_generation: None,
+        })
+        .await;
+        assert!(
+            !st.has_live_session("ses_resume").await,
+            "fixture: the kill removed the rebuilt session's map key"
+        );
+
+        // Release the parked rescue and settle the resume.
+        stall.release.send(()).expect("release the parked rescue");
+        let out = resume.await.expect("the resume settles");
+
+        // THE outcome: the typed ownership-changed refusal — never Ok over
+        // the retired session (pre-fix: the resume returned the killed
+        // session and the rescue had installed a fresh bridge on it).
+        match out {
+            Err(ResumeOpencodeError::Manager(freshell_opencode::ServeError::Transport(msg))) => {
+                assert!(
+                    msg.contains("ownership changed during resume"),
+                    "the typed refusal names the ownership change: {msg}"
+                );
+            }
+            Err(ResumeOpencodeError::Manager(err)) => {
+                panic!("the refusal must be the ownership-changed Transport error, got {err:?}")
+            }
+            Err(_) => {
+                panic!("the refusal must be a Manager error (NotFound/Reserved are wrong here)")
+            }
+            Ok(_) => panic!(
+                "the resume returned success over a session the concurrent kill \
+                 retired (ep2-r3)"
+            ),
+        }
+
+        // NO bridge install, NO snapshot push for the retired session.
+        manager.dispatch_event(
+            freshell_opencode::events::parse_serve_event(&json!({
+                "type": "session.idle",
+                "properties": { "sessionID": "ses_resume" }
+            }))
+            .expect("parseable serve event"),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let all = drain_frames(&mut rx);
+        assert!(
+            all.iter().all(
+                |f| !(is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                    && f["sessionId"].as_str() == Some("ses_resume"))
+            ),
+            "no recovery-snapshot push for the retired session: {all:?}"
+        );
+        assert!(
+            !all.iter().any(|f| f["type"] == "freshAgent.event"
+                && f["sessionId"].as_str() == Some("ses_resume")),
+            "no resurrected bridge frame for the killed session: {all:?}"
+        );
+        let _ = (exited, spawns);
+    }
+
+    // ── fresheyes ep2-r4: the handoff runner's post-commit bridge re-check ──
+
+    /// The ep2-r4 flavor-writer latch: the runner's OWN awaited flavor steps
+    /// are the deterministic interleaving points (existing injection seams —
+    /// no `cfg(test)` production gates). `stage` parks the runner INSIDE the
+    /// Handoff window (before the `Live` commit — the pre-commit
+    /// daemon-loss test's hold); the staged handle's `commit` parks the
+    /// runner AFTER the commit (the post-commit kill test's hold). An
+    /// unwired latch is a plain immediate `Ok` — the happy-path writer.
+    #[derive(Default)]
+    struct ParkingFlavorWriter {
+        stage_entered: StdMutex<Option<std::sync::mpsc::Sender<()>>>,
+        stage_release: StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        commit_entered: StdMutex<Option<std::sync::mpsc::Sender<()>>>,
+        commit_release: StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    /// The staged flavor handle [`ParkingFlavorWriter`] hands the runner:
+    /// `commit()` fires `entered` and parks on `release` when armed.
+    struct ParkingStagedFlavor {
+        entered: Option<std::sync::mpsc::Sender<()>>,
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+
+    impl crate::session_handoff::StagedFlavor for ParkingStagedFlavor {
+        fn commit(
+            self: Box<Self>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        {
+            let Self { entered, release } = *self;
+            Box::pin(async move {
+                if let Some(entered) = entered {
+                    let _ = entered.send(());
+                }
+                if let Some(release) = release {
+                    let _ = release.await;
+                }
+                Ok(())
+            })
+        }
+    }
+
+    impl crate::session_handoff::FlavorWrite for ParkingFlavorWriter {
+        fn stage(
+            &self,
+            _provider: &str,
+            _session_id: &str,
+            _flavor: &str,
+        ) -> crate::session_handoff::StagedFlavorFuture {
+            let stage_entered = self.stage_entered.lock().expect("writer latch").take();
+            let stage_release = self.stage_release.lock().expect("writer latch").take();
+            let commit_entered = self.commit_entered.lock().expect("writer latch").take();
+            let commit_release = self.commit_release.lock().expect("writer latch").take();
+            Box::pin(async move {
+                if let Some(entered) = stage_entered {
+                    let _ = entered.send(());
+                }
+                if let Some(release) = stage_release {
+                    let _ = release.await;
+                }
+                Ok(Some(Box::new(ParkingStagedFlavor {
+                    entered: commit_entered,
+                    release: commit_release,
+                })
+                    as Box<dyn crate::session_handoff::StagedFlavor>))
+            })
+        }
+    }
+
+    /// The ep2-r4 fixture: the selfheal manager shape (flag-controlled
+    /// daemon death, test-speed watch/backoff knobs) wired into a FULL
+    /// [`crate::session_handoff::SessionHandoffRunner`] — the finding lives
+    /// in the RUNNER's commit path (`start_target`'s under-ticket
+    /// continuation → the awaited flavor write → the single `Live`
+    /// commit), so the tests drive the real runner over the real
+    /// shared-serve machinery. The runner holds clones of the same states
+    /// the lane uses (the broadcast bus, the coordinator, the shared
+    /// manager).
+    async fn handoff_selfheal_rig(
+        backoff_initial_ms: u64,
+        backoff_max_ms: u64,
+        writer: crate::session_handoff::FlavorWriter,
+    ) -> (
+        FreshOpencodeState,
+        Arc<crate::session_handoff::SessionHandoffRunner>,
+        Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+        tokio::sync::broadcast::Receiver<String>,
+        Arc<AtomicBool>,
+        OpencodeServeManager,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(256);
+        let broadcast_tx = Arc::new(tx);
+        let auth_token = Arc::new("handoff-ep2r4-tok".to_string());
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let terminal_registry =
+            freshell_terminal::TerminalRegistry::new().with_ownership(Arc::clone(&registry));
+        let fresh_agent = FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx))
+            .with_ownership(Arc::clone(&registry))
+            .with_terminal_registry(terminal_registry.clone());
+        let exited = Arc::new(AtomicBool::new(false));
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let deps = ServeDeps {
+            spawner: Arc::new(FlagExitSpawner {
+                exited: exited.clone(),
+                spawns: spawns.clone(),
+            }),
+            http: Arc::new(FakeHttp {
+                next_session: AtomicUsize::new(0),
+            }),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(20),
+            daemon_watch_interval: Duration::from_millis(10),
+            re_warm_backoff_initial_ms: backoff_initial_ms,
+            re_warm_backoff_max_ms: backoff_max_ms,
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager.clone()).await;
+        let mut st = FreshOpencodeState::new(fresh_agent.clone());
+        st.set_ownership(Arc::clone(&registry));
+        // Production arms the daemon-loss watcher at the first opencode WS
+        // entry point; the handoff lane does not, so arm it here (the fork
+        // fixture's precedent) — the typed loss edge and the `Started`
+        // revival pass are the real machinery the finding is about.
+        st.ensure_daemon_loss_watcher().await;
+        let mut fresh_claude = crate::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+        fresh_claude.set_ownership(Arc::clone(&registry));
+        let mut fresh_codex = crate::FreshCodexState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            json!({ "freshAgent": { "enabled": true } }),
+        );
+        fresh_codex.set_ownership(Arc::clone(&registry));
+        let runner = crate::session_handoff::SessionHandoffRunner::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            Arc::clone(&registry),
+            terminal_registry,
+            fresh_codex,
+            fresh_claude,
+            st.clone(),
+            fresh_agent.clone(),
+            // A FreshAgent-target handoff never consults the CLI specs
+            // (validate_handoff_target's terminal arm only).
+            Arc::new(Vec::new()),
+        )
+        .with_flavor_writer(Some(writer));
+        (st, Arc::new(runner), registry, rx, exited, manager)
+    }
+
+    /// A `switch` handoff moving `durable` to the freshopencode lane (the
+    /// finding's target arm — the under-ticket continuation).
+    fn freshopencode_handoff_request(durable: &str) -> crate::session_handoff::HandoffRequest {
+        crate::session_handoff::HandoffRequest {
+            action: crate::session_handoff::HandoffAction::Switch,
+            provider: "opencode".to_string(),
+            session_id: durable.to_string(),
+            target_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            session_type: Some("freshopencode".to_string()),
+            mode: None,
+            cwd: Some(std::env::temp_dir().to_string_lossy().to_string()),
+            tab_id: None,
+            pane_id: None,
+            observed_epoch: None,
+            observed_generation: None,
+            device_id: Some("test-device-ep2r4".to_string()),
+        }
+    }
+
+    /// fresheyes ep2-r4 Major (daemon loss in the handoff pre-commit
+    /// window): the under-ticket continuation installs its
+    /// generation-fenced bridge and runs its transitional rescue BEFORE the
+    /// runner's single `Live` commit; between the two the runner still
+    /// awaits the staged flavor write while the coordinator key remains
+    /// `Handoff`. A daemon loss there kills the fresh bridge with every
+    /// recovery trigger spent — the successor's one-shot `Started` revival
+    /// pass correctly skips the transitional owner, the `Live` commit emits
+    /// no new daemon signal, and the finished rescue is never rerun — so
+    /// the handoff answered plain success over an A-generation dead bridge.
+    ///
+    /// The interleaving, forced deterministically through the REAL paths:
+    /// the runner parks inside the flavor `stage` (its own awaited step
+    /// inside the Handoff window); while parked, daemon A dies and B
+    /// re-warms through the REAL loss/re-warm machinery (the fixture
+    /// proves B serves while the bridge stays dead — the revival pass
+    /// skipped the Handoff owner); releasing the park lets the commit
+    /// land, and the handoff must NOT leave a dead A-generation bridge:
+    /// the commit's re-check recovers it against B (a B-stamped live
+    /// bridge + exactly one idle snapshot push) or surfaces the typed
+    /// loss — never plain success over a dead bridge.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handoff_commit_recovers_daemon_loss_in_the_pre_commit_window() {
+        let writer = Arc::new(ParkingFlavorWriter::default());
+        let (stage_entered_tx, stage_entered) = std::sync::mpsc::channel::<()>();
+        let (stage_release_tx, stage_release_rx) = tokio::sync::oneshot::channel::<()>();
+        writer
+            .stage_entered
+            .lock()
+            .expect("writer latch")
+            .replace(stage_entered_tx);
+        writer
+            .stage_release
+            .lock()
+            .expect("writer latch")
+            .replace(stage_release_rx);
+        let (st, runner, registry, mut rx, exited, manager) = handoff_selfheal_rig(
+            5,
+            50,
+            writer.clone() as crate::session_handoff::FlavorWriter,
+        )
+        .await;
+
+        // The prior: a committed TERMINAL owner (the terminal→freshopencode
+        // shape; the handoff's prior stop is the idempotent AlreadyGone
+        // against the nonexistent terminal row).
+        let durable = "ses_ep2r4_loss";
+        commit_terminal_owner(&registry, durable).await;
+
+        // The mover drives the finding's interleaving while the runner is
+        // parked inside the Handoff window.
+        let mover_state = st.clone();
+        let mover_manager = manager.clone();
+        let mover_exited = exited.clone();
+        let mover = tokio::spawn(async move {
+            stage_entered
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("the runner parks in the awaited flavor stage (inside the Handoff window)");
+            // The under-ticket rescue has COMPLETED (start_target returned
+            // before the runner reached the flavor write) — the loss below
+            // lands in the finding's exact window.
+            mover_exited.store(true, Ordering::SeqCst); // daemon A dies
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while mover_manager.base_url().await.is_some() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "A's loss must take the running entry within the budget"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // ...the take's sweep closed the target session's A-era bridge
+            // channel — the just-installed bridge is dead.
+            await_bridge_liveness(
+                &mover_state,
+                durable,
+                false,
+                "A's loss kills the target's just-installed bridge",
+            )
+            .await;
+            mover_exited.store(false, Ordering::SeqCst); // B re-warms
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while mover_manager.base_url().await.is_none() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "B's re-warm must respawn the daemon within the budget"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // B's one-shot `Started` revival pass has run — and correctly
+            // SKIPPED the transitional (Handoff) owner: the bridge stays
+            // dead while B serves, with no recovery trigger left (the
+            // finding's unrecovered state, observed by the fixture before
+            // the commit proceeds).
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                !session_serve_bridge_alive(&mover_state, durable).await,
+                "fixture: the Started revival pass skipped the Handoff owner — \
+                 the dead A-era bridge with no recovery trigger (ep2-r4)"
+            );
+            stage_release_tx.send(()).expect("release the parked stage");
+        });
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(20),
+            runner
+                .spawn_handoff(freshopencode_handoff_request(durable))
+                .completion,
+        )
+        .await
+        .expect("the handoff completes within the budget")
+        .expect("the runner task lives to answer");
+        mover.await.expect("the mover completed the interleaving");
+
+        // The operation's answer: SUCCESS (the recovery leg — the happy
+        // contract, not the typed-loss leg).
+        assert_eq!(
+            resp["ok"],
+            json!(true),
+            "the handoff answers success: {resp:?}"
+        );
+        await_freshagent_live(&registry, durable).await;
+
+        // THE BRIDGE: the handoff must not leave a dead A-generation
+        // bridge. RED on HEAD: plain success over the dead bridge.
+        assert!(
+            session_serve_bridge_alive(&st, durable).await,
+            "the handoff must not answer success over a dead A-generation \
+             bridge — the pre-commit loss left every recovery trigger spent \
+             and the commit's re-check is the only one left (ep2-r4)"
+        );
+        // The recovered bridge is stamped to the CURRENT (successor) daemon
+        // generation — not the dead A era.
+        {
+            let session_arc = st
+                .sessions
+                .lock()
+                .await
+                .get(durable)
+                .cloned()
+                .expect("the handoff target session is registered");
+            let session = session_arc.lock().await;
+            assert_eq!(
+                session.serve_bridge_daemon,
+                manager.ownership_id().await,
+                "the recovered bridge is stamped to the successor daemon B"
+            );
+        }
+
+        // The frames: the commit's re-check pushed EXACTLY ONE recovery
+        // snapshot for the actually-restarted bridge (the revival pass
+        // pushed none — it skipped the Handoff owner), exactly ONE typed
+        // loss edge reached the materialized session, and NO chime
+        // anywhere (a daemon loss is never a positive completion).
+        let mut all = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                && f["sessionId"].as_str() == Some(durable)
+        })
+        .await;
+        all.extend(drain_frames(&mut rx));
+        let pushes = all
+            .iter()
+            .filter(|f| {
+                is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                    && f["sessionId"].as_str() == Some(durable)
+            })
+            .count();
+        assert_eq!(
+            pushes, 1,
+            "exactly ONE recovery snapshot for the restarted bridge: {all:?}"
+        );
+        let edges = all
+            .iter()
+            .filter(|f| {
+                f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == "freshAgent.error"
+                    && f["event"]["code"] == "OPENCODE_DAEMON_LOST"
+                    && f["sessionId"].as_str() == Some(durable)
+            })
+            .count();
+        assert_eq!(
+            edges, 1,
+            "exactly ONE typed loss edge for the target session: {all:?}"
+        );
+        assert!(
+            all.iter()
+                .all(|f| f["event"]["type"] != "freshAgent.turn.complete"),
+            "a daemon loss is never a positive completion — no chime: {all:?}"
+        );
+        assert!(
+            manager.base_url().await.is_some(),
+            "fixture: the successor daemon B serves"
+        );
+    }
+
+    /// The ep2-r4 REFUSAL leg (the ep2-r3 discipline applied to the
+    /// runner's commit): a kill completing between the runner's `Live`
+    /// commit and its answer must surface the typed ownership-changed
+    /// failure — never plain success over the retired session. The
+    /// deterministic hold is the runner's own awaited STAGED FLAVOR
+    /// COMMIT (post-commit, pre-answer): the mover completes a REAL
+    /// `freshAgent.kill` while the runner is parked there; the commit's
+    /// re-check then refuses (the kill's teardown owns the cleanup — no
+    /// bridge install, no snapshot push, no re-own). RED on HEAD: the
+    /// runner answered ok:true with nothing re-checking after the commit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_between_the_handoff_commit_and_its_answer_fails_the_handoff_typed() {
+        let writer = Arc::new(ParkingFlavorWriter::default());
+        let (commit_entered_tx, commit_entered) = std::sync::mpsc::channel::<()>();
+        let (commit_release_tx, commit_release_rx) = tokio::sync::oneshot::channel::<()>();
+        writer
+            .commit_entered
+            .lock()
+            .expect("writer latch")
+            .replace(commit_entered_tx);
+        writer
+            .commit_release
+            .lock()
+            .expect("writer latch")
+            .replace(commit_release_rx);
+        // The daemon never dies here (the KILL is the mover) — a far re-warm
+        // budget keeps the background machinery out of the window.
+        let (st, runner, registry, mut rx, exited, manager) = handoff_selfheal_rig(
+            60_000,
+            120_000,
+            writer.clone() as crate::session_handoff::FlavorWriter,
+        )
+        .await;
+
+        let durable = "ses_ep2r4_refused";
+        commit_terminal_owner(&registry, durable).await;
+
+        let mover_state = st.clone();
+        let mover_registry = registry.clone();
+        let mover = tokio::spawn(async move {
+            commit_entered
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("the runner parks in the staged flavor commit (after the Live commit)");
+            // Fixture honesty: the handoff's Live{FreshAgent} commit has
+            // landed (the parked staged commit is strictly post-commit).
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if matches!(
+                    mover_registry.observe("opencode", durable).state,
+                    freshell_ownership::OwnershipState::Live { owner, .. }
+                        if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                ) {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the handoff's Live{{FreshAgent}} commit never landed"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // The concurrent kill, driven through the REAL path to
+            // completion — the mover's teardown owns the cleanup.
+            mover_state
+                .handle_kill(FreshAgentKill {
+                    provider: AgentProvider::Opencode,
+                    session_id: durable.to_string(),
+                    session_type: SessionType::Freshopencode,
+                    cwd: None,
+                    observed_epoch: None,
+                    observed_generation: None,
+                })
+                .await;
+            assert!(
+                !mover_state.has_live_session(durable).await,
+                "fixture: the kill removed every map key for the target session"
+            );
+            assert!(
+                !matches!(
+                    mover_registry.observe("opencode", durable).state,
+                    freshell_ownership::OwnershipState::Live { owner, .. }
+                        if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                ),
+                "fixture: the coordinator no longer holds the session Live{{FreshAgent}}"
+            );
+            commit_release_tx
+                .send(())
+                .expect("release the staged commit");
+        });
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(20),
+            runner
+                .spawn_handoff(freshopencode_handoff_request(durable))
+                .completion,
+        )
+        .await
+        .expect("the handoff completes within the budget")
+        .expect("the runner task lives to answer");
+        mover.await.expect("the mover completed the interleaving");
+
+        // THE outcome: the typed ownership-changed failure — never plain
+        // success over the retired session (RED on HEAD: ok:true).
+        assert_ne!(
+            resp["ok"],
+            json!(true),
+            "the handoff must not answer success over a session a concurrent \
+             kill retired between the commit and the answer (ep2-r4): {resp:?}"
+        );
+        assert_eq!(
+            resp["error"]["code"],
+            json!("STALE_GENERATION"),
+            "the refusal is the typed ownership-changed failure: {resp:?}"
+        );
+        assert_eq!(
+            resp["error"]["retryable"],
+            json!(true),
+            "the refusal is the canonical retryable race outcome: {resp:?}"
+        );
+
+        // NO resurrection: the refusal never installs a bridge and never
+        // pushes a snapshot — the kill's teardown owns the cleanup.
+        assert!(
+            !st.has_live_session(durable).await,
+            "the refusal never resurrected the retired session"
+        );
+        manager.dispatch_event(
+            freshell_opencode::events::parse_serve_event(&json!({
+                "type": "session.idle",
+                "properties": { "sessionID": durable }
+            }))
+            .expect("parseable serve event"),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let all = drain_frames(&mut rx);
+        assert!(
+            all.iter().all(
+                |f| !(is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                    && f["sessionId"].as_str() == Some(durable))
+            ),
+            "no recovery-snapshot push for the retired session: {all:?}"
+        );
+        assert!(
+            !all.iter().any(
+                |f| f["type"] == "freshAgent.event" && f["sessionId"].as_str() == Some(durable)
+            ),
+            "no resurrected bridge frame for the killed session: {all:?}"
+        );
+        assert!(
+            all.iter()
+                .all(|f| f["event"]["type"] != "freshAgent.turn.complete"),
+            "no chime anywhere: {all:?}"
+        );
+        // The kill's coordinator commit stands — nothing re-owns the
+        // retired session.
+        assert!(
+            !matches!(
+                registry.observe("opencode", durable).state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+            ),
+            "the kill's coordinator commit stands — the re-check never re-owns the session"
+        );
+        let _ = (exited, manager);
+    }
+
+    // ── fresheyes ep2-r5: the rescue is bound to the committed session
+    // instance and ownership fence, never to a same-key replacement ──
+
+    /// fresheyes ep2-r5 Major (the rescue adopts a same-key replacement
+    /// for the committed session): the post-commit rescue verified
+    /// whichever session currently occupies the durable id — not the
+    /// session INSTANCE and ownership GENERATION the caller committed. A
+    /// kill that removes the committed session followed by another
+    /// freshopencode resume under the SAME durable id leaves a brand-new
+    /// session object under the key, committed Live at a NEWER
+    /// generation; the rescue's by-id lookup obtained the replacement
+    /// `Arc`, the kind-only ownership check accepted the replacement's
+    /// era, and the rescue answered Healthy — after which the resume
+    /// handed back its own removed-and-killed `Arc` for the attach
+    /// caller to restart a bridge on.
+    ///
+    /// The interleaving, forced deterministically through the
+    /// `cfg(test)` PRE-LOOKUP rescue stall: the original resume's
+    /// post-commit rescue fires `entered` BEFORE its map re-lookup and
+    /// parks; while held, a REAL `freshAgent.kill` of the committed
+    /// session COMPLETES and a REAL replacement resume installs a
+    /// brand-new instance under the same key (asserted: a strictly newer
+    /// Live generation); only then is the rescue released — its
+    /// re-lookup now finds the REPLACEMENT. The resume must REFUSE —
+    /// the typed ownership-changed error, never `Ok` over the retired
+    /// instance — and the refusal must leave the replacement untouched
+    /// (its registration, bridge, and era stand; the mover's own
+    /// lifecycle owns the key now). Pre-fix, the rescue adopted the
+    /// same-kind replacement and the resume answered `Ok` with the
+    /// retired `Arc`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replacement_resume_under_the_killed_key_fails_the_original_resume_typed() {
+        // The selfheal fixture answers the cold resumes' GET /session/:id;
+        // the daemon never dies (the KILL+REPLACE is the mover). The
+        // coordinator IS wired — the committed-fence leg is half the
+        // finding, and the committed-instance leg must hold either way.
+        let (mut st, _rx, exited, spawns, _manager) = selfheal_state(60_000, 120_000).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        let durable = "ses_ep2r5_resume";
+        // Park the ORIGINAL resume's post-commit rescue BEFORE its map
+        // re-lookup — the exact window the finding names (the mover
+        // completes while the rescue is in flight).
+        let stall = st.arm_rescue_lookup_stall(durable);
+        let st2 = st.clone();
+        let original = tokio::spawn(async move {
+            st2.resume_durable_session(durable, None, None, None, None)
+                .await
+        });
+
+        stall
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the rescue parks before its map re-lookup");
+
+        // Fixture honesty: the parked rescue is strictly POST-COMMIT —
+        // the original resume's own Live commit has landed; record its
+        // era (the committed fence the rescue must still find).
+        let committed_generation = match registry.observe("opencode", durable) {
+            freshell_ownership::OwnershipSnapshot {
+                generation,
+                state: freshell_ownership::OwnershipState::Live { owner, .. },
+                ..
+            } if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent => generation,
+            snap => panic!("the original resume committed Live: {snap:?}"),
+        };
+
+        // The mover, part 1: a REAL kill of the committed session, driven
+        // through the REAL path to completion (the durable close, every
+        // map key, the killed flag, the bridge abort, Stopping→Vacant).
+        st.handle_kill(FreshAgentKill {
+            provider: AgentProvider::Opencode,
+            session_id: durable.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+            observed_epoch: None,
+            observed_generation: None,
+        })
+        .await;
+        assert!(
+            !st.has_live_session(durable).await,
+            "fixture: the kill removed the committed session's map key"
+        );
+        assert!(
+            !matches!(
+                registry.observe("opencode", durable).state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+            ),
+            "fixture: the kill vacated the coordinator key"
+        );
+
+        // The mover, part 2: a REAL replacement resume installs a
+        // BRAND-NEW instance under the SAME durable id and commits it
+        // Live at a strictly newer generation — the finding's same-key
+        // replacement.
+        let replacement = match st
+            .resume_durable_session(durable, None, None, None, None)
+            .await
+        {
+            Ok(arc) => arc,
+            Err(ResumeOpencodeError::Manager(err)) => panic!(
+                "fixture: the replacement resume commits a fresh instance under the vacated key: {err:?}"
+            ),
+            Err(ResumeOpencodeError::NotFound) => {
+                panic!("fixture: the replacement resume found no serve row")
+            }
+            Err(ResumeOpencodeError::Reserved) => {
+                panic!("fixture: the replacement resume hit a reserved key")
+            }
+        };
+        assert!(
+            st.has_live_session(durable).await,
+            "fixture: the replacement session is registered"
+        );
+        let replacement_generation = match registry.observe("opencode", durable) {
+            freshell_ownership::OwnershipSnapshot {
+                generation,
+                state: freshell_ownership::OwnershipState::Live { owner, .. },
+                ..
+            } if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent => generation,
+            snap => panic!("the replacement resume committed Live: {snap:?}"),
+        };
+        assert!(
+            replacement_generation > committed_generation,
+            "the replacement's era is a strictly newer generation than the committed fence"
+        );
+        // The retired-vs-replacement identity is the RESCUE's job, not the
+        // fixture's; the replacement's own Arc is only fixture honesty.
+        let _ = replacement;
+
+        // Release the parked rescue: its re-lookup now finds the
+        // REPLACEMENT under the key. Only the committed-instance binding
+        // and the committed-fence check can refuse it.
+        stall.release.send(()).expect("release the parked rescue");
+        let out = original.await.expect("the original resume settles");
+
+        // THE outcome: the typed ownership-changed refusal — never Ok
+        // over the retired original instance (pre-fix: the rescue
+        // adopted the same-kind replacement, answered Healthy, and the
+        // resume returned its own removed-and-killed `Arc`).
+        match out {
+            Err(ResumeOpencodeError::Manager(freshell_opencode::ServeError::Transport(msg))) => {
+                assert!(
+                    msg.contains("ownership changed during resume"),
+                    "the typed refusal names the ownership change: {msg}"
+                );
+            }
+            Err(ResumeOpencodeError::Manager(err)) => {
+                panic!("the refusal must be the ownership-changed Transport error, got {err:?}")
+            }
+            Err(_) => {
+                panic!("the refusal must be a Manager error (NotFound/Reserved are wrong here)")
+            }
+            Ok(_) => panic!(
+                "the resume returned success over a session a concurrent kill retired and \
+                 a same-key replacement superseded (ep2-r5)"
+            ),
+        }
+
+        // The refusal never touched the replacement: its registration,
+        // live bridge, and committed era stand — the mover's lifecycle
+        // owns the key now, and the retired original's rescue installed
+        // nothing for it (the refusal returns before any restart; the
+        // kill's teardown owns the original's cleanup).
+        assert!(
+            st.has_live_session(durable).await,
+            "the replacement's registration stands"
+        );
+        assert!(
+            session_serve_bridge_alive(&st, durable).await,
+            "the replacement's bridge stands — the refusal never uninstalled it"
+        );
+        assert_eq!(
+            registry.observe("opencode", durable).generation,
+            replacement_generation,
+            "the refusal never re-owned or moved the replacement's era"
+        );
+        let _ = (exited, spawns, fake);
+    }
+
+    /// The ep2-r5 interleave on the HANDOFF runner's post-commit re-check
+    /// (the ep2-r4 tail's caller leg): the runner committed its
+    /// freshopencode target and parks in its own awaited STAGED FLAVOR
+    /// COMMIT (the ep2-r4 latch, strictly post-commit); while held, a
+    /// REAL kill retires the committed target and a REAL replacement
+    /// resume installs a brand-new instance under the SAME durable id
+    /// (Live at a strictly newer generation). The re-check's by-id
+    /// lookup then finds the replacement — the runner must surface the
+    /// typed ownership-changed failure, never answer success carrying
+    /// its obsolete generation, and never touch the replacement (the
+    /// mover's lifecycle owns the key). Pre-fix, the rescue adopted the
+    /// same-kind replacement and the handoff answered ok:true.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replacement_resume_under_the_killed_key_fails_the_handoff_typed() {
+        let writer = Arc::new(ParkingFlavorWriter::default());
+        let (commit_entered_tx, commit_entered) = std::sync::mpsc::channel::<()>();
+        let (commit_release_tx, commit_release_rx) = tokio::sync::oneshot::channel::<()>();
+        writer
+            .commit_entered
+            .lock()
+            .expect("writer latch")
+            .replace(commit_entered_tx);
+        writer
+            .commit_release
+            .lock()
+            .expect("writer latch")
+            .replace(commit_release_rx);
+        // The daemon never dies here (the KILL+REPLACE is the mover) — a
+        // far re-warm budget keeps the background machinery out of the
+        // window.
+        let (st, runner, registry, _rx, exited, manager) = handoff_selfheal_rig(
+            60_000,
+            120_000,
+            writer.clone() as crate::session_handoff::FlavorWriter,
+        )
+        .await;
+
+        let durable = "ses_ep2r5_handoff";
+        commit_terminal_owner(&registry, durable).await;
+
+        let mover_state = st.clone();
+        let mover_registry = registry.clone();
+        let mover = tokio::spawn(async move {
+            commit_entered
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("the runner parks in the staged flavor commit (after the Live commit)");
+            // Fixture honesty: the handoff's Live{FreshAgent} commit has
+            // landed (the parked staged commit is strictly
+            // post-commit); record the committed era.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let committed_generation = loop {
+                match mover_registry.observe("opencode", durable) {
+                    freshell_ownership::OwnershipSnapshot {
+                        generation,
+                        state: freshell_ownership::OwnershipState::Live { owner, .. },
+                        ..
+                    } if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent => {
+                        break generation
+                    }
+                    _ => {
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "the handoff's Live{{FreshAgent}} commit never landed"
+                        );
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            };
+            // The mover, part 1: a REAL kill of the committed target, to
+            // completion — the mover's teardown owns the cleanup.
+            mover_state
+                .handle_kill(FreshAgentKill {
+                    provider: AgentProvider::Opencode,
+                    session_id: durable.to_string(),
+                    session_type: SessionType::Freshopencode,
+                    cwd: None,
+                    observed_epoch: None,
+                    observed_generation: None,
+                })
+                .await;
+            assert!(
+                !mover_state.has_live_session(durable).await,
+                "fixture: the kill removed every map key for the committed target"
+            );
+            assert!(
+                !matches!(
+                    mover_registry.observe("opencode", durable).state,
+                    freshell_ownership::OwnershipState::Live { owner, .. }
+                        if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                ),
+                "fixture: the kill vacated the coordinator key"
+            );
+            // The mover, part 2: a REAL replacement resume installs a
+            // BRAND-NEW instance under the SAME durable id, committed
+            // Live at a strictly newer generation.
+            let replacement = match mover_state
+                .resume_durable_session(durable, None, None, None, None)
+                .await
+            {
+                Ok(arc) => arc,
+                Err(ResumeOpencodeError::Manager(err)) => panic!(
+                    "fixture: the replacement resume commits a fresh instance under the vacated key: {err:?}"
+                ),
+                Err(ResumeOpencodeError::NotFound) => {
+                    panic!("fixture: the replacement resume found no serve row")
+                }
+                Err(ResumeOpencodeError::Reserved) => {
+                    panic!("fixture: the replacement resume hit a reserved key")
+                }
+            };
+            let replacement_generation = match mover_registry.observe("opencode", durable) {
+                freshell_ownership::OwnershipSnapshot {
+                    generation,
+                    state: freshell_ownership::OwnershipState::Live { owner, .. },
+                    ..
+                } if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent => generation,
+                snap => panic!("the replacement resume committed Live: {snap:?}"),
+            };
+            assert!(
+                replacement_generation > committed_generation,
+                "the replacement's era is a strictly newer generation than the handoff's commit"
+            );
+            let _ = replacement;
+            commit_release_tx
+                .send(())
+                .expect("release the staged commit");
+            (committed_generation, replacement_generation)
+        });
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(20),
+            runner
+                .spawn_handoff(freshopencode_handoff_request(durable))
+                .completion,
+        )
+        .await
+        .expect("the handoff completes within the budget")
+        .expect("the runner task lives to answer");
+        let (committed_generation, replacement_generation) =
+            mover.await.expect("the mover completed the interleaving");
+        assert!(
+            replacement_generation > committed_generation,
+            "fixture: the replacement superseded the handoff's committed era"
+        );
+
+        // THE outcome: the typed ownership-changed failure — never plain
+        // success carrying the runner's obsolete generation (pre-fix:
+        // the rescue adopted the same-key replacement and the handoff
+        // answered ok:true).
+        assert_ne!(
+            resp["ok"],
+            json!(true),
+            "the handoff must not answer success over a target a concurrent kill retired \
+             and a same-key replacement superseded (ep2-r5): {resp:?}"
+        );
+        assert_eq!(
+            resp["error"]["code"],
+            json!("STALE_GENERATION"),
+            "the refusal is the typed ownership-changed failure: {resp:?}"
+        );
+        assert_eq!(
+            resp["error"]["retryable"],
+            json!(true),
+            "the refusal is the canonical retryable race outcome: {resp:?}"
+        );
+
+        // The refusal never touched the replacement: its registration,
+        // live bridge, and committed era stand — the mover's lifecycle
+        // owns the key now, and the retired target's re-check installed
+        // nothing (the refusal returns before any restart; the kill's
+        // teardown owns the original's cleanup).
+        assert!(
+            st.has_live_session(durable).await,
+            "the replacement's registration stands"
+        );
+        assert!(
+            session_serve_bridge_alive(&st, durable).await,
+            "the replacement's bridge stands — the refusal never uninstalled it"
+        );
+        assert_eq!(
+            registry.observe("opencode", durable).generation,
+            replacement_generation,
+            "the refusal never re-owned or moved the replacement's era"
+        );
+        let _ = (exited, manager);
+    }
+
+    /// LB-05 (falsified → redesign): in the incident, the pane's fenced
+    /// attach was exercised 3× against the dead shared daemon and recovered
+    /// NOTHING, because the attach tail only re-subscribed the bridge —
+    /// nothing respawns the daemon for a map-hit. The fenced attach must be
+    /// a REAL recovery verb: `ensure_started` BEFORE the bridge restart, so
+    /// the map-hit attach respawns the daemon and re-bridges (mirroring
+    /// `resume_durable_session`'s map-miss behavior).
+    #[tokio::test]
+    async fn map_hit_fenced_attach_respawns_the_daemon_and_rebridges() {
+        // Backoff far beyond the test window: the background re-warm must NOT
+        // be the respawn this test credits — the ATTACH's own
+        // `ensure_started` is the recovery under proof.
+        let (mut st, mut rx, exited, spawns, manager) = selfheal_state(60_000, 120_000).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        let (_placeholder, durable) =
+            materialized_selfheal_session(&st, &mut rx, "req-attach-recover").await;
+        await_freshagent_live(&registry, &durable).await;
+        // The observed runtime-owner pair the fenced attach carries.
+        let before = registry.observe("opencode", &durable);
+
+        // The shared daemon dies; the session row PERSISTS (the map-hit
+        // shape). Bounded wait for the manager's watcher to clear the entry.
+        exited.store(true, Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if manager.base_url().await.is_none() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the daemon's running entry must clear after the exit"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let _ = drain_frames(&mut rx); // the loss edge (already fanned out) etc.
+        let spawns_before = spawns.load(Ordering::SeqCst);
+        // The respawn can now succeed (the flag-driven fixture's death flag
+        // clears, exactly like the crash-loop fixture in Task 3's tests).
+        exited.store(false, Ordering::SeqCst);
+
+        // THE MAP-HIT FENCED ATTACH — the incident's three wasted attempts,
+        // now the documented recovery verb.
+        st.handle_attach(FreshAgentAttach {
+            provider: AgentProvider::Opencode,
+            session_id: durable.clone(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+            observed_epoch: Some(before.epoch),
+            observed_generation: Some(before.generation),
+            resume_session_id: None,
+            session_ref: None,
+        })
+        .await;
+
+        assert!(
+            spawns.load(Ordering::SeqCst) > spawns_before,
+            "a map-hit attach against a daemon-absent manager must respawn the \
+             shared daemon (observed {} spawns; {} before the attach)",
+            spawns.load(Ordering::SeqCst),
+            spawns_before
+        );
+        assert!(
+            session_serve_bridge_alive(&st, &durable).await,
+            "the attach must re-bridge the session"
+        );
+        let frames = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                && f["sessionId"].as_str() == Some(durable.as_str())
+        })
+        .await;
+        assert!(
+            !frames.is_empty(),
+            "the attach tail's snapshot push must arrive: {frames:?}"
+        );
+    }
+
+    /// Plan-review round 3 (the ownership-coordinator gate): a session
+    /// killed/retired or handed to a terminal owner between the loss and the
+    /// respawn must NOT be revived — the revival pass re-looks-up the map at
+    /// revival time (a retired session's keys are gone) and observes the
+    /// CANONICAL ownership state fresh (a terminal owner or any lifecycle
+    /// transition owns the window; only Live{FreshAgent} sessions — this
+    /// runtime's own — revive).
+    #[tokio::test]
+    async fn revival_skips_sessions_handed_off_or_removed_after_the_loss() {
+        let (mut st, mut rx, exited, _spawns, _manager) = selfheal_state(5, 50).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        let (_p_keeps, keeps) = materialized_selfheal_session(&st, &mut rx, "req-keeps").await;
+        let (p_gone, gone) = materialized_selfheal_session(&st, &mut rx, "req-gone").await;
+        let (_p_term, term) = materialized_selfheal_session(&st, &mut rx, "req-term").await;
+        for durable in [&keeps, &gone, &term] {
+            await_freshagent_live(&registry, durable).await;
+        }
+
+        // While the daemon is down (modeled pre-loss here), session B is
+        // retired from the map AND its key completes a terminal handoff (the
+        // concurrent-handoff shape); session C STAYS mapped but its key is
+        // terminal-owned (the committed-handoff window).
+        {
+            let mut map = st.sessions.lock().await;
+            map.remove(&p_gone);
+            map.remove(&gone);
+        }
+        commit_terminal_owner(&registry, &gone).await;
+        commit_terminal_owner(&registry, &term).await;
+        let _ = drain_frames(&mut rx);
+
+        exited.store(true, Ordering::SeqCst); // the daemon dies (bridges die with it)
+                                              // Deterministic anchor: the fan-out reaches the LAST mapped session
+                                              // (BTreeSet order — keeps, then term), so term's edge proves the
+                                              // whole fan-out ran.
+        let loss_frames = frames_until(&mut rx, |f| {
+            f["type"] == "freshAgent.event"
+                && f["event"]["code"] == "OPENCODE_DAEMON_LOST"
+                && f["sessionId"].as_str() == Some(term.as_str())
+        })
+        .await;
+
+        exited.store(false, Ordering::SeqCst); // the re-warm's respawn now succeeds
+
+        // `Started` → the revival pass: keeps IS revived...
+        let revive_frames = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                && f["sessionId"].as_str() == Some(keeps.as_str())
+        })
+        .await;
+
+        // ...and the pass has had every opportunity to (wrongly) touch the
+        // retired and terminal-owned sessions — settle, then audit the whole
+        // post-loss window.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut all = loss_frames;
+        all.extend(revive_frames);
+        all.extend(drain_frames(&mut rx));
+
+        assert!(
+            session_serve_bridge_alive(&st, &keeps).await,
+            "the healthy fresh-agent session revives"
+        );
+        assert!(
+            !session_serve_bridge_alive(&st, &gone).await,
+            "the retired session must NOT be revived"
+        );
+        assert!(
+            !session_serve_bridge_alive(&st, &term).await,
+            "the terminal-owned session must NOT be revived"
+        );
+        let gone_snapshots = all
+            .iter()
+            .filter(|f| {
+                is_event(f, "freshAgent.session.snapshot", None)
+                    && f["sessionId"].as_str() == Some(gone.as_str())
+            })
+            .count();
+        assert_eq!(
+            gone_snapshots, 0,
+            "no snapshot push for the retired session: {all:?}"
+        );
+        let term_snapshots = all
+            .iter()
+            .filter(|f| {
+                is_event(f, "freshAgent.session.snapshot", None)
+                    && f["sessionId"].as_str() == Some(term.as_str())
+            })
+            .count();
+        assert_eq!(
+            term_snapshots, 0,
+            "no snapshot push for the terminal-owned session: {all:?}"
+        );
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    // ── merged from the send-during-compact-queue branch ──
+    /// The shared core behind every gated-compact harness variant: builds the
+    /// fake-HTTP serve manager with the passed config delta. `request_timeout`
+    /// overrides the serve request timeout ONLY when provided (the
+    /// delta-review round 6 extension timeout test needs a short one; every
+    /// other caller keeps the 30s default).
+    async fn compact_state_gated_cfg(
+        config_body: &str,
+        summarize_outcome: SummarizeOutcome,
+        summarize_gate: Option<Arc<tokio::sync::Notify>>,
+        config_gate: Option<Arc<tokio::sync::Notify>>,
+        request_timeout: Option<Duration>,
+    ) -> (
+        FreshOpencodeState,
+        Arc<CompactFakeHttp>,
+        tokio::sync::broadcast::Receiver<String>,
+        Arc<tokio::sync::broadcast::Sender<String>>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx.clone()));
+        let http = Arc::new(CompactFakeHttp::new(
+            config_body.as_bytes().to_vec(),
+            summarize_outcome,
+            tx.subscribe(),
+            summarize_gate,
+            None,
+            config_gate,
+        ));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            request_timeout: request_timeout
+                .unwrap_or_else(|| ServeConfig::default().request_timeout),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        (FreshOpencodeState::new(fresh_agent), http, rx, Arc::new(tx))
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// [`compact_state_gated`]'s bus-sender variant (send-during-compact
+    /// queue, Task 3): ALSO returns the broadcast bus's sender. The
+    /// FIFO/order tests subscribe a SECOND, untouched receiver from it
+    /// BEFORE any handler runs — a broadcast channel buffers each
+    /// receiver INDEPENDENTLY, so that receiver keeps the run's TOTAL
+    /// emission order even while the first receiver's
+    /// `frames_until`/`drain_frames` calls consume their own buffer
+    /// (consumed frames are gone; the round-3 review's finding).
+    async fn compact_state_gated_tx(
+        config_body: &str,
+        summarize_outcome: SummarizeOutcome,
+        summarize_gate: Option<Arc<tokio::sync::Notify>>,
+        config_gate: Option<Arc<tokio::sync::Notify>>,
+    ) -> (
+        FreshOpencodeState,
+        Arc<CompactFakeHttp>,
+        tokio::sync::broadcast::Receiver<String>,
+        Arc<tokio::sync::broadcast::Sender<String>>,
+    ) {
+        compact_state_gated_cfg(
+            config_body,
+            summarize_outcome,
+            summarize_gate,
+            config_gate,
+            None,
+        )
+        .await
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// The recorded-body needle probe: `RecordedRequest.body` is an
+    /// `Option<Value>` with NO Display, so assert on the serialized JSON
+    /// body as a whole (`None` serializes to `null` — the same parse
+    /// idiom the fake itself uses at its `body_value`).
+    fn r_body_contains(r: &RecordedRequest, needle: &str) -> bool {
+        serde_json::to_string(&r.body)
+            .unwrap_or_default()
+            .contains(needle)
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    // ── merged from the send-during-compact-queue branch ──
+    /// Wait (bounded) until the fake has recorded a `prompt_async` POST
+    /// whose body contains `text` — the send-during-compact drain tests'
+    /// "the queued send actually POSTed" witness. Recording happens at
+    /// request ARRIVAL for every request (the same record-then-park
+    /// split the summarize arm uses), so a POST parked on the one-shot
+    /// prompt gate is still observable here. The POSTs happen inside
+    /// SPAWNED drive tasks — never assert them against a fixed sleep.
+    async fn await_abort_posted(http: &Arc<CompactFakeHttp>) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if http
+                    .recorded()
+                    .iter()
+                    .any(|r| r.method == "POST" && r.url.contains("/abort"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the abort POST lands within the budget"));
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    async fn await_prompt_posted(http: &Arc<CompactFakeHttp>, text: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if http
+                    .recorded()
+                    .iter()
+                    .any(|r| r.url.contains("prompt_async") && r_body_contains(r, text))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the prompt POST containing {text:?} lands within the budget"));
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// send-during-compact queue (Task 4): a `freshAgent.kill` (pane close/
+    /// retire) DROPS the queued sends under the phase-3 session lock —
+    /// atomic with `killed` — with one structured WARN per dropped entry
+    /// (a message must never silently disappear), and the dropped message
+    /// NEVER reaches the daemon (the drain's killed gate and the decrement
+    /// sites' self-gating spawns are the backstops for a drain mid-drive
+    /// racing the drop).
+    #[tokio::test]
+    async fn kill_with_a_queued_send_drops_it_with_a_warn_and_it_never_posts() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q5", Some("prov/model")).await;
+        let session_arc = st.sessions.lock().await.get("ses_q5").cloned().unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q5")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q5", "must die with the pane")),
+        )
+        .await;
+        assert!(
+            !session_arc.lock().await.pending_sends.is_empty(),
+            "fixture: the send queued behind the parked compact"
+        );
+
+        let (events, _guard) = info_capture::capture();
+
+        // The kill — the same inline FreshAgentKill literal the
+        // kill-mid-compact test above uses.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            st.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q5".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("kill completes");
+
+        // (1) The queued message is gone and never POSTs (causally safe: the
+        // queue was dropped under the phase-3 lock; the drain's killed gate
+        // and the decrement sites' self-gating spawns never drive).
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")
+                    && r_body_contains(r, "must die with the pane")),
+            "kill drops the queue — the message must never reach the daemon"
+        );
+        assert!(
+            session_arc.lock().await.pending_sends.is_empty(),
+            "the drop emptied the queue"
+        );
+        // (2) The drop is observable: one WARN naming the dropped request
+        // (message + the structured request_id field).
+        let captured = events.lock().unwrap();
+        assert!(
+            captured
+                .iter()
+                .any(|e| e.message.contains("fresh_agent_send_dropped_on_kill")
+                    && format!("{:?}", e.fields).contains("req-must die with the pane")),
+            "every dropped entry is WARNed with its request id: {captured:?}"
+        );
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// send-during-compact queue (Task 4, the stranding heal — the round-2
+    /// review's finding): the kill's DURABLE_CLOSE_FAILED arm decrements
+    /// `close_pending` with `killed` NEVER set ("the session is resumable
+    /// exactly as if the kill never ran"). A compact that settles inside
+    /// the kill's awaited-close window parks its settle-tail drain behind
+    /// `close_pending > 0` — the drain returns. The decrement site's
+    /// POSITIVE drain re-trigger must heal it: the queued send drains with
+    /// NO further input from the test, no matter how long the close took.
+    #[tokio::test]
+    async fn a_queued_send_survives_a_clean_failed_kill_and_drains_after_the_close_gate_releases() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        insert_compact_session(&st, "ses_q6", Some("prov/model")).await;
+        let session_arc = st.sessions.lock().await.get("ses_q6").cloned().unwrap();
+
+        // 1. Park the compact (the standard gated rig), queue one send.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q6")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q6", "the stranded heal")),
+        )
+        .await;
+        assert!(
+            !session_arc.lock().await.pending_sends.is_empty(),
+            "fixture: the send queued behind the parked compact"
+        );
+
+        // 2. The kill whose durable close parks, then fails CLEAN (the
+        // minimal fake-side knob scripts the park-then-failure: no existing
+        // knob composes a park window with the Clean failure class —
+        // `set_fail_writes` answers immediately with no park window, and
+        // the retire stall parks but answers `Ok`, the SUCCESS arm).
+        let close_fail = fake.arm_retire_fail_park("opencode", "ses_q6");
+        let st2 = st.clone();
+        let mut kill = tokio::spawn(async move {
+            st2.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q6".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        });
+        // The kill is deterministically inside its AWAITED durable close
+        // (the enumeration gate armed): the knob's `entered` fired when
+        // the batch call parked its answer.
+        let mut entered = false;
+        for _ in 0..100 {
+            if close_fail.entered.try_recv().is_ok() {
+                entered = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(entered, "the kill parked inside its awaited durable close");
+        assert_eq!(
+            session_arc.lock().await.close_pending,
+            1,
+            "the kill's enumeration gate is armed while the close parks"
+        );
+
+        // 3. Release the summarize gate DURING the awaited-close window: the
+        // compact settles; its settle-tail drain spawns, observes
+        // `close_pending > 0`, and returns (the stranded leg).
+        summarize_gate.notify_waiters();
+        let _ = frames_until(&mut rx, |f| is_event(f, "freshAgent.turn.complete", None)).await;
+        // The settle tail emits its terminal frames and then spawns the
+        // drain in ONE synchronous stretch (no await between the
+        // turn.complete broadcast and the spawn), so on this current-thread
+        // runtime the drain IS spawned by the time frames_until returns —
+        // but the spawned task still needs a scheduler round to RUN and
+        // observe the armed gate: yield until it has returned.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !session_arc.lock().await.pending_sends.is_empty(),
+            "the settle-tail drain returned at the armed gate — the send is stranded"
+        );
+
+        // 4. The parked close answers CLEAN FAILURE: the kill completes with
+        // FreshAgentKilled{success:false, DURABLE_CLOSE_FAILED} (the
+        // pre-existing broadcast), `killed` stays false, and
+        // `close_pending` returns to 0 — the decrement site.
+        close_fail
+            .release
+            .send(())
+            .expect("release the parked close failure");
+        tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
+            .await
+            .expect("the kill completes")
+            .expect("kill task completed");
+
+        // THE HEAL: the queued prompt POSTs with NO further input from the
+        // test — the decrement site's drain_detached fired.
+        await_prompt_posted(&http, "the stranded heal").await;
+
+        // The kill answered failure and the session is resumable exactly as
+        // if the kill never ran.
+        let frames = drain_frames(&mut rx);
+        let killed_frame = frames
+            .iter()
+            .find(|f| f["type"] == "freshAgent.killed")
+            .expect("the kill answers freshAgent.killed");
+        assert_eq!(
+            killed_frame["success"], false,
+            "a Clean-failed durable close reports success:false: {killed_frame}"
+        );
+        assert_eq!(
+            killed_frame["code"], "DURABLE_CLOSE_FAILED",
+            "the failure class is the clean close failure: {killed_frame}"
+        );
+        assert!(
+            !session_arc.lock().await.killed.load(Ordering::SeqCst),
+            "a Clean-failed close must never mark the session killed"
+        );
+        assert_eq!(
+            session_arc.lock().await.close_pending,
+            0,
+            "the enumeration gate released"
+        );
+        assert!(
+            session_arc.lock().await.pending_sends.is_empty(),
+            "the healed drain emptied the queue"
+        );
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// The composer stays interactive while a session is busy, so a send CAN
+    /// arrive mid-compact. The send is QUEUED (FIFO, on the session's
+    /// `pending_sends`) instead of refused — the user's typed message is never
+    /// lost — with the client contract's immediate `freshAgent.send.accepted`
+    /// (the original requestId) and a structured WARN as the ONLY queue-time
+    /// side effects: no prompt POST fires while the compact is parked, the
+    /// compact's driving task stays the session's registered `turn_task`
+    /// (never stolen), and a later kill still aborts it without a fabricated
+    /// `freshAgent.turn.complete` (the kill also drops the queued entry).
+    #[tokio::test]
+    async fn send_during_an_in_flight_compact_is_queued_accepted_and_leaves_the_compact_owned() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q1", Some("prov/model")).await;
+        // The compact drive: parked summarize = deterministic in-flight window.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q1")),
+        )
+        .await
+        .expect("handle_compact returns after registering the detached drive");
+        await_summarize_posted(&http).await;
+
+        // WARN capture: the crate's real facility (user precedent :6807-6851).
+        let (events, _guard) = info_capture::capture();
+
+        // THE SEND — arrives while the compact drive is in flight.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q1", "queued text")),
+        )
+        .await
+        .expect("handle_send queues inline (no refusal path)");
+
+        // (1) The client contract: immediate `freshAgent.send.accepted` with the
+        // original requestId (send_msg mints request_id = Some("req-queued text")).
+        // frames_until stops at the FIRST predicate match — one call pins the
+        // single expected acceptance.
+        let frames = frames_until(&mut rx, |f| {
+            f["type"] == "freshAgent.send.accepted" && f["requestId"] == "req-queued text"
+        })
+        .await;
+        assert!(
+            !frames.is_empty(),
+            "accepted carries the send's original requestId"
+        );
+
+        // (2) NO refusal: the D2-F1 nested INTERNAL_ERROR broadcast is gone.
+        assert!(
+            !drain_frames(&mut rx)
+                .iter()
+                .any(|f| is_event(f, "freshAgent.error", None)
+                    && f["event"]["code"] == "INTERNAL_ERROR"),
+            "the refusal must not fire — the send is queued"
+        );
+
+        // (3) NO prompt POST left the building while the compact is parked.
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async") && r_body_contains(r, "queued text")),
+            "the queued send must NOT POST while the compact is in flight"
+        );
+
+        // (4) The compact's turn_task is untouched (the original test's
+        // ownership invariant, kept) and the send is parked FIFO.
+        {
+            let session_arc = st
+                .sessions
+                .lock()
+                .await
+                .get("ses_q1")
+                .cloned()
+                .expect("session present");
+            let session = session_arc.lock().await;
+            assert!(
+                session
+                    .turn_task
+                    .as_ref()
+                    .is_some_and(|t| t.kind == TurnTaskKind::Compact && !t.is_finished()),
+                "the compact still owns the session's turn_task"
+            );
+            assert_eq!(
+                session.pending_sends.len(),
+                1,
+                "the send is parked in the FIFO queue"
+            );
+        }
+
+        // (5) The structured WARN named the queueing (message + field).
+        {
+            let captured = events.lock().unwrap();
+            assert!(
+                captured
+                    .iter()
+                    .any(|e| e.message.contains("fresh_agent_send_queued_behind_compact")),
+                "queueing is observable in the structured log"
+            );
+        }
+
+        // (6) The kill tail of the replaced test stays: a kill mid-compact
+        // aborts the compact with no fabricated freshAgent.turn.complete and
+        // lands freshAgent.killed (kill also drops the queue — Task 4 adds the
+        // dropped-entry WARN).
+        let session_arc = st
+            .sessions
+            .lock()
+            .await
+            .get("ses_q1")
+            .cloned()
+            .expect("session present before the kill");
+        st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
+            provider: AgentProvider::Opencode,
+            session_id: "ses_q1".to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+        summarize_gate.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await; // settle window
+
+        let frames = drain_frames(&mut rx);
+        assert!(
+            frames.iter().any(|f| f["type"] == "freshAgent.killed"),
+            "the kill frame lands: {frames:?}"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.turn.complete", None)),
+            "the aborted compact never fabricates a turn-complete: {frames:?}"
+        );
+        assert!(
+            session_arc
+                .lock()
+                .await
+                .turn_task
+                .as_ref()
+                .map(|t| t.is_finished())
+                .unwrap_or(true),
+            "the kill took + aborted the compact's registered task"
+        );
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// The drain's FIFO + one-at-a-time + emission-order contract, end to
+    /// end. Two sends queued behind a parked compact; the release drains
+    /// them strictly one per settle tail: the compact's trailing `idle`
+    /// precedes the first send's `running`, the first send's trailing
+    /// `idle` precedes the second's `running` — pinned over the WHOLE
+    /// run's frame stream from a second receiver (the first receiver's
+    /// earlier frames_until/drain_frames calls consume their own buffer).
+    #[tokio::test]
+    async fn a_queued_send_drains_after_the_compact_settles_in_fifo_order() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        // The _tx variant exposes the bus sender: a SECOND, untouched
+        // receiver carries the total frame order for assertion (6) even
+        // though this test's earlier frames_until/drain_frames calls
+        // consume the first receiver (the round-3 review's finding).
+        let (st, http, mut rx, bus_tx) = compact_state_gated_tx(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        let mut order_rx = bus_tx.subscribe();
+        insert_compact_session(&st, "ses_q2", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q2")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+
+        // Arm the one-shot prompt park BEFORE the drain can fire.
+        let prompt_gate = http.arm_prompt_gate();
+
+        // TWO queued sends — FIFO order is the assertion target.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q2", "first queued")),
+        )
+        .await
+        .expect("queues inline");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q2", "second queued")),
+        )
+        .await
+        .expect("queues inline");
+
+        // Both accepted at queue time. frames_until stops at the FIRST
+        // predicate match — wait for EACH requestId with its own call.
+        let _ = frames_until(&mut rx, |f| {
+            f["type"] == "freshAgent.send.accepted" && f["requestId"] == "req-first queued"
+        })
+        .await;
+        let _ = frames_until(&mut rx, |f| {
+            f["type"] == "freshAgent.send.accepted" && f["requestId"] == "req-second queued"
+        })
+        .await;
+
+        // Release: the compact POST answers, the drive settles, the drain runs.
+        summarize_gate.notify_waiters();
+
+        // (1) The FIRST drained send parks on the one-shot prompt gate.
+        await_prompt_posted(&http, "first queued").await;
+
+        // (2) ONE-AT-A-TIME (the design constraint, now PROVEN): while the
+        // first queued send is in flight (parked), the second has NOT
+        // started — the drain drives exactly one entry per settle tail.
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async") && r_body_contains(r, "second queued")),
+            "one-at-a-time: the second queued send has not POSTed while the first is in flight"
+        );
+
+        // (3) Release the first send's prompt; its settle tail drives the
+        // second (bounded async waits: the POSTs happen inside spawned
+        // tasks — never assert them against a fixed sleep).
+        prompt_gate.notify_waiters();
+        await_prompt_posted(&http, "second queued").await;
+
+        // (4) Order on the recorded log: compact BEFORE first, first BEFORE
+        // second (FIFO).
+        let recorded = http.recorded();
+        let summarize_ix = recorded
+            .iter()
+            .position(|r| r.url.contains("summarize"))
+            .expect("summarize POST recorded");
+        let first_ix = recorded
+            .iter()
+            .position(|r| r.url.contains("prompt_async") && r_body_contains(r, "first queued"))
+            .expect("first queued send drained");
+        let second_ix = recorded
+            .iter()
+            .position(|r| r.url.contains("prompt_async") && r_body_contains(r, "second queued"))
+            .expect("second queued send drained");
+        assert!(
+            summarize_ix < first_ix,
+            "drain waits for the compact settle"
+        );
+        assert!(first_ix < second_ix, "FIFO order");
+
+        // (5) The queue drains completely and the pane settles idle —
+        // wait for EACH drive's trailing idle with its own bounded call
+        // (frames_until stops at the FIRST match, and the first call
+        // would otherwise return on the compact's already-buffered idle
+        // while the second send's drive is still in flight): the
+        // compact's, the first send's, then the second send's. All
+        // three landed = the queue drained and the pane settled.
+        for _ in 0..3 {
+            let _ = frames_until(&mut rx, |f| {
+                is_event(f, "freshAgent.session.snapshot", Some("idle"))
+            })
+            .await;
+        }
+        let session_arc = st.sessions.lock().await.get("ses_q2").cloned().unwrap();
+        assert!(session_arc.lock().await.pending_sends.is_empty());
+
+        // (6) THE EMISSION-ORDER CONTRACT (the round-2 review's ordering
+        // finding): over the WHOLE run's frame stream, each drive's trailing
+        // idle precedes the next drive's running — the compact settles (idle)
+        // before send #1 starts (running), and send #1 settles before send #2
+        // starts. One drain_frames at the end gives the total emission
+        // order; positional assertions on the running/idle snapshot lists.
+        // Drain the SECOND receiver — the first receiver's earlier
+        // frames_until/drain_frames calls already consumed its frames, so
+        // the full emission order survives only in order_rx.
+        let all_frames = drain_frames(&mut order_rx);
+        let running_ix: Vec<usize> = all_frames
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| is_event(f, "freshAgent.session.snapshot", Some("running")))
+            .map(|(i, _)| i)
+            .collect();
+        let idle_ix: Vec<usize> = all_frames
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| is_event(f, "freshAgent.session.snapshot", Some("idle")))
+            .map(|(i, _)| i)
+            .collect();
+        // This rig emits exactly 3 runnings (compact, send 1, send 2) and 3
+        // idles — assert the counts, then the cross-drive ordering.
+        assert_eq!(running_ix.len(), 3, "compact + two sends each ran once");
+        assert_eq!(idle_ix.len(), 3, "each drive settled once");
+        assert!(
+            idle_ix[0] < running_ix[1],
+            "the compact's trailing idle precedes the first queued send's running"
+        );
+        assert!(
+            idle_ix[1] < running_ix[2],
+            "the first send's trailing idle precedes the second queued send's running"
+        );
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// MUST #4 (the client contract): a fresh send arriving while older
+    /// entries are still queued appends — never drives ahead of them.
+    /// The exact window: a live (unsettled) SEND drive with an
+    /// already-queued entry the drain has not popped yet.
+    #[tokio::test]
+    async fn a_send_arriving_behind_pending_queue_entries_appends_fifo() {
+        let (st, _http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            None,
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q2b", Some("prov/model")).await;
+        let session_arc = st.sessions.lock().await.get("ses_q2b").cloned().unwrap();
+        {
+            let mut session = session_arc.lock().await;
+            // Plant the live SEND drive + the pending older entry white-box
+            // (same-crate test style): the drain has not popped it.
+            session.turn_task = Some(TurnTask {
+                kind: TurnTaskKind::Send,
+                handle: tokio::spawn(std::future::pending::<()>()),
+                compact_settled_rx: None,
+                settling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            });
+            session
+                .pending_sends
+                .push_back(send_msg("ses_q2b", "older entry"));
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q2b", "newer entry")),
+        )
+        .await
+        .expect("appends behind pending entries");
+        let session = session_arc.lock().await;
+        let texts: Vec<String> = session
+            .pending_sends
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["older entry".to_string(), "newer entry".to_string()],
+            "a send behind pending queue entries appends in FIFO order"
+        );
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// The settling-flag gate semantics, planted deterministically.
+    #[tokio::test]
+    async fn a_settling_registration_does_not_block_the_drain_but_a_live_one_does() {
+        let (st, _http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            None,
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q2c", Some("prov/model")).await;
+        let session_arc = st.sessions.lock().await.get("ses_q2c").cloned().unwrap();
+        // (a) live (unsettling) registration → the drain returns without popping.
+        {
+            let mut session = session_arc.lock().await;
+            session.turn_task = Some(TurnTask {
+                kind: TurnTaskKind::Compact,
+                handle: tokio::spawn(std::future::pending::<()>()),
+                compact_settled_rx: None,
+                settling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            });
+            session.pending_sends.push_back(send_msg("ses_q2c", "held"));
+        }
+        st.drain_pending_sends("ses_q2c").await;
+        assert_eq!(
+            session_arc.lock().await.pending_sends.len(),
+            1,
+            "a live registration blocks the drain"
+        );
+        // (b) settling registration → the drain pops and drives (the drive
+        // itself POSTs to the fake — this rig has no coordinator wired, so
+        // the unfenced entry proceeds exactly like the direct path).
+        {
+            let mut session = session_arc.lock().await;
+            session.turn_task = Some(TurnTask {
+                kind: TurnTaskKind::Compact,
+                handle: tokio::spawn(std::future::pending::<()>()),
+                compact_settled_rx: None,
+                settling: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            });
+        }
+        st.drain_pending_sends("ses_q2c").await;
+        assert!(
+            session_arc.lock().await.pending_sends.is_empty(),
+            "a settling registration is past its emissions — the drain proceeds"
+        );
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Same rig; park the compact, queue one send, then interrupt. The
+    /// aborted compact's own settle tail NEVER runs (TurnTask doc
+    /// :199-201), so the drain must fire from handle_interrupt after
+    /// abort_and_settle — the queued prompt POST is the proof.
+    #[tokio::test]
+    async fn an_interrupted_compact_still_drains_the_queued_send() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q3", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q3")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q3", "survives the interrupt")),
+        )
+        .await;
+        // The inline FreshAgentInterrupt literal the interrupt lifecycle
+        // test uses (same field shape, adapted to ses_q3).
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q3".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers");
+        await_prompt_posted(&http, "survives the interrupt").await;
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Delta-review round 3: the FAILED daemon-side abort path. The
+    /// interrupt's Err arm must NOT dispatch parked sends — the daemon
+    /// may still be executing the interrupted turn, and firing a prompt
+    /// into that window could lose or reorder the message. The deferral
+    /// holds EVERY drain trigger off (the interrupt's own, the queue
+    /// arm's push-armed drain) and is WARN-observable; a LATER
+    /// interrupt whose daemon-side abort SUCCEEDS proves the quiesce,
+    /// disarms the deferral, and delivers the queue in FIFO order.
+    #[tokio::test]
+    async fn a_failed_daemon_abort_defers_the_drain_until_a_successful_interrupt() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q8", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q8")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        // TWO queued sends: the second's push-armed drain is the extra
+        // trigger that must ALSO be held off during the orphan window.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q8", "first deferred")),
+        )
+        .await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q8", "second deferred")),
+        )
+        .await;
+
+        let (events, _guard) = info_capture::capture();
+
+        // The daemon-side abort FAILS — the Err arm arms the deferral.
+        http.arm_abort_fail();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q8".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers (abort fails)");
+
+        // The daemon-side compact completes in the fake; NOTHING local
+        // observes it — the parked prompts must STILL not have POSTed
+        // (the deferral holds every trigger). Let any spawned drain
+        // reach its gate check before asserting absence.
+        summarize_gate.notify_waiters();
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        {
+            let captured = events.lock().unwrap();
+            assert!(
+                captured.iter().any(|e| e
+                    .message
+                    .contains("fresh_agent_interrupt_abort_failed_queue_deferred")),
+                "the deferral is WARN-observable"
+            );
+        }
+        assert!(
+            !http.recorded().iter().any(|r| {
+                r.url.contains("prompt_async")
+                    && (r_body_contains(r, "first deferred") || r_body_contains(r, "second deferred"))
+            }),
+            "a failed daemon-side abort must defer the drain — no parked prompt POSTs into the orphan window"
+        );
+        // A LATER interrupt whose daemon-side abort SUCCEEDS proves the
+        // quiesce: disarm + drain → the queue delivers in FIFO order.
+        http.clear_abort_fail();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q8".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers (abort succeeds)");
+        await_prompt_posted(&http, "first deferred").await;
+        await_prompt_posted(&http, "second deferred").await;
+        let recorded = http.recorded();
+        let first_ix = recorded
+            .iter()
+            .position(|r| r.url.contains("prompt_async") && r_body_contains(r, "first deferred"))
+            .expect("first deferred drained");
+        let second_ix = recorded
+            .iter()
+            .position(|r| r.url.contains("prompt_async") && r_body_contains(r, "second deferred"))
+            .expect("second deferred drained");
+        assert!(first_ix < second_ix, "the recovered queue delivers FIFO");
+        let session_arc = st.sessions.lock().await.get("ses_q8").cloned().unwrap();
+        assert!(
+            session_arc.lock().await.pending_sends.is_empty(),
+            "the recovered queue drains completely"
+        );
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Delta-review round 4: the deferral is NOT permanent. The serve
+    /// bridge observes the daemon's own session-IDLE event — the proven
+    /// end of the orphaned daemon-side turn — and
+    /// [`FreshOpencodeState::observe_daemon_idle`] (the exact function
+    /// the bridge calls on a `Snapshot::Idle`) releases the latch and
+    /// delivers the parked queue AUTOMATICALLY, FIFO, with the release
+    /// WARN-observable. No manual interrupt required.
+    #[tokio::test]
+    async fn the_daemon_idle_observation_releases_the_interrupt_deferral_and_delivers() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q9", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q9")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q9", "first auto")),
+        )
+        .await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q9", "second auto")),
+        )
+        .await;
+
+        let (events, _guard) = info_capture::capture();
+        http.arm_abort_fail();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q9".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers (abort fails)");
+        {
+            let captured = events.lock().unwrap();
+            assert!(
+                captured.iter().any(|e| e
+                    .message
+                    .contains("fresh_agent_interrupt_abort_failed_queue_deferred")),
+                "the deferral is WARN-observable"
+            );
+        }
+
+        // The daemon-side compact eventually settles; the bridge observes
+        // the interrupted turn's running and then its idle (the
+        // delivery-order identity) — the AUTOMATIC release + delivery:
+        FreshOpencodeState::observe_daemon_running(&st, "ses_q9", "ses_q9").await;
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q9", "ses_q9").await;
+        await_prompt_posted(&http, "first auto").await;
+        await_prompt_posted(&http, "second auto").await;
+        {
+            let captured = events.lock().unwrap();
+            assert!(
+                captured.iter().any(|e| e
+                    .message
+                    .contains("fresh_agent_interrupt_orphan_released_by_daemon_idle")),
+                "the release is WARN-observable"
+            );
+        }
+        let recorded = http.recorded();
+        let first_ix = recorded
+            .iter()
+            .position(|r| r.url.contains("prompt_async") && r_body_contains(r, "first auto"))
+            .expect("first auto delivered");
+        let second_ix = recorded
+            .iter()
+            .position(|r| r.url.contains("prompt_async") && r_body_contains(r, "second auto"))
+            .expect("second auto delivered");
+        assert!(first_ix < second_ix, "the released queue delivers FIFO");
+        let session_arc = st.sessions.lock().await.get("ses_q9").cloned().unwrap();
+        assert!(
+            session_arc.lock().await.pending_sends.is_empty(),
+            "the released queue drains completely"
+        );
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Delta-review round 4: an interrupt on an UNMATERIALIZED session
+    /// takes the early-return path — the teardown-start latch arming is
+    /// undone there, so a later compact queue can never be poisoned by a
+    /// deferral latch with no daemon-side turn behind it.
+    #[tokio::test]
+    async fn an_unmaterialized_interrupt_does_not_poison_the_deferral_latch() {
+        let (st, _http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            None,
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q10", Some("prov/model")).await;
+        let session_arc = st.sessions.lock().await.get("ses_q10").cloned().unwrap();
+        // Unmaterialize white-box: no real durable id → the interrupt's
+        // early-return path.
+        session_arc.lock().await.real_session_id = None;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q10".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers (unmaterialized early return)");
+        {
+            let session = session_arc.lock().await;
+            assert!(
+                !session.orphaned_daemon_turn.load(Ordering::SeqCst),
+                "the latch is not left armed by the unmaterialized early return"
+            );
+        }
+        // And the drain still works afterward (the poisoning regression's
+        // observable): park an entry white-box and drive it.
+        {
+            let mut session = session_arc.lock().await;
+            session
+                .pending_sends
+                .push_back(send_msg("ses_q10", "after the early return"));
+        }
+        st.drain_pending_sends("ses_q10").await;
+        assert!(
+            session_arc.lock().await.pending_sends.is_empty(),
+            "a later queue is not poisoned — the drain drives"
+        );
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Delta-review round 5: the bridge's idle broadcast is gated on
+    /// genuine session quiescence. The same daemon idle is consumed
+    /// independently by the drive's await_idle — a bridge-side idle
+    /// processed AFTER the next queued send has started (the scheduling
+    /// race the round-5 reviewer identified) must be SUPPRESSED: a
+    /// stale trailing idle would flip the client's flush gate mid-send,
+    /// flushing another message into the send-overwrites-send direct
+    /// path and breaking one-at-a-time. The live drive's own settle
+    /// tail owns the authoritative idle.
+    #[tokio::test]
+    async fn a_stale_bridge_idle_during_a_live_queued_send_is_suppressed() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q11", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q11")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        // Two queued sends; the one-shot prompt gate parks the FIRST
+        // drained send (the FIFO rig's deterministic in-flight window).
+        let prompt_gate = http.arm_prompt_gate();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q11", "first live")),
+        )
+        .await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q11", "second live")),
+        )
+        .await;
+
+        // Release: the compact settles (its settle tail broadcasts the
+        // AUTHORITATIVE idle — a legitimate one, it precedes the next
+        // running), the drain drives the first send, and its prompt
+        // PARKS — the first send is LIVE.
+        summarize_gate.notify_waiters();
+        await_prompt_posted(&http, "first live").await;
+        // Consume everything the legitimate flow emitted up to here.
+        let _ = drain_frames(&mut rx);
+
+        // The bridge now processes the daemon's idle for the COMPACT —
+        // the stale duplicate racing the live queued send. It MUST be
+        // suppressed: NO new frame lands while the first send is live.
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q11", "ses_q11").await;
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            drain_frames(&mut rx).is_empty(),
+            "the stale bridge-side idle is suppressed while the first queued send is live — no new frame may land"
+        );
+        // And the queue is still parked (nothing drove past the live send).
+        assert!(!http
+            .recorded()
+            .iter()
+            .any(|r| { r.url.contains("prompt_async") && r_body_contains(r, "second live") }));
+
+        // Release the first send's prompt: it settles (its settle tail
+        // broadcasts the AUTHORITATIVE idle), the second drives, and the
+        // run completes with the emission-order contract intact.
+        prompt_gate.notify_waiters();
+        await_prompt_posted(&http, "second live").await;
+        let _ = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+        })
+        .await;
+        let session_arc = st.sessions.lock().await.get("ses_q11").cloned().unwrap();
+        assert!(session_arc.lock().await.pending_sends.is_empty());
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Focused-review episode 1 round 1: the quiescence decision and the
+    /// idle emission are ONE critical section — the mutex-release
+    /// handoff race. A bridge idle observed on a quiescent session and
+    /// a concurrently-arriving send are serialized by the SESSION LOCK:
+    /// tokio's Mutex is fair (FIFO), so with the helper queued FIRST
+    /// and a handle_send queued SECOND behind a held lock, the helper
+    /// must emit its idle BEFORE the send registers/emits running —
+    /// never the stale interleaving this gate exists to prevent.
+    /// Multi-thread flavor: the woken send runs on another worker the
+    /// moment the lock handoff happens, so a broadcast-after-release
+    /// bug has real workers to lose against; with the fix the running
+    /// can only follow the idle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_bridge_idle_broadcast_is_atomic_with_send_registration() {
+        let (st, http, mut rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            None,
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q12", Some("prov/model")).await;
+        // Hold the session lock so both waiters queue in a known order.
+        let session_arc = st.sessions.lock().await.get("ses_q12").cloned().unwrap();
+        let _held = session_arc.lock().await;
+
+        let helper = {
+            let st = st.clone();
+            let id = "ses_q12".to_string();
+            tokio::spawn(async move {
+                FreshOpencodeState::observe_daemon_idle(&st, &id, &id).await;
+            })
+        };
+        // Yield so the helper parks on the session lock FIRST.
+        tokio::task::yield_now().await;
+        let sender = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                let _ = st
+                    .handle_send(send_msg("ses_q12", "the handoff send"))
+                    .await;
+            })
+        };
+        // Yield so the send parks SECOND (tokio Mutex grants FIFO).
+        tokio::task::yield_now().await;
+        // Release the held lock: the helper acquires, decides quiescent,
+        // and emits its idle INSIDE the critical section; only then may
+        // the send register + emit its running.
+        // Park the send's prompt POST (single-use gate): its settle
+        // idle cannot exist until released, so any idle observed while
+        // parked is a stale bridge emission racing the registration —
+        // the exact interleaving this critical section forbids.
+        let prompt_gate = http.arm_prompt_gate();
+        drop(_held);
+        let _ = sender.await;
+        await_prompt_posted(&http, "the handoff send").await;
+        let _ = helper.await;
+
+        let idle = |f: &Value| is_event(f, "freshAgent.session.snapshot", Some("idle"));
+        let running = |f: &Value| is_event(f, "freshAgent.session.snapshot", Some("running"));
+        let pre = drain_frames(&mut rx);
+        assert!(!pre.is_empty(), "the handoff produced frames");
+        if idle(&pre[0]) {
+            // Helper-first: the idle emission is atomic with the
+            // quiescence decision — the send's running can only follow.
+            let running_ix = pre
+                .iter()
+                .position(running)
+                .expect("the send's running landed");
+            assert!(
+                running_ix > 0,
+                "the helper's idle precedes the send's running — the emission is atomic with the decision"
+            );
+            assert!(
+                !pre.iter().skip(1).any(idle),
+                "no second idle may exist while the send is still parked"
+            );
+        } else {
+            assert!(
+                running(&pre[0]),
+                "unexpected first frame — neither idle nor running"
+            );
+            assert!(
+                !pre.iter().any(idle),
+                "sender-first means the helper observed the live send inside its critical section and SUPPRESSED — an idle while the send is still parked is a stale emission that raced the registration"
+            );
+        }
+
+        // Release the POST: the send settles, exactly one settle idle.
+        prompt_gate.notify_waiters();
+        let settle = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+        })
+        .await;
+        let remaining = drain_frames(&mut rx);
+        let late_idles = remaining.iter().filter(|f| idle(f)).count();
+        assert_eq!(
+            late_idles, 0,
+            "the settle idle is consumed exactly once — no late stale emissions"
+        );
+        assert!(settle.iter().any(idle));
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Delta-review round 6 (extension) Major 2: the daemon reporting idle
+    /// while the session-scoped abort request is STILL IN FLIGHT must NOT
+    /// release the deferral latch — `handle_interrupt` drops the session
+    /// lock to await the abort, and a release in that window dispatches
+    /// the parked prompt before the abort has settled; the daemon's late
+    /// abort processing can then cancel that freshly-dispatched prompt
+    /// after it left `pending_sends`, with no requeue or correlated
+    /// failure — losing the message. The release defers to the abort's
+    /// settlement (its Ok arm drains; its ambiguous-failure arm keeps
+    /// the round-3 deferral).
+    #[tokio::test]
+    async fn the_daemon_idle_release_defers_to_an_in_flight_abort() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q13", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q13")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q13", "deferred behind the abort")),
+        )
+        .await;
+
+        // The interrupt's daemon-side abort parks at the gate: the abort
+        // request is IN FLIGHT (recorded, unsettled).
+        let abort_gate = http.arm_abort_gate();
+        let interrupt = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    st.handle_interrupt(FreshAgentInterrupt {
+                        provider: AgentProvider::Opencode,
+                        session_id: "ses_q13".to_string(),
+                        session_type: SessionType::Freshopencode,
+                        cwd: None,
+                    }),
+                )
+                .await
+            })
+        };
+        await_abort_posted(&http).await;
+
+        // The daemon reports idle while the abort is in flight (the old
+        // compact's turn ended on its own). The release must DEFER: the
+        // latch stays armed and no parked prompt dispatches into the
+        // abort's settlement window.
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q13", "ses_q13").await;
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "no parked prompt may dispatch while the abort request is still in flight — the release defers to the abort's settlement"
+        );
+        {
+            let session_arc = st.sessions.lock().await.get("ses_q13").cloned().unwrap();
+            assert!(
+                session_arc
+                    .lock()
+                    .await
+                    .orphaned_daemon_turn
+                    .load(Ordering::SeqCst),
+                "the deferral latch stays armed while the abort is in flight"
+            );
+        }
+
+        // The abort settles 200: the Ok arm disarms + drains — the parked
+        // prompt delivers AFTER the abort, never into its window.
+        abort_gate.notify_waiters();
+        interrupt
+            .await
+            .expect("interrupt task lives")
+            .expect("interrupt answers within the budget");
+        await_prompt_posted(&http, "deferred behind the abort").await;
+        let abort_ix = http
+            .recorded()
+            .iter()
+            .position(|r| r.method == "POST" && r.url.contains("/abort"))
+            .expect("the abort POST is recorded");
+        let prompt_ix = http
+            .recorded()
+            .iter()
+            .position(|r| r.url.contains("prompt_async"))
+            .expect("the parked prompt drained");
+        assert!(
+            abort_ix < prompt_ix,
+            "the abort settled before the parked prompt dispatched"
+        );
+        let session_arc = st.sessions.lock().await.get("ses_q13").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
+        assert!(session.pending_sends.is_empty());
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Delta-review round 6 (extension) Major 1: an abort request TIMEOUT is
+    /// the failure flavor that kills the sidecar (`DiscardOnTimeout::Yes` →
+    /// `discard_running` + `Lost` to every session) — by construction no
+    /// daemon-side writer can remain, so the deferral latch must NOT survive
+    /// it (the old code left it armed forever: the bridge ignores `Lost`,
+    /// the emitter closes, and no idle can ever release the queue again —
+    /// parked messages strand). The timeout arm disarms + drains: the
+    /// parked message either delivers (post-revival) or fails with the
+    /// normal typed send-failure path — it never strands silently.
+    #[tokio::test]
+    async fn an_abort_timeout_discards_the_sidecar_and_still_drains_the_queue() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx, _tx) = compact_state_gated_cfg(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+            Some(Duration::from_millis(150)),
+        )
+        .await;
+        insert_compact_session(&st, "ses_q14", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q14")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q14", "survives the timeout")),
+        )
+        .await;
+
+        let (events, _guard) = info_capture::capture();
+        // The daemon-side abort NEVER resolves — the request times out at
+        // the serve request_timeout (150ms) and the sidecar is discarded.
+        http.arm_abort_hang();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q14".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers after the abort timeout");
+
+        await_prompt_posted(&http, "survives the timeout").await;
+        {
+            let captured = events.lock().unwrap();
+            assert!(
+                captured
+                    .iter()
+                    .any(|e| e.message.contains("fresh_agent_interrupt_abort_no_writer")),
+                "the timeout's no-writer settlement is WARN-observable"
+            );
+        }
+        let session_arc = st.sessions.lock().await.get("ses_q14").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(
+            !session.orphaned_daemon_turn.load(Ordering::SeqCst),
+            "the timeout flavor leaves no daemon-side writer — the latch cannot survive it"
+        );
+        assert!(session.pending_sends.is_empty());
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Focused episode 2 round 1, Major 1: an abort refused at the connect
+    /// phase (`Undelivered`) proves only that the ABORT never reached the
+    /// daemon — it says nothing about the already-accepted daemon-side
+    /// turn, which may still be running. It must DEFER exactly like a
+    /// 500-answered abort (the round-3 semantics); a later daemon idle is
+    /// the proven quiesce that releases + delivers.
+    #[tokio::test]
+    async fn an_undelivered_abort_defers_like_a_failed_abort() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q15", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q15")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q15", "waits out the refusal")),
+        )
+        .await;
+
+        let (events, _guard) = info_capture::capture();
+        http.arm_abort_refused();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q15".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers after the refused abort");
+
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "an undelivered abort defers like a failed one — the daemon-side turn may still be running"
+        );
+        {
+            let captured = events.lock().unwrap();
+            assert!(
+                captured.iter().any(|e| e
+                    .message
+                    .contains("fresh_agent_interrupt_abort_failed_queue_deferred")),
+                "the refusal keeps the round-3 deferral WARN"
+            );
+        }
+        let session_arc = st.sessions.lock().await.get("ses_q15").cloned().unwrap();
+        assert!(
+            session_arc
+                .lock()
+                .await
+                .orphaned_daemon_turn
+                .load(Ordering::SeqCst),
+            "the deferral latch stays armed"
+        );
+
+        // The daemon later reports the interrupted turn's running and
+        // then its idle (the delivery-order identity) — the PROVEN quiesce
+        // releases + delivers (round-4 semantics).
+        FreshOpencodeState::observe_daemon_running(&st, "ses_q15", "ses_q15").await;
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q15", "ses_q15").await;
+        await_prompt_posted(&http, "waits out the refusal").await;
+        let session_arc = st.sessions.lock().await.get("ses_q15").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
+        assert!(session.pending_sends.is_empty());
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Focused episode 2 round 1, Major 2: with two rapid interrupts, the
+    /// FIRST abort to settle must NOT clear the latch + drain while the
+    /// second abort is still in flight — the second abort's late
+    /// processing could cancel the freshly dispatched prompt after it
+    /// left the queue. The LAST in-flight abort's settlement owns the
+    /// release.
+    #[tokio::test]
+    async fn the_last_in_flight_abort_owns_the_queue_release() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q16", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q16")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q16", "behind both aborts")),
+        )
+        .await;
+
+        // Interrupt A's abort parks on the one-shot gate (in flight);
+        // interrupt B's abort answers 200 immediately.
+        let abort_gate = http.arm_abort_gate();
+        let interrupt_a = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    st.handle_interrupt(FreshAgentInterrupt {
+                        provider: AgentProvider::Opencode,
+                        session_id: "ses_q16".to_string(),
+                        session_type: SessionType::Freshopencode,
+                        cwd: None,
+                    }),
+                )
+                .await
+            })
+        };
+        await_abort_posted(&http).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q16".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt B answers (abort 200)");
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "B's SUCCESSFUL abort must not drain while A's abort is still in flight — the LAST settlement owns the release"
+        );
+        {
+            let session_arc = st.sessions.lock().await.get("ses_q16").cloned().unwrap();
+            assert!(
+                session_arc
+                    .lock()
+                    .await
+                    .orphaned_daemon_turn
+                    .load(Ordering::SeqCst),
+                "the deferral latch stays armed until the last abort settles"
+            );
+        }
+
+        // A's abort settles 200 — the LAST settlement clears + drains.
+        abort_gate.notify_waiters();
+        interrupt_a
+            .await
+            .expect("interrupt A task lives")
+            .expect("interrupt A answers within the budget");
+        await_prompt_posted(&http, "behind both aborts").await;
+        let session_arc = st.sessions.lock().await.get("ses_q16").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
+        assert!(session.pending_sends.is_empty());
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Focused episode 2 round 1, Major 3: a daemon idle observed DURING
+    /// an abort window is remembered, not discarded — if the abort then
+    /// settles with an ambiguous failure (HTTP 500), the already-seen
+    /// idle is the proven quiesce that releases + delivers; without the
+    /// memory the queue would strand (the compact's only idle edge is
+    /// gone and no later event can release it).
+    #[tokio::test]
+    async fn an_idle_observed_during_an_abort_window_releases_on_its_ambiguous_failure() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q17", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q17")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q17", "waits for the memory")),
+        )
+        .await;
+
+        // The abort parks (in flight) AND will answer 500 when released.
+        let abort_gate = http.arm_abort_gate();
+        http.arm_abort_fail();
+        let interrupt = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    st.handle_interrupt(FreshAgentInterrupt {
+                        provider: AgentProvider::Opencode,
+                        session_id: "ses_q17".to_string(),
+                        session_type: SessionType::Freshopencode,
+                        cwd: None,
+                    }),
+                )
+                .await
+            })
+        };
+        await_abort_posted(&http).await;
+
+        // The daemon reports the interrupted turn's RUNNING and then
+        // its idle DURING the abort window — the delivery-order identity
+        // (episode 2 round 5, Major 2): an idle is proof only when it
+        // FOLLOWS a delivered running. Deferred (episode 2 round 1,
+        // Major 2) but REMEMBERED (episode 2 round 1, Major 3).
+        FreshOpencodeState::observe_daemon_running(&st, "ses_q17", "ses_q17").await;
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q17", "ses_q17").await;
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "the release defers to the abort's settlement"
+        );
+
+        // The abort settles AMBIGUOUSLY (500) — the remembered idle is
+        // the proven quiesce: release + deliver (no stranding on the
+        // compact's only idle edge having already fired).
+        abort_gate.notify_waiters();
+        interrupt
+            .await
+            .expect("interrupt task lives")
+            .expect("interrupt answers within the budget");
+        await_prompt_posted(&http, "waits for the memory").await;
+        let session_arc = st.sessions.lock().await.get("ses_q17").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
+        assert!(session.pending_sends.is_empty());
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Focused episode 2 round 2, Major 1: a successful abort that is NOT
+    /// the last in flight must not broadcast `idle` — the unchanged client
+    /// flushes its composer queue on that idle, and with the interrupt
+    /// having removed the turn task and the server queue possibly empty,
+    /// `handle_send` dispatches the flushed message DIRECTLY (never
+    /// passing through the drain gate) — the remaining in-flight abort
+    /// can then cancel it at the daemon after the client removed it from
+    /// its queue: silent typed-message loss. The idle broadcast, like
+    /// every other release action, is owned by the LAST settlement.
+    #[tokio::test]
+    async fn no_idle_broadcast_while_a_sibling_abort_is_in_flight() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q18", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q18")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q18", "behind both aborts")),
+        )
+        .await;
+
+        let abort_gate = http.arm_abort_gate();
+        let interrupt_a = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    st.handle_interrupt(FreshAgentInterrupt {
+                        provider: AgentProvider::Opencode,
+                        session_id: "ses_q18".to_string(),
+                        session_type: SessionType::Freshopencode,
+                        cwd: None,
+                    }),
+                )
+                .await
+            })
+        };
+        await_abort_posted(&http).await;
+        // B's abort answers 200 immediately — NOT the last in flight.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q18".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt B answers (abort 200, not last)");
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let frames = drain_frames(&mut rx);
+        assert!(
+            !frames.iter().any(|f| {
+                is_event(f, "freshAgent.session.snapshot", Some("idle"))
+            }),
+            "a not-last abort settlement must not broadcast idle — the client would flush its composer queue straight into the sibling abort's cancellation window"
+        );
+
+        // A's abort settles 200 — the LAST settlement broadcasts idle and
+        // delivers the queue.
+        abort_gate.notify_waiters();
+        interrupt_a
+            .await
+            .expect("interrupt A task lives")
+            .expect("interrupt A answers within the budget");
+        let _ = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+        })
+        .await;
+        await_prompt_posted(&http, "behind both aborts").await;
+        let session_arc = st.sessions.lock().await.get("ses_q18").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
+        assert!(session.pending_sends.is_empty());
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Focused episode 2 round 2, Major 2: a `Transport` abort failure is
+    /// MID-EXCHANGE ambiguous — the daemon may still apply the abort after
+    /// the client saw the failure — so a remembered idle does NOT prove it
+    /// is safe to drain: the daemon could apply the old abort to the
+    /// freshly dispatched prompt. Transport keeps the round-3 deferral
+    /// (WARN-observable, released by a LATER idle or a successful
+    /// interrupt); only request-SETTLED flavors (Http answered 500, Decode
+    /// answered garbage) may consume the remembered idle.
+    #[tokio::test]
+    async fn a_transport_abort_failure_does_not_trust_the_remembered_idle() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q19", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q19")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q19", "waits out the ambiguity")),
+        )
+        .await;
+
+        let (events, _guard) = info_capture::capture();
+        let abort_gate = http.arm_abort_gate();
+        http.arm_abort_ambiguous();
+        let interrupt = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    st.handle_interrupt(FreshAgentInterrupt {
+                        provider: AgentProvider::Opencode,
+                        session_id: "ses_q19".to_string(),
+                        session_type: SessionType::Freshopencode,
+                        cwd: None,
+                    }),
+                )
+                .await
+            })
+        };
+        await_abort_posted(&http).await;
+
+        // The daemon idles during the abort window — remembered (Major 3,
+        // episode 2 round 1) but NOT trusted for a Transport settlement
+        // (the live status map says busy — the compact still runs in
+        // this fiction, and the recovery watcher's polls agree).
+        http.arm_status_busy("ses_q19", 1000);
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q19", "ses_q19").await;
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "the release defers to the abort's settlement"
+        );
+
+        // The abort settles with a mid-exchange reset — the daemon may
+        // still apply it, so the remembered idle must NOT be consumed.
+        abort_gate.notify_waiters();
+        interrupt
+            .await
+            .expect("interrupt task lives")
+            .expect("interrupt answers within the budget");
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "a Transport failure is mid-exchange ambiguous — the remembered idle does not authorize draining while the daemon may still apply the abort"
+        );
+        {
+            let captured = events.lock().unwrap();
+            assert!(
+                captured.iter().any(|e| e
+                    .message
+                    .contains("fresh_agent_interrupt_abort_failed_queue_deferred")),
+                "the Transport settlement keeps the round-3 deferral WARN"
+            );
+        }
+        let session_arc = st.sessions.lock().await.get("ses_q19").cloned().unwrap();
+        assert!(
+            session_arc
+                .lock()
+                .await
+                .orphaned_daemon_turn
+                .load(Ordering::SeqCst),
+            "the deferral latch stays armed after the Transport settlement"
+        );
+
+        // A LATER daemon idle — following the interrupted turn's
+        // running (the delivery-order identity), with the abort long
+        // settled and the daemon truly quiesced — is the proven release:
+        // deliver.
+        FreshOpencodeState::observe_daemon_running(&st, "ses_q19", "ses_q19").await;
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q19", "ses_q19").await;
+        await_prompt_posted(&http, "waits out the ambiguity").await;
+        let session_arc = st.sessions.lock().await.get("ses_q19").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
+        assert!(session.pending_sends.is_empty());
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Focused episode 2 round 2, Major 3: an OVERLAPPING interrupt must
+    /// not erase the idle evidence remembered inside the open abort
+    /// window. If A's abort is in flight, the daemon idles (remembered),
+    /// B arms (the old code reset the memory on every arming), and both
+    /// aborts settle with answered 500s, the LAST settlement must still
+    /// hold the evidence — otherwise the queue strands on the compact's
+    /// already-fired only idle edge. The memory's reset point is TURN
+    /// REGISTRATION (a new turn invalidates old idle evidence), never an
+    /// interrupt arming.
+    #[tokio::test]
+    async fn an_overlapping_interrupt_does_not_erase_the_remembered_idle() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q20", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q20")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q20", "needs the surviving memory")),
+        )
+        .await;
+
+        let abort_gate = http.arm_abort_gate();
+        http.arm_abort_fail();
+        let interrupt_a = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    st.handle_interrupt(FreshAgentInterrupt {
+                        provider: AgentProvider::Opencode,
+                        session_id: "ses_q20".to_string(),
+                        session_type: SessionType::Freshopencode,
+                        cwd: None,
+                    }),
+                )
+                .await
+            })
+        };
+        await_abort_posted(&http).await;
+
+        // The daemon reports the interrupted turn's RUNNING and then
+        // idles during A's abort window — the delivery-order identity
+        // (round 5, Major 2) makes the idle proof; it is remembered.
+        FreshOpencodeState::observe_daemon_running(&st, "ses_q20", "ses_q20").await;
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q20", "ses_q20").await;
+        // B arms while A's abort is still in flight; B's abort answers 500
+        // immediately (not the last — defers to A's settlement).
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q20".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt B answers (abort 500, not last)");
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "B's settlement is not the last — the release defers to A"
+        );
+
+        // A's abort settles 500 — the LAST settlement — and must find the
+        // memory INTACT (an overlapping arming erased it pre-fix): consume,
+        // release, deliver.
+        abort_gate.notify_waiters();
+        interrupt_a
+            .await
+            .expect("interrupt A task lives")
+            .expect("interrupt A answers within the budget");
+        await_prompt_posted(&http, "needs the surviving memory").await;
+        let session_arc = st.sessions.lock().await.get("ses_q20").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
+        assert!(session.pending_sends.is_empty());
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Focused episode 2 round 3, Major 1: an idle observed during an
+    /// abort window must not BROADCAST either — with the message still in
+    /// the CLIENT's UX queue the server queue is EMPTY, the interrupt
+    /// removed the turn task, so the observation is "quiescent" and the
+    /// broadcast would flush the client queue straight into
+    /// handle_send's direct path (which never consults abort_in_flight)
+    /// while the abort is still unsettled — the outstanding abort can
+    /// cancel the flushed prompt after the client removed it from its
+    /// queue. The in-flight branch defers BOTH the release and the
+    /// broadcast to the settlement.
+    #[tokio::test]
+    async fn an_idle_observed_during_an_abort_window_never_broadcasts() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q21", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q21")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+
+        // No queued SERVER send: pending_sends stays empty (the message
+        // this scenario cares about sits in the client's UX queue).
+        let abort_gate = http.arm_abort_gate();
+        let interrupt = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    st.handle_interrupt(FreshAgentInterrupt {
+                        provider: AgentProvider::Opencode,
+                        session_id: "ses_q21".to_string(),
+                        session_type: SessionType::Freshopencode,
+                        cwd: None,
+                    }),
+                )
+                .await
+            })
+        };
+        await_abort_posted(&http).await;
+
+        // The daemon idles during the abort window. With the turn taken
+        // and the queue empty this observation is "quiescent" — the old
+        // code broadcast the idle, flushing the client queue into the
+        // unsettled abort's cancellation window.
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q21", "ses_q21").await;
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let frames = drain_frames(&mut rx);
+        assert!(
+            !frames
+                .iter()
+                .any(|f| is_event(f, "freshAgent.session.snapshot", Some("idle"))),
+            "an idle observed during an abort window must not broadcast — the client would flush its composer queue into the unsettled abort"
+        );
+
+        // The abort settles 200 — the LAST settlement owns the idle
+        // broadcast.
+        abort_gate.notify_waiters();
+        interrupt
+            .await
+            .expect("interrupt task lives")
+            .expect("interrupt answers within the budget");
+        let _ = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+        })
+        .await;
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Focused episode 2 round 3, Major 3: a not-last SUCCESSFUL abort
+    /// must record its proven quiesce (the daemon ANSWERED — the session
+    /// was provably settled at that moment) instead of discarding it. If
+    /// the LAST sibling then settles with an answered failure (HTTP 500
+    /// here; Undelivered the same shape), the settlement consumes the
+    /// earlier sibling's proof and delivers — instead of leaving the
+    /// latch armed forever for a window whose turn was already settled.
+    #[tokio::test]
+    async fn an_earlier_sibling_ok_abort_satisfies_the_last_failed_settlement() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q22", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q22")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q22", "needs the earlier proof")),
+        )
+        .await;
+
+        let abort_gate = http.arm_abort_gate();
+        let interrupt_a = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    st.handle_interrupt(FreshAgentInterrupt {
+                        provider: AgentProvider::Opencode,
+                        session_id: "ses_q22".to_string(),
+                        session_type: SessionType::Freshopencode,
+                        cwd: None,
+                    }),
+                )
+                .await
+            })
+        };
+        await_abort_posted(&http).await;
+        // B's abort answers 200 immediately — NOT the last in flight.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q22".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt B answers (abort 200, not last)");
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "B's not-last settlement deferred the release to A — as designed"
+        );
+
+        // A's abort settles 500 — the LAST settlement. It must find the
+        // quiesce proof B's answered abort recorded, consume it, and
+        // deliver — not defer a window whose turn B already proved
+        // settled. (The fail knob is read at RESPONSE time, so arming it
+        // here only affects A's parked request.)
+        http.arm_abort_fail();
+        abort_gate.notify_waiters();
+        interrupt_a
+            .await
+            .expect("interrupt A task lives")
+            .expect("interrupt A answers within the budget");
+        await_prompt_posted(&http, "needs the earlier proof").await;
+        let session_arc = st.sessions.lock().await.get("ses_q22").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
+        assert!(session.pending_sends.is_empty());
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Focused episode 2 round 3, Major 4: a mixed ordering — the FIRST
+    /// abort times out (killing the sidecar: no daemon-side writer can
+    /// remain, the latch disarms, but the drain defers to the last
+    /// settlement), and the LAST abort then settles with a mid-exchange
+    /// Transport failure against the just-killed daemon. The last
+    /// settlement must recognize the INHERITED no-writer state (latch
+    /// already disarmed by the timeout — the sidecar is dead, no
+    /// retro-abort is possible) and drain, not defer forever (and the
+    /// old code's debug_assert panicked here).
+    #[tokio::test]
+    async fn a_timeout_then_transport_last_still_drains_the_inherited_no_writer_window() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx, _tx) = compact_state_gated_cfg(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+            Some(Duration::from_millis(150)),
+        )
+        .await;
+        insert_compact_session(&st, "ses_q23", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q23")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q23", "survives the mixed window")),
+        )
+        .await;
+
+        // A's abort takes the one-shot HANG (times out at 150ms, kills
+        // the sidecar, NOT the last in flight); B's abort parks on the
+        // gate and answers a mid-exchange reset (Transport) on release.
+        http.arm_abort_hang();
+        let abort_gate = http.arm_abort_gate();
+        http.arm_abort_ambiguous();
+        let interrupt_a = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    st.handle_interrupt(FreshAgentInterrupt {
+                        provider: AgentProvider::Opencode,
+                        session_id: "ses_q23".to_string(),
+                        session_type: SessionType::Freshopencode,
+                        cwd: None,
+                    }),
+                )
+                .await
+            })
+        };
+        await_abort_posted(&http).await;
+        let interrupt_b = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    st.handle_interrupt(FreshAgentInterrupt {
+                        provider: AgentProvider::Opencode,
+                        session_id: "ses_q23".to_string(),
+                        session_type: SessionType::Freshopencode,
+                        cwd: None,
+                    }),
+                )
+                .await
+            })
+        };
+        // Positive sync (focused episode 2 round 4, Minor 3): wait for
+        // B's abort POST to be recorded — B is parked on the gate and A's
+        // 150ms timeout cannot make A the last settlement.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let aborts = http
+                    .recorded()
+                    .iter()
+                    .filter(|r| r.method == "POST" && r.url.contains("/abort"))
+                    .count();
+                if aborts >= 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("both abort POSTs land within the budget");
+        // A settles with the TIMEOUT (not the last — B is still parked):
+        // the sidecar is discarded, the latch disarms, no drain yet.
+        interrupt_a
+            .await
+            .expect("interrupt A task lives")
+            .expect("interrupt A answers after the abort timeout");
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "A's not-last timeout defers the drain to the last settlement"
+        );
+
+        // B settles with the mid-exchange reset — the LAST settlement,
+        // into the INHERITED no-writer window: the sidecar the timeout
+        // killed cannot retro-apply anything, so the queue drains.
+        abort_gate.notify_waiters();
+        interrupt_b
+            .await
+            .expect("interrupt B task lives")
+            .expect("interrupt B answers within the budget");
+        await_prompt_posted(&http, "survives the mixed window").await;
+        let session_arc = st.sessions.lock().await.get("ses_q23").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
+        assert!(session.pending_sends.is_empty());
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Focused episode 2 round 4, Major 2: the LAST no-writer settlement
+    /// (the abort timeout killed the sidecar) must emit the idle snapshot
+    /// the abort window suppressed — with the typed message still solely
+    /// in the CLIENT's UX queue the server drain is a no-op, and without
+    /// the frame the client stays busy forever (it cannot flush, and
+    /// hidden panes do not poll).
+    #[tokio::test]
+    async fn an_abort_timeout_still_emits_the_idle_snapshot() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx, _tx) = compact_state_gated_cfg(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+            Some(Duration::from_millis(150)),
+        )
+        .await;
+        insert_compact_session(&st, "ses_q24", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q24")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+
+        // NO queued server send: the typed message sits solely in the
+        // client's UX queue — the drain is a no-op and the idle frame is
+        // the only thing that lets the client recover.
+        http.arm_abort_hang();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q24".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers after the abort timeout");
+
+        let _ = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+        })
+        .await;
+        let session_arc = st.sessions.lock().await.get("ses_q24").cloned().unwrap();
+        assert!(!session_arc
+            .lock()
+            .await
+            .orphaned_daemon_turn
+            .load(Ordering::SeqCst));
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Focused episode 2 round 4, Major 3: an idle delivered during an
+    /// abort window can be a STALE duplicate from the previous turn (the
+    /// interrupted turn's own `running` follows it in stream order). A
+    /// running delivery after the recorded proof invalidates it: the
+    /// failed-abort settlement must NOT consume the stale proof and
+    /// dispatch into the still-running daemon-side compact. The next
+    /// FRESH idle (the real end of the interrupted turn) releases.
+    #[tokio::test]
+    async fn a_stale_idle_then_running_does_not_release_on_the_failed_abort() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q25", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q25")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q25", "waits for a fresh idle")),
+        )
+        .await;
+
+        let abort_gate = http.arm_abort_gate();
+        http.arm_abort_fail();
+        let interrupt = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    st.handle_interrupt(FreshAgentInterrupt {
+                        provider: AgentProvider::Opencode,
+                        session_id: "ses_q25".to_string(),
+                        session_type: SessionType::Freshopencode,
+                        cwd: None,
+                    }),
+                )
+                .await
+            })
+        };
+        await_abort_posted(&http).await;
+
+        // The bridge delivers a STALE idle (from the previous turn)
+        // during the window and THEN the interrupted turn's own running
+        // (stream order). The stale idle follows no delivered running
+        // and the live status map says busy — it records nothing.
+        http.arm_status_busy("ses_q25", 1000);
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q25", "ses_q25").await;
+        FreshOpencodeState::observe_daemon_running(&st, "ses_q25", "ses_q25").await;
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "no dispatch before the abort settles"
+        );
+
+        // The abort settles 500 — the STALE proof must not be consumed
+        // (the busy guard holds): no dispatch into the possibly-live
+        // daemon-side compact.
+        abort_gate.notify_waiters();
+        interrupt
+            .await
+            .expect("interrupt task lives")
+            .expect("interrupt answers within the budget");
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "a stale idle followed by running is not proof the interrupted turn ended — the settlement must not consume it"
+        );
+        let session_arc = st.sessions.lock().await.get("ses_q25").cloned().unwrap();
+        assert!(
+            session_arc
+                .lock()
+                .await
+                .orphaned_daemon_turn
+                .load(Ordering::SeqCst),
+            "the deferral holds until a FRESH idle"
+        );
+
+        // The interrupted turn REALLY ends — the fresh idle (following
+        // its running) releases and delivers.
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q25", "ses_q25").await;
+        await_prompt_posted(&http, "waits for a fresh idle").await;
+        let session_arc = st.sessions.lock().await.get("ses_q25").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
+        assert!(session.pending_sends.is_empty());
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Focused episode 2 round 4, Minor 1: an Undelivered LAST settlement
+    /// consumes the earlier sibling's ANSWERED-abort proof (the strong
+    /// proof) and delivers — that abort never reached the daemon, so no
+    /// retro-hazard, and the sibling's answer already settled the turn.
+    #[tokio::test]
+    async fn an_undelivered_last_settlement_consumes_the_earlier_answered_proof() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q26", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q26")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q26", "delivers on the strong proof")),
+        )
+        .await;
+
+        let abort_gate = http.arm_abort_gate();
+        let interrupt_a = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    st.handle_interrupt(FreshAgentInterrupt {
+                        provider: AgentProvider::Opencode,
+                        session_id: "ses_q26".to_string(),
+                        session_type: SessionType::Freshopencode,
+                        cwd: None,
+                    }),
+                )
+                .await
+            })
+        };
+        await_abort_posted(&http).await;
+        // B's abort answers 200 — NOT the last: records the STRONG proof.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q26".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt B answers (abort 200, not last)");
+        // Focused episode 2 round 5, Major 3: the daemon's resulting
+        // idle arrives while A is still in flight — it must NOT erase
+        // (downgrade) B's strong proof. (Delivered after a running — the
+        // interrupted turn's — so it records the weak proof too; the
+        // strong marker survives.)
+        FreshOpencodeState::observe_daemon_running(&st, "ses_q26", "ses_q26").await;
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q26", "ses_q26").await;
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "B's not-last settlement deferred the release to A — as designed"
+        );
+
+        // A's parked abort is released as Undelivered — the LAST
+        // settlement consumes the strong proof and delivers.
+        http.arm_abort_refused();
+        abort_gate.notify_waiters();
+        interrupt_a
+            .await
+            .expect("interrupt A task lives")
+            .expect("interrupt A answers within the budget");
+        await_prompt_posted(&http, "delivers on the strong proof").await;
+        let session_arc = st.sessions.lock().await.get("ses_q26").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
+        assert!(session.pending_sends.is_empty());
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Focused episode 2 round 5, Major 2: the settle-before-running
+    /// interleaving — a STALE idle (following no delivered running) is
+    /// recorded as nothing; the abort then settles Http-500 BEFORE the
+    /// bridge delivers the interrupted turn's running. The settlement
+    /// must NOT consume any proof (there is none); the queue waits for
+    /// the interrupted turn's OWN idle — which follows its running — to
+    /// release through the round-4 path. Pre-fix the stale idle was
+    /// recorded and consumed, dispatching into the still-running compact.
+    #[tokio::test]
+    async fn a_stale_idle_before_the_running_delivery_never_releases_on_the_failed_abort() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q27", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q27")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q27", "waits for the real idle")),
+        )
+        .await;
+
+        let abort_gate = http.arm_abort_gate();
+        http.arm_abort_fail();
+        let interrupt = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    st.handle_interrupt(FreshAgentInterrupt {
+                        provider: AgentProvider::Opencode,
+                        session_id: "ses_q27".to_string(),
+                        session_type: SessionType::Freshopencode,
+                        cwd: None,
+                    }),
+                )
+                .await
+            })
+        };
+        await_abort_posted(&http).await;
+
+        // The bridge delivers the STALE idle (from the previous turn —
+        // following NO delivered running, and the live status map says
+        // busy because the compact still runs): records NOTHING.
+        http.arm_status_busy("ses_q27", 1000);
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q27", "ses_q27").await;
+
+        // The abort settles 500 BEFORE the interrupted turn's running is
+        // delivered — the settlement finds no proof and defers (the
+        // pre-fix code consumed the stale idle and dispatched into the
+        // still-running compact).
+        abort_gate.notify_waiters();
+        interrupt
+            .await
+            .expect("interrupt task lives")
+            .expect("interrupt answers within the budget");
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "a stale idle that follows no delivered running is not proof — the settlement must not consume it"
+        );
+        let session_arc = st.sessions.lock().await.get("ses_q27").cloned().unwrap();
+        assert!(
+            session_arc
+                .lock()
+                .await
+                .orphaned_daemon_turn
+                .load(Ordering::SeqCst),
+            "the deferral holds until the interrupted turn's own idle"
+        );
+
+        // The interrupted turn's running and then its OWN idle arrive (the
+        // delivery-order identity): the round-4 release path delivers.
+        FreshOpencodeState::observe_daemon_running(&st, "ses_q27", "ses_q27").await;
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q27", "ses_q27").await;
+        await_prompt_posted(&http, "waits for the real idle").await;
+        let session_arc = st.sessions.lock().await.get("ses_q27").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
+        assert!(session.pending_sends.is_empty());
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Delta-review round 7 (extension): the post-settlement stale-idle
+    /// race in the round-4 release path — a failed abort settles (the
+    /// counter is zero, the latch armed), and the NEXT delivered idle
+    /// must still prove it belongs to the interrupted turn. With normal
+    /// bridge lag the stale previous-turn idle can arrive AFTER the
+    /// settlement, following no delivered running: the old code
+    /// released on it and drained into the still-running compact. The
+    /// delivery-order identity now applies here too — only an idle that
+    /// follows a delivered running may release; the interrupted turn's
+    /// own idle (which follows its running) delivers.
+    #[tokio::test]
+    async fn a_stale_idle_after_a_failed_abort_settlement_does_not_release() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q28", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q28")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q28", "waits out the bridge lag")),
+        )
+        .await;
+
+        // The abort FAILS (answered 500) and settles — counter zero,
+        // latch armed, the queue deferred.
+        http.arm_abort_fail();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q28".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers (abort 500)");
+        let session_arc = st.sessions.lock().await.get("ses_q28").cloned().unwrap();
+        assert!(
+            session_arc
+                .lock()
+                .await
+                .orphaned_daemon_turn
+                .load(Ordering::SeqCst),
+            "the failed abort defers the queue"
+        );
+
+        // A STALE idle (from the previous turn) arrives after the
+        // settlement, following NO delivered running: it must NOT
+        // release — the compact may still be running (the live status
+        // map says busy).
+        http.arm_status_busy("ses_q28", 1000);
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q28", "ses_q28").await;
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "a stale idle arriving after the settlement follows no running — it must not release the queue"
+        );
+        let session_arc = st.sessions.lock().await.get("ses_q28").cloned().unwrap();
+        assert!(
+            session_arc
+                .lock()
+                .await
+                .orphaned_daemon_turn
+                .load(Ordering::SeqCst),
+            "the deferral holds"
+        );
+
+        // The interrupted turn's OWN idle — following its delivered
+        // running — is the proven release: deliver.
+        FreshOpencodeState::observe_daemon_running(&st, "ses_q28", "ses_q28").await;
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q28", "ses_q28").await;
+        await_prompt_posted(&http, "waits out the bridge lag").await;
+        let session_arc = st.sessions.lock().await.get("ses_q28").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
+        assert!(session.pending_sends.is_empty());
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Focused episode 3 round 1: the identity's blind spot — the
+    /// running edge can be GENUINELY missed (the SSE transport reconnects
+    /// without replaying missed events; a lagged broadcast drops them).
+    /// When the interrupted turn's REAL terminal idle arrives after a
+    /// failed abort settled, with no running ever delivered, the
+    /// delivery-order identity alone would reject it and strand the
+    /// queue forever. The authoritative fallback: the daemon's LIVE
+    /// status map says the session is idle NOW — the release proceeds.
+    #[tokio::test]
+    async fn a_missed_running_edge_does_not_strand_the_real_terminal_idle() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q29", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q29")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q29", "survives the reconnect")),
+        )
+        .await;
+
+        // The abort FAILS (answered 500) and settles — counter zero,
+        // latch armed, the queue deferred.
+        http.arm_abort_fail();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q29".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers (abort 500)");
+
+        // The compact's running was LOST (a reconnect or lag — never
+        // delivered), but its REAL terminal idle arrives: no running
+        // preceded it, and the daemon's LIVE status map says idle (the
+        // daemon-side turn ended; the aborted local drive never consumed
+        // the seeded busy budget) — the poll fallback authorizes the
+        // release and the queue delivers.
+        http.clear_status_busy("ses_q29");
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q29", "ses_q29").await;
+        await_prompt_posted(&http, "survives the reconnect").await;
+        let session_arc = st.sessions.lock().await.get("ses_q29").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(
+            !session.orphaned_daemon_turn.load(Ordering::SeqCst),
+            "the missed-running terminal idle releases — no strand"
+        );
+        assert!(session.pending_sends.is_empty());
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Focused episode 3 round 2, Major 1: a RETRYING compact is RUNNING
+    /// by the canonical classifier ("busy" AND "retry") — the missed-
+    /// running fallback must NOT treat it as settled and drain into it.
+    /// Only when the daemon's live status is neither busy nor retry (the
+    /// turn actually ended) does the release proceed.
+    #[tokio::test]
+    async fn a_retrying_compact_is_running_and_does_not_release_the_queue() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q30", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q30")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q30", "waits out the retry")),
+        )
+        .await;
+
+        // The abort FAILS (answered 500) and settles — counter zero,
+        // latch armed.
+        http.arm_abort_fail();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q30".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers (abort 500)");
+
+        // The compact is RETRYING (no running was ever delivered — the
+        // missed-running path), and the daemon's live status map says
+        // "retry": a RUNNING state. The terminal-looking idle must NOT
+        // release — draining into a retrying compact is the loss the
+        // queue exists to prevent.
+        http.arm_status_retry("ses_q30");
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q30", "ses_q30").await;
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "a retrying compact is running — the canonical classifier must not mistake it for settled"
+        );
+        let session_arc = st.sessions.lock().await.get("ses_q30").cloned().unwrap();
+        assert!(
+            session_arc
+                .lock()
+                .await
+                .orphaned_daemon_turn
+                .load(Ordering::SeqCst),
+            "the deferral holds while the compact retries"
+        );
+
+        // The compact finally settles — the live status map reports
+        // neither busy nor retry — and the release delivers.
+        http.clear_status_busy("ses_q30");
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q30", "ses_q30").await;
+        await_prompt_posted(&http, "waits out the retry").await;
+        let session_arc = st.sessions.lock().await.get("ses_q30").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
+        assert!(session.pending_sends.is_empty());
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Focused episode 3 round 3, Major 2: a TRANSIENT status-poll failure
+    /// must not permanently consume a genuine terminal idle — the
+    /// interrupted compact's only idle edge already fired, so no later
+    /// observation will re-try. The bounded-backoff retry ladder
+    /// re-polls; once the poll succeeds (the daemon idle) the release
+    /// and delivery happen WITHOUT any further idle event.
+    #[tokio::test]
+    async fn a_transient_status_poll_failure_does_not_strand_the_terminal_idle() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q31", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q31")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q31", "survives the poll failure")),
+        )
+        .await;
+
+        // The abort FAILS (answered 500) and settles — counter zero,
+        // latch armed.
+        http.arm_abort_fail();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q31".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers (abort 500)");
+
+        // The compact's real terminal idle arrives with the running edge
+        // missed; the live poll FAILS transitively (one mid-exchange
+        // error). The retry ladder must re-poll and deliver WITHOUT any
+        // further idle event (the only idle edge already fired).
+        http.clear_status_busy("ses_q31");
+        http.arm_status_poll_failures(1);
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q31", "ses_q31").await;
+        await_prompt_posted(&http, "survives the poll failure").await;
+        let session_arc = st.sessions.lock().await.get("ses_q31").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(
+            !session.orphaned_daemon_turn.load(Ordering::SeqCst),
+            "the recovery watcher concluded the terminal idle — no strand"
+        );
+        assert!(session.pending_sends.is_empty());
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Focused episode 3 round 4: the round-3 ladder stopped on a busy
+    /// answer — so a terminal idle MISSED in the supported SSE
+    /// reconnect/lag windows stranded the queue forever (no local turn
+    /// task, no further idle event, the latch blocking every drain).
+    /// The recovery watcher now owns it: a busy/retry verdict arms the
+    /// automatic poll watcher, which delivers WITHOUT any further idle
+    /// event once the daemon's live status settles.
+    #[tokio::test]
+    async fn a_missed_terminal_idle_is_recovered_by_the_poll_watcher() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q32", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q32")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q32", "needs the watcher")),
+        )
+        .await;
+
+        // The abort FAILS (answered 500) and settles — counter zero,
+        // latch armed.
+        http.arm_abort_fail();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q32".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers (abort 500)");
+
+        // A stale idle polls BUSY (the compact still runs) — the verdict
+        // arms the automatic watcher.
+        http.arm_status_busy("ses_q32", 5);
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q32", "ses_q32").await;
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "the busy verdict releases nothing"
+        );
+
+        // The compact settles and its terminal idle is MISSED entirely —
+        // no observe call, no idle event. The watcher's live polling
+        // drains the busy budget, sees the daemon settle, and delivers
+        // automatically.
+        await_prompt_posted(&http, "needs the watcher").await;
+        let session_arc = st.sessions.lock().await.get("ses_q32").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(
+            !session.orphaned_daemon_turn.load(Ordering::SeqCst),
+            "the watcher recovered the missed terminal idle — no strand"
+        );
+        assert!(session.pending_sends.is_empty());
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Delta-review round 8 (extension 2), Major: the deferral ITSELF
+    /// arms the recovery watcher — arming only from an arriving idle
+    /// event left the compact's sole terminal idle LOST in the supported
+    /// SSE reconnect/lag window undiscovered: no observe, no watcher,
+    /// no polling, every drain blocked. Here NO idle event ever arrives;
+    /// the deferral's own watcher polls the daemon and delivers.
+    #[tokio::test]
+    async fn a_failed_abort_deferral_arms_the_recovery_watcher_by_itself() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q33", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q33")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q33", "needs no idle event at all")),
+        )
+        .await;
+
+        // The abort FAILS (answered 500) and settles — the deferral
+        // WARNs and arms the recovery watcher. NO idle observation is
+        // ever made: the compact's sole terminal idle is LOST to the
+        // supported reconnect/lag window.
+        http.arm_abort_fail();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q33".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers (abort 500)");
+        let session_arc = st.sessions.lock().await.get("ses_q33").cloned().unwrap();
+        assert!(
+            session_arc
+                .lock()
+                .await
+                .orphaned_daemon_turn
+                .load(Ordering::SeqCst),
+            "the deferral holds the queue"
+        );
+
+        // The deferral-armed watcher polls the daemon's live status: the
+        // compact's seeded busy budget drains, the daemon settles, and
+        // the queue delivers — with NO idle event ever observed.
+        await_prompt_posted(&http, "needs no idle event at all").await;
+        let session_arc = st.sessions.lock().await.get("ses_q33").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(
+            !session.orphaned_daemon_turn.load(Ordering::SeqCst),
+            "the deferral-armed watcher recovered the lost terminal idle"
+        );
+        assert!(session.pending_sends.is_empty());
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Delta-review round 8 (extension 2), Minor: the recovery watcher
+    /// STOPS when kill (or handoff) removes the session — the old loop
+    /// kept polling + broadcasting stale idle frames every 250ms for up
+    /// to ten minutes, and a quickly resumed pane using the same durable
+    /// id received those obsolete frames.
+    #[tokio::test]
+    async fn the_recovery_watcher_stops_when_the_session_is_killed() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q34", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q34")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q34", "parked when the pane dies")),
+        )
+        .await;
+
+        // The abort FAILS and settles — the deferral arms the watcher.
+        http.arm_abort_fail();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q34".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers (abort 500)");
+
+        // KILL the session — the watcher must stop; no stale idle frames
+        // may reach a later pane reusing this durable id.
+        st.sessions.lock().await.remove("ses_q34");
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q34".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await;
+        // Let several watcher ticks pass.
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        let frames = drain_frames(&mut rx);
+        assert!(
+            !frames.iter().any(|f| {
+                is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                    && f["sessionId"] == "ses_q34"
+            }),
+            "a killed session's watcher must not broadcast stale idle frames"
+        );
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Same rig with SummarizeOutcome::Answered500 + the gate (fixture
+    /// companion edit A makes the 500 arm park like OkAnswered — without
+    /// it, the compact settles before the send arrives and the queue is
+    /// never exercised). Queue a send while parked, release, the compact
+    /// FAILS — the settle tail still runs → the drain still fires.
+    #[tokio::test]
+    async fn a_queued_send_drains_after_a_failed_compact_too() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::Answered500,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q4", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q4")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q4", "drains past the failure")),
+        )
+        .await;
+        summarize_gate.notify_waiters();
+        // The failure is LOUD (pre-existing), and the queued send STILL drains.
+        let _ = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.error", None) && f["event"]["code"] == "OPENCODE_COMPACT_FAILED"
+        })
+        .await;
+        await_prompt_posted(&http, "drains past the failure").await;
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Task 5: the drain-time fence re-validation. The send is enqueued
+    /// with a CURRENTLY VALID observed pair (the old shape seeded an
+    /// already-stale generation, which an enqueue-only validation would
+    /// have refused identically — vacuous for the drain-time guarantee —
+    /// delta-review round 9, extension 2). Ownership then ADVANCES while
+    /// the entry still sits QUEUED: the test holds the session's
+    /// per-session mutex across the compact's settle, so the drain — the
+    /// drain-time revalidation itself — parks on the mutex BEFORE it
+    /// validates the captured pair, and the stop + re-grant (the handoff
+    /// class: stop the Live record with the CURRENT pair, then commit a
+    /// NEW Live at the next generation — generations are monotonic per
+    /// key) lands in exactly the window the drain-time revalidation
+    /// exists to close: after the fence's capture, before its atomic
+    /// validation. The registry's transition APIs structurally answer
+    /// BlockedHandoff under an armed attach window, so the transition
+    /// must land after the compact's own guard released at its dispatch
+    /// boundary — the post-settle revalidation slot, where a real
+    /// lifecycle move races the queued drain. The enqueued send is
+    /// PROVEN accepted with no early refusal (the revalidation is at
+    /// DRAIN time, not enqueue), and the drain-time refusal is TYPED and
+    /// REQUEST-CORRELATED: a top-level `error` frame carrying the
+    /// send's requestId (the send_error idiom — the wire `error.code` is
+    /// always INTERNAL_ERROR, the typed code rides in the message),
+    /// never an uncorrelated session-scoped broadcast. The refused entry
+    /// never POSTs, is discarded (never retried), and the queue
+    /// CONTINUES: an unfenced send queued behind it drains and POSTs
+    /// (the direct send path's parse-only tolerance — the queue is never
+    /// stricter than the path it re-enters).
+    #[tokio::test]
+    async fn a_stale_queued_fence_refuses_typed_at_drain_and_the_queue_continues() {
+        // Same gated rig, plus a coordinator registry seeded Live{FreshAgent}
+        // on the durable key — the SAME seeding the parked-compact tests use
+        // (the compact itself MUST be fenced with the current pair: an
+        // unfenced compact against a Live{FreshAgent} key is the typed
+        // FENCE_REQUIRED refusal and the drive never spawns).
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (mut st, http, mut rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q6", Some("prov/model")).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        seed_live_fresh_owner(&registry, "ses_q6"); // Live{FreshAgent} at generation G
+        let (epoch, generation) = fenced_observed(&registry, "ses_q6"); // the current pair
+
+        // The compact, FENCED with the current pair.
+        let mut compact = compact_msg("ses_q6");
+        (compact.observed_epoch, compact.observed_generation) = (epoch, generation);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact),
+        )
+        .await
+        .expect("compact registers (fenced)");
+        await_summarize_posted(&http).await;
+
+        // (1) A CURRENTLY VALID observed pair: the send is ACCEPTED into
+        // the queue while the compact is parked — no early refusal (an
+        // enqueue-only validation would be indistinguishable from the
+        // drain-time one, so the acceptance-while-parked is the load-
+        // bearing half of this proof).
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg_fenced(
+                "ses_q6",
+                "valid at enqueue",
+                epoch,
+                generation,
+            )),
+        )
+        .await;
+        {
+            let session_arc = st.sessions.lock().await.get("ses_q6").cloned().unwrap();
+            assert_eq!(
+                session_arc.lock().await.pending_sends.len(),
+                1,
+                "the valid-at-enqueue send is queued behind the parked compact"
+            );
+        }
+        let early = drain_frames(&mut rx);
+        assert!(
+            !early
+                .iter()
+                .any(|f| f["type"] == "error" && f["requestId"] == "req-valid at enqueue"),
+            "no refusal before the drain — the revalidation happens at DRAIN time: {early:?}"
+        );
+
+        // (2) An UNFENCED send queues behind it — the queue-continues
+        // probe (the direct send path's parse-only tolerance; the queue
+        // is never stricter than the path it re-enters).
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q6", "unfenced one")),
+        )
+        .await;
+        {
+            let session_arc = st.sessions.lock().await.get("ses_q6").cloned().unwrap();
+            assert_eq!(
+                session_arc.lock().await.pending_sends.len(),
+                2,
+                "the queue holds the fenced and the unfenced entries"
+            );
+        }
+
+        // (3) THE PARK: hold the session's per-session mutex across the
+        // settle. Every drain (the enqueue-triggered ones and the
+        // compact's settle-tail one) parks ON the mutex before it can
+        // reach the captured pair's validation — an async park, so the
+        // runtime, the compact's own settle bookkeeping, and the test
+        // itself all keep making progress.
+        let session_arc = st.sessions.lock().await.get("ses_q6").cloned().unwrap();
+        let session_guard = session_arc.lock().await;
+        summarize_gate.notify_waiters();
+
+        // (4) THE STALE WINDOW: the entry still sits QUEUED, and
+        // ownership ADVANCES under it — the Live record (stoppable with
+        // the CURRENT pair the send also observed) is stopped to Vacant
+        // and a NEW start-commit grants Live at a newer generation (the
+        // handoff class — generations are monotonic per key). The
+        // compact's op guard releases at its dispatch boundary — a
+        // ≤5ms witness-watch the drive task runs on its own scheduling —
+        // so the stop uses the registry's OWN retryable-refusal
+        // discipline: `BlockedHandoff` is the typed "retry after the
+        // attach completes" answer, and the bounded retry loop IS the
+        // wait (the grant proves the window freed; each 5ms sleep also
+        // yields the runtime so the drive task's watcher can run and
+        // drop the guard). No drain has armed an attach guard (they are
+        // all parked on the mutex), so once the compact's guard is down
+        // the transition window is free — deterministic.
+        let stop_gen = {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match registry.begin_stop(
+                    PROVIDER,
+                    "ses_q6",
+                    "op-q6-advance",
+                    &freshell_ownership::StopClaim {
+                        expected_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                        expected_runtime: None,
+                        observed: freshell_ownership::ObservedFence {
+                            epoch: registry.boot_epoch(),
+                            generation: generation
+                                .expect("the seeded Live pair carries a generation"),
+                        },
+                    },
+                    "test",
+                    freshell_ownership::now_epoch_ms(),
+                ) {
+                    freshell_ownership::StopOutcome::Granted { generation } => break generation,
+                    freshell_ownership::StopOutcome::BlockedHandoff { .. } => {
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "the current-pair stop never granted — the compact's \
+                             guard never released its attach window"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                    other => panic!("the current-pair stop must begin: {other:?}"),
+                }
+            }
+        };
+        assert_eq!(
+            registry.commit_stop(PROVIDER, "ses_q6", "op-q6-advance", stop_gen),
+            freshell_ownership::CommitOutcome::Committed
+        );
+        seed_live_fresh_owner(&registry, "ses_q6");
+        let still_no_early = drain_frames(&mut rx);
+        assert!(
+            !still_no_early
+                .iter()
+                .any(|f| f["type"] == "error" && f["requestId"] == "req-valid at enqueue"),
+            "the advancement alone refuses nothing — the queue holds the entry: {still_no_early:?}"
+        );
+
+        // (5) Release the mutex: the settle completes, the drain runs,
+        // and the captured pair is validated ATOMICALLY — the
+        // advanced-past entry is refused AT DRAIN, TYPED and
+        // REQUEST-CORRELATED: a top-level `error` frame carrying its
+        // requestId. The wire `error.code` is always INTERNAL_ERROR (the
+        // send_error idiom); the typed code rides in the MESSAGE —
+        // assert the requestId and the guard's stale wording
+        // (STALE_OP_GUARD_MESSAGE) in the message, never a wire code.
+        drop(session_guard);
+        let frames = frames_until(&mut rx, |f| {
+            f["type"] == "error" && f["requestId"] == "req-valid at enqueue"
+        })
+        .await;
+        assert!(
+            frames.iter().any(|f| f["message"]
+                .to_string()
+                .to_lowercase()
+                .contains("newer ownership generation")),
+            "the drain-time stale-fence refusal carries the guard's stale-fence message: {frames:?}"
+        );
+        // (6) It never POSTs.
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async") && r_body_contains(r, "valid at enqueue")),
+            "the refused stale entry must never reach the prompt POST"
+        );
+        // (7) The queue CONTINUES: the unfenced entry drains and POSTs.
+        await_prompt_posted(&http, "unfenced one").await;
+        let session_arc = st.sessions.lock().await.get("ses_q6").cloned().unwrap();
+        assert!(
+            session_arc.lock().await.pending_sends.is_empty(),
+            "the refused entry was discarded; the unfenced entry drained"
+        );
+        // (8) The never-POSTs guarantee holds for the DRAIN'S WHOLE
+        // LIFETIME, not just the refusal instant: the queue is empty (the
+        // drain loop has fully settled) and the continuation entry has
+        // POSTed, so a faulty drain that emits the refusal but falls
+        // through or asynchronously dispatches the stale entry afterward
+        // is caught HERE (focused episode 5 round 1) — the stale prompt
+        // must still be absent, never mutating the newer owner's turn
+        // history.
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async") && r_body_contains(r, "valid at enqueue")),
+            "the refused stale entry must never reach the prompt POST, even after \
+             the drain has fully settled and the continuation entry POSTed"
+        );
+    }
+
+    // ── merged from the send-during-compact-queue branch ──
+    /// Task 5: the settled tolerance pin — an UNFENCED queued send (the
+    /// legacy client shape: no observed pair on the wire message) queued
+    /// behind a fenced compact on a WIRED Live key proceeds at drain
+    /// exactly like the direct send path: the queue re-enters the send
+    /// path and is not stricter than the path it re-enters. The op
+    /// guard's no-laundering discipline (an unfenced None against a Live
+    /// key is the typed FENCE_REQUIRED refusal) binds the
+    /// history-RESTRUCTURING lanes (compact/rollback/fork), not the
+    /// append-a-turn send lane — `handle_send`'s direct path is
+    /// fence-parse-only, and the drain matches it.
+    #[tokio::test]
+    async fn an_unfenced_queued_send_drains_like_a_direct_send_against_a_wired_owner() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (mut st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q7", Some("prov/model")).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        seed_live_fresh_owner(&registry, "ses_q7");
+        let (epoch, generation) = fenced_observed(&registry, "ses_q7");
+        let mut compact = compact_msg("ses_q7");
+        (compact.observed_epoch, compact.observed_generation) = (epoch, generation);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact),
+        )
+        .await
+        .expect("compact registers (fenced)");
+        await_summarize_posted(&http).await;
+        // UNFENCED (send_msg sends no observed pair).
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q7", "unfenced but queued")),
+        )
+        .await;
+        summarize_gate.notify_waiters();
+        await_prompt_posted(&http, "unfenced but queued").await;
+        let session_arc = st.sessions.lock().await.get("ses_q7").cloned().unwrap();
+        assert!(session_arc.lock().await.pending_sends.is_empty());
     }
 }

@@ -5,6 +5,67 @@ import {
   runSearchSessionsCommand,
 } from '../../../tools/freshell-cli/index.js'
 import { createCliCommandHarness } from '../../helpers/visible-first/cli-command-harness.js'
+import { spawn } from 'node:child_process'
+import { once } from 'node:events'
+import { createServer } from 'node:http'
+import { createRequire } from 'node:module'
+import { resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
+
+const require = createRequire(import.meta.url)
+const cliPath = resolve(process.cwd(), 'tools/freshell-cli/index.ts')
+const tsxLoader = pathToFileURL(require.resolve('tsx')).href
+
+/** Spawns the real CLI (retained-flags.test.ts pattern) against a stub HTTP
+ * server and records every resulting HTTP call. */
+async function invokeCli(args: string[]) {
+  const requests: Array<{ url: string; body: any }> = []
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = []
+    for await (const chunk of request) chunks.push(Buffer.from(chunk))
+    const text = Buffer.concat(chunks).toString()
+    requests.push({ url: request.url ?? '', body: text ? JSON.parse(text) : undefined })
+    response.setHeader('content-type', 'application/json')
+    if (request.method === 'GET' && request.url === '/api/tabs') {
+      response.end(JSON.stringify({ tabs: [{ id: 't1', activePaneId: 'p1' }], activeTabId: 't1' }))
+    } else if (request.method === 'GET' && request.url === '/api/panes?tabId=t1') {
+      response.end(JSON.stringify({ panes: [{ id: 'p1', index: 0, kind: 'terminal' }] }))
+    } else {
+      response.end(JSON.stringify({
+        status: 'ok',
+        data: {
+          tabId: 't1',
+          paneId: 'p1',
+          sessionName: {
+            record: { ref: { kind: 'session', provider: 'claude', sessionId: 's1' }, name: 'Accepted server name', source: 'automatic-provider', revision: 2 },
+            documentGeneration: 9,
+            redirects: [],
+            changed: true,
+          },
+        },
+      }))
+    }
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('test server did not listen')
+  try {
+    const child = spawn(process.execPath, ['--import', tsxLoader, cliPath, ...args], {
+      env: { ...process.env, NODE_NO_WARNINGS: '1', FRESHELL_URL: `http://127.0.0.1:${address.port}`, FRESHELL_TOKEN: 'test-token' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 10_000,
+    })
+    let stderr = ''
+    let stdout = ''
+    child.stdout.on('data', (chunk) => { stdout += String(chunk) })
+    child.stderr.on('data', (chunk) => { stderr += String(chunk) })
+    const [code] = await once(child, 'close')
+    return { code, stderr, stdout, requests }
+  } finally {
+    await new Promise<void>((resolvePromise, reject) => server.close((error) => error ? reject(error) : resolvePromise()))
+  }
+}
 
 describe('CLI commands', () => {
   it('calls api send-keys endpoint', async () => {
@@ -149,6 +210,75 @@ describe('CLI commands', () => {
       tier: 'title',
       query: 'alpha',
       totalScanned: 1,
+    })
+  })
+
+  describe('rename/create name intent', () => {
+    it('rename-pane defaults the intent to automatic on the wire', async () => {
+      const result = await invokeCli(['rename-pane', '--target', 'p1', 'Agent suggested name'])
+      expect(result.stderr).toBe('')
+      expect(result.code).toBe(0)
+      const patch = result.requests.find((request) => request.url === '/api/panes/p1')
+      expect(patch).toBeDefined()
+      expect(patch!.body).toMatchObject({ name: 'Agent suggested name', nameIntent: 'automatic' })
+    })
+
+    it('rename-pane forwards an explicit user intent', async () => {
+      const result = await invokeCli(['rename-pane', '--target', 'p1', '--name-intent', 'user', 'Human name'])
+      expect(result.stderr).toBe('')
+      expect(result.code).toBe(0)
+      const patch = result.requests.find((request) => request.url === '/api/panes/p1')
+      expect(patch!.body).toMatchObject({ name: 'Human name', nameIntent: 'user' })
+    })
+
+    it('rename-tab defaults the intent to automatic on the wire', async () => {
+      const result = await invokeCli(['rename-tab', '--target', 't1', 'Suggested tab name'])
+      expect(result.stderr).toBe('')
+      expect(result.code).toBe(0)
+      const patch = result.requests.find((request) => request.url === '/api/tabs/t1')
+      expect(patch).toBeDefined()
+      expect(patch!.body).toMatchObject({ name: 'Suggested tab name', nameIntent: 'automatic' })
+    })
+
+    it('rename-tab forwards an explicit user intent', async () => {
+      const result = await invokeCli(['rename-tab', '--target', 't1', '--name-intent', 'user', 'Human tab name'])
+      expect(result.stderr).toBe('')
+      expect(result.code).toBe(0)
+      const patch = result.requests.find((request) => request.url === '/api/tabs/t1')
+      expect(patch!.body).toMatchObject({ name: 'Human tab name', nameIntent: 'user' })
+    })
+
+    it('new-tab seeds the create name with automatic intent by default', async () => {
+      const result = await invokeCli(['new-tab', '--name', 'Fresh conversation', '--mode', 'claude'])
+      expect(result.stderr).toBe('')
+      expect(result.code).toBe(0)
+      const post = result.requests.find((request) => request.url === '/api/tabs')
+      expect(post).toBeDefined()
+      expect(post!.body).toMatchObject({ name: 'Fresh conversation', nameIntent: 'automatic' })
+    })
+
+    it('new-tab forwards an explicit user intent for the create name', async () => {
+      const result = await invokeCli(['new-tab', '--name', 'Named by a human', '--name-intent', 'user'])
+      expect(result.stderr).toBe('')
+      expect(result.code).toBe(0)
+      const post = result.requests.find((request) => request.url === '/api/tabs')
+      expect(post!.body).toMatchObject({ name: 'Named by a human', nameIntent: 'user' })
+    })
+
+    it('rejects an unknown name intent without issuing any request', async () => {
+      const result = await invokeCli(['rename-tab', '--target', 't1', '--name-intent', 'bogus', 'X'])
+      expect(result.code).toBe(1)
+      expect(result.requests).toEqual([])
+      expect(result.stderr).toContain('--name-intent')
+    })
+
+    it('reflects the server-accepted name in the response, not the submitted string', async () => {
+      const result = await invokeCli(['rename-pane', '--target', 'p1', 'Losing suggestion', '--name-intent', 'user'])
+      expect(result.code).toBe(0)
+      // The stub server always answers with its accepted winner; the CLI
+      // output reports that accepted record verbatim.
+      expect(result.stderr).toBe('')
+      expect(result.stdout).toContain('Accepted server name')
     })
   })
 })

@@ -216,3 +216,49 @@ async fn a_dead_writer_falls_back_to_the_inline_write() {
     assert!(raw.contains("\"p1\""), "{raw}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Unified agent names (merge integration): the tab's stable naming-source
+/// relationship survives the persisted registry round-trip — a restart must
+/// never drop a session-owned tab's source pointer (the rename-tab route
+/// resolves it, never the active pane). Pre-merge the restore path parsed
+/// only id/title/fallbackSessionRef and silently lost `nameSource`.
+#[tokio::test]
+async fn a_restarted_registry_preserves_a_tabs_name_source() {
+    let dir = unique_dir("un-names-source");
+    let path = dir.join("layout-store.json");
+    {
+        let store =
+            LayoutStore::with_persistence_offload(path.clone(), tokio::runtime::Handle::current());
+        let scoped = serde_json::from_value(json!({
+            "tabs": [{ "id": "t1", "title": "Scoped", "nameSource": { "kind": "session", "paneId": "p-agent" } }],
+            "activeTabId": "t1",
+            "layouts": {
+                "t1": {
+                    "type": "leaf",
+                    "id": "p-agent",
+                    "content": { "kind": "terminal", "mode": "claude" },
+                },
+            },
+            "activePane": { "t1": "p-agent" },
+            "timestamp": 1,
+        }))
+        .expect("UiLayoutSync parses");
+        store.update_from_ui(&scoped, "client-a");
+        store.flush_persistence().await;
+        let raw = std::fs::read_to_string(&path).expect("the flushed write landed");
+        assert!(
+            raw.contains("\"nameSource\""),
+            "the persisted registry carries the naming source: {raw}"
+        );
+    } // drop = the "restart"
+
+    let reloaded = LayoutStore::with_persistence(path.clone());
+    assert_eq!(
+        reloaded.tab_name_source("t1"),
+        Some(freshell_protocol::session_names::TabNameSource::Session {
+            pane_id: "p-agent".into(),
+        }),
+        "the reloaded registry keeps the session-owned tab's source pointer"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

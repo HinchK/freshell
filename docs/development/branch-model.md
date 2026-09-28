@@ -10,6 +10,11 @@ Local `main` should be a clean, fast-forwarded copy of `origin/main`. It may be 
 
 Feature branches are authored in dedicated worktrees under `.worktrees/<slug>`.
 
+Worktrees (and branches) may predate the pnpm migration. The shared pre-push
+hook and the base gate select the package manager per tree, so npm-era
+worktrees keep working; see [Local pre-push gate](pre-push-gate.md) and the
+[pnpm migration plan](../plans/2026-09-19-pnpm-migration.md).
+
 ## Change Flow
 
 1. Confirm the repo-supported test suite is green on the intended base before creating a new worktree.

@@ -577,3 +577,154 @@ describe('persistedState parsers', () => {
     })
   })
 })
+
+  describe('unified agent names (Task 6): naming identity round-trip', () => {
+    it('keeps a valid tab nameSource through the persisted-tabs parse and drops a malformed one', () => {
+      const raw = JSON.stringify({
+        version: TABS_SCHEMA_VERSION,
+        tabs: {
+          activeTabId: 't1',
+          tabs: [
+            {
+              id: 't1',
+              title: 'Owned',
+              createdAt: 1,
+              nameSource: { kind: 'session', paneId: 'p-agent' },
+            },
+            {
+              id: 't2',
+              title: 'Corrupt',
+              createdAt: 1,
+              nameSource: { kind: 'session' },
+            },
+          ],
+        },
+      })
+
+      const parsed = parsePersistedTabsRaw(raw)
+      expect(parsed?.tabs.tabs[0].nameSource).toEqual({ kind: 'session', paneId: 'p-agent' })
+      expect(parsed?.tabs.tabs[1].nameSource).toBeUndefined()
+    })
+
+    it('keeps pane namingHandle/nameRef on terminal pane content through the panes parse', () => {
+      const raw = JSON.stringify({
+        version: PANES_SCHEMA_VERSION,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-1',
+              status: 'creating',
+              mode: 'claude',
+              shell: 'system',
+              namingHandle: 'nh-persist-1',
+              nameRef: { kind: 'pending', id: 'nh-persist-1' },
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      })
+
+      const parsed = parsePersistedPanesRaw(raw)
+      const content = (parsed!.layouts['tab-1'] as any).content
+      expect(content.namingHandle).toBe('nh-persist-1')
+      expect(content.nameRef).toEqual({ kind: 'pending', id: 'nh-persist-1' })
+    })
+
+    it('drops a malformed pane nameRef instead of retaining a corrupt naming identity', () => {
+      const raw = JSON.stringify({
+        version: PANES_SCHEMA_VERSION,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-1',
+              status: 'creating',
+              mode: 'claude',
+              shell: 'system',
+              nameRef: { kind: 'bogus' },
+              namingHandle: 17,
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      })
+
+      const parsed = parsePersistedPanesRaw(raw)
+      const content = (parsed!.layouts['tab-1'] as any).content
+      expect(content.nameRef).toBeUndefined()
+      expect(content.namingHandle).toBeUndefined()
+    })
+  })
+
+// ── unified agent names (Task 7): the parse-level sanitizer gate ─────────────
+
+describe('persistedState parsers — unified agent names (Task 7)', () => {
+  const scopedLayout = {
+    type: 'leaf',
+    id: 'p-agent',
+    content: {
+      kind: 'terminal',
+      mode: 'claude',
+      createRequestId: 'req-1',
+      sessionRef: { provider: 'claude', sessionId: 'sess-1' },
+      namingHandle: 'h-1',
+    },
+  } as const
+
+  it('parsePersistedPanesRaw strips a scoped pane title/flag while preserving the pane identity and out-of-scope titles', () => {
+    const raw = JSON.stringify({
+      version: 7,
+      layouts: {
+        'tab-1': scopedLayout,
+        'tab-shell': {
+          type: 'leaf',
+          id: 'p-shell',
+          content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-2' },
+        },
+      },
+      activePane: { 'tab-1': 'p-agent' },
+      paneTitles: { 'tab-1': { 'p-agent': 'Scoped Alias' }, 'tab-shell': { 'p-shell': 'Shell Title' } },
+      paneTitleSetByUser: { 'tab-1': { 'p-agent': true }, 'tab-shell': { 'p-shell': true } },
+    })
+    const parsed = parsePersistedPanesRaw(raw)
+    expect(parsed).not.toBeNull()
+    expect(parsed!.paneTitles).toEqual({ 'tab-shell': { 'p-shell': 'Shell Title' } })
+    expect(parsed!.paneTitleSetByUser).toEqual({ 'tab-shell': { 'p-shell': true } })
+    // The pane identity survives the sanitizer untouched.
+    const content = (parsed!.layouts['tab-1'] as { content: Record<string, unknown> }).content
+    expect(content.sessionRef).toEqual({ provider: 'claude', sessionId: 'sess-1' })
+    expect(content.namingHandle).toBe('h-1')
+  })
+
+  it('parsePersistedTabsRaw drops a session-owned tab freeze flag and keeps legacy tabs verbatim', () => {
+    const raw = JSON.stringify({
+      version: 2,
+      tabs: {
+        activeTabId: 't1',
+        tabs: [
+          { id: 't1', title: 'Session Named', titleSetByUser: true, nameSource: { kind: 'session', paneId: 'p1' } },
+          { id: 't2', title: 'Legacy', titleSetByUser: true },
+        ],
+      },
+      tombstones: [],
+    })
+    const parsed = parsePersistedTabsRaw(raw)
+    expect(parsed).not.toBeNull()
+    const sessionOwned = parsed!.tabs.tabs.find((t) => t.id === 't1')!
+    expect(sessionOwned.titleSetByUser).toBeUndefined()
+    // The last-known title projection and the source pointer survive.
+    expect(sessionOwned.title).toBe('Session Named')
+    expect(sessionOwned.nameSource).toEqual({ kind: 'session', paneId: 'p1' })
+    const legacy = parsed!.tabs.tabs.find((t) => t.id === 't2')!
+    expect(legacy.titleSetByUser).toBe(true)
+  })
+})

@@ -72,18 +72,18 @@ describe('Electron Rust app-bound startup', () => {
   it('runs isolated dev prerequisites and verifies every Rust startup resource', () => {
     const projectRoot = mkdtempSync(path.join(tmpdir(), 'freshell-electron-dev-'))
     const resources = resolveElectronDevPrerequisitePaths(projectRoot, 'linux')
-    const runCommand = vi.fn((command: string, args: string[], cwd: string) => {
-      expect(command).toBe('npm')
+    const runCommand = vi.fn((phase: { command: string; args: string[] }, cwd: string) => {
+      expect(phase.command).toBe('npm')
       expect(cwd).toBe(projectRoot)
 
-      const phase = args.join(' ')
-      if (phase === 'run build:client') {
+      const script = phase.args.join(' ')
+      if (script === 'run build:client') {
         mkdirSync(path.dirname(resources.clientIndex), { recursive: true })
         writeFileSync(resources.clientIndex, '<!doctype html>')
-      } else if (phase === 'run build:tools') {
+      } else if (script === 'run build:tools') {
         mkdirSync(path.dirname(resources.mcpEntry), { recursive: true })
         writeFileSync(resources.mcpEntry, 'export {}')
-      } else if (phase === 'run build:rust') {
+      } else if (script === 'run build:rust') {
         mkdirSync(path.dirname(resources.serverBinary), { recursive: true })
         writeFileSync(resources.serverBinary, 'rust release binary')
       }
@@ -93,13 +93,13 @@ describe('Electron Rust app-bound startup', () => {
       const resolved = runElectronDevPrerequisites({
         projectRoot,
         platform: 'linux',
-        npm: 'npm',
+        managerCommand: 'npm',
         runCommand,
       })
 
       expect(resolved).toEqual(resources)
       expect(runCommand).toHaveBeenCalledTimes(4)
-      expect(runCommand.mock.calls.map(([, args]) => args)).toEqual([
+      expect(runCommand.mock.calls.map(([phase]) => phase.args)).toEqual([
         ['run', 'prebuild'],
         ['run', 'build:client'],
         ['run', 'build:tools'],

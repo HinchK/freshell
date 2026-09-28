@@ -61,6 +61,11 @@ extraResources:
     to: node-client-runtime
     filter:
       - "**/*"
+  # The stager's hash-verified receipt rides at the artifact root: the
+  # verifier's authority for the runtime's link/lock/metadata contract.
+  # File-level entry — the per-subdirectory copies above never see it.
+  - from: electron-runtime/.electron-runtime-receipt.json
+    to: .electron-runtime-receipt.json
   # Launch chooser assets (loaded from the real filesystem before connecting).
   - from: dist/launch-chooser
     to: launch-chooser

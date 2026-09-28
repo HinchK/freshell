@@ -3,6 +3,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { resolveManagerExecFileCommand } from '../../setup/manager-command.js'
+
 /**
  * Raw MCP stdio JSON-RPC client + build helper for the "MCP bridge" QA-lever
  * pin (`docs/plans/2026-07-18-agent-api-mcp-parity-spec.md` \u00a76/\u00a78.3).
@@ -40,30 +42,32 @@ export function mcpServerBinPath(root: string = REPO_ROOT): string {
 
 /**
  * Ensure `dist/tools/freshell-mcp/server.js` exists and is current by running
- * `npm run build:tools` (`tsc -p tsconfig.tools.json`). Running the build
- * unconditionally keeps the generated client current when source files or
- * dependencies changed, without relying on hand-rolled mtime checks across
- * the tooling and shared trees. Returns the elapsed build time in ms so
- * callers can log it.
+ * the project manager's `run build:tools` (`tsc -p tsconfig.tools.json`).
+ * Running the build unconditionally keeps the generated client current when
+ * source files or dependencies changed, without relying on hand-rolled mtime
+ * checks across the tooling and shared trees. Returns the elapsed build time
+ * in ms so callers can log it.
  */
 export function ensureMcpServerBuilt(root: string = REPO_ROOT): { path: string; buildMs: number } {
   const bin = mcpServerBinPath(root)
   const start = Date.now()
-  const result = spawnSync('npm', ['run', 'build:tools'], {
+  const build = resolveManagerExecFileCommand(['run', 'build:tools'], process.env, process.platform, process.execPath, root)
+  const result = spawnSync(build.command, build.args, {
     cwd: root,
     stdio: 'pipe',
     encoding: 'utf8',
+    shell: build.viaShell ?? false,
   })
   const buildMs = Date.now() - start
   if (result.status !== 0) {
     throw new Error(
-      `npm run build:tools failed (exit ${result.status ?? 'signal ' + result.signal}); ` +
+      `manager run build:tools failed (exit ${result.status ?? 'signal ' + result.signal}); ` +
       `cannot boot the MCP bridge fixture without a current dist/tools/freshell-mcp/server.js.\n` +
       `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
     )
   }
   if (!fs.existsSync(bin)) {
-    throw new Error(`npm run build:tools completed but ${bin} is still missing.`)
+    throw new Error(`manager run build:tools completed but ${bin} is still missing.`)
   }
   return { path: bin, buildMs }
 }

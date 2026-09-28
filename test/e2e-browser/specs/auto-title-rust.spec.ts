@@ -58,8 +58,26 @@ interface FakeGemini {
  * candidates payload and records every request's `x-goog-api-key` header so
  * tests can assert the seeded settings key actually arrived on the wire.
  */
-async function startFakeGemini(replyText: string): Promise<FakeGemini> {
+interface FakeGemini {
+  baseUrl: string
+  requests: FakeGeminiRequest[]
+  close: () => Promise<void>
+  /** Hold every generateContent response until released (the in-request race pin). */
+  holdResponses?: () => void
+  releaseResponses?: () => void
+}
+
+/**
+ * A local fake Gemini: answers
+ * `POST /v1beta/models/gemini-3.5-flash-lite:generateContent` with a fixed
+ * candidates payload and records every request's `x-goog-api-key` header so
+ * tests can assert the seeded settings key actually arrived on the wire.
+ * `opts.hold` parks each response until `releaseResponses()` — the
+ * manual-wins-during-request pin.
+ */
+async function startFakeGemini(replyText: string, opts?: { hold?: boolean }): Promise<FakeGemini> {
   const requests: FakeGeminiRequest[] = []
+  let held = opts?.hold === true
   const server = http.createServer((req, res) => {
     let body = ''
     req.on('data', (chunk: Buffer) => { body += chunk.toString() })
@@ -71,10 +89,22 @@ async function startFakeGemini(replyText: string): Promise<FakeGemini> {
         body,
       })
       if (req.method === 'POST' && req.url === GEMINI_GENERATE_PATH) {
-        res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({
-          candidates: [{ content: { parts: [{ text: replyText }] } }],
-        }))
+        const answer = () => {
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({
+            candidates: [{ content: { parts: [{ text: replyText }] } }],
+          }))
+        }
+        if (held) {
+          const timer = setInterval(() => {
+            if (!held) {
+              clearInterval(timer)
+              answer()
+            }
+          }, 20)
+        } else {
+          answer()
+        }
       } else {
         res.writeHead(404, { 'content-type': 'application/json' })
         res.end('{}')
@@ -87,6 +117,8 @@ async function startFakeGemini(replyText: string): Promise<FakeGemini> {
     baseUrl: `http://127.0.0.1:${port}/v1beta`,
     requests,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    holdResponses: () => { held = true },
+    releaseResponses: () => { held = false },
   }
 }
 
@@ -105,6 +137,8 @@ function buildClaudeSessionJsonl(input: {
   sessionId: string
   cwd: string
   firstMessage: string
+  /** A `type:'summary'` record marks the parsed title provider-generated. */
+  summary?: string
 }): string {
   const lines: string[] = [
     JSON.stringify({
@@ -156,6 +190,14 @@ function buildClaudeSessionJsonl(input: {
     }))
     previousUuid = assistantUuid
   }
+  if (input.summary !== undefined) {
+    lines.push(JSON.stringify({
+      type: 'summary',
+      summary: input.summary,
+      sessionId: input.sessionId,
+      uuid: `${input.sessionId}-summary`,
+    }))
+  }
   return `${lines.join('\n')}\n`
 }
 
@@ -181,6 +223,8 @@ interface SeededSession {
   firstMessage: string
   /** Basename of the per-home project dir (the sweep's `dir` placeholder). */
   projectDirName: string
+  /** Optional provider summary record (provider-generated parsed title). */
+  summary?: string
 }
 
 interface BootedServer {
@@ -240,6 +284,7 @@ async function bootAutoTitleServer(opts: {
               sessionId: opts.session.sessionId,
               cwd: projectDir,
               firstMessage: opts.session.firstMessage,
+              summary: opts.session.summary,
             }),
           )
         }
@@ -314,7 +359,10 @@ async function resumeSeededSession(
   return { tabId, terminalId }
 }
 
-/** The directory read model's title for `claude:<sessionId>` (or null). */
+/** The directory read model's title for `claude:<sessionId>` (or null).
+ * Unified agent names (Task 4): the naming record's current name rides the
+ * additive `sessionName` field (the sidebar's authoritative surface); the
+ * legacy `title` stays the pre-naming parsed value for non-manual records. */
 async function directoryTitle(
   page: import('@playwright/test').Page,
   info: { baseUrl: string; token: string },
@@ -325,9 +373,16 @@ async function directoryTitle(
     { headers: { 'x-auth-token': info.token } },
   )
   if (!res.ok()) return null
-  const payload = await res.json() as { items: Array<{ provider: string; sessionId: string; title?: string }> }
+  const payload = await res.json() as {
+    items: Array<{
+      provider: string
+      sessionId: string
+      title?: string
+      sessionName?: string
+    }>
+  }
   const item = payload.items.find((i) => i.provider === 'claude' && i.sessionId === sessionId)
-  return item?.title ?? null
+  return item?.sessionName ?? item?.title ?? null
 }
 
 /** The persisted `config.sessionOverrides[key]` row from the isolated home. */
@@ -377,12 +432,12 @@ test.describe('Auto-title pipeline (rust)', () => {
         { timeout: 15_000 },
       ).toBe(FIRST_MESSAGE)
 
-      // The persisted override row records the ladder rung. Polled: the
-      // config write is best-effort/asynchronous relative to the read model.
+      // Unified agent names (Task 4): the naming authority owns the title —
+      // the settings ladder NEVER acquires a competing scoped row.
       await expect.poll(
-        async () => (await sessionOverride(booted.info.homeDir, `claude:${SESSION_ID}`))?.titleSource ?? null,
+        async () => (await sessionOverride(booted.info.homeDir, `claude:${SESSION_ID}`)) ?? null,
         { timeout: 10_000 },
-      ).toBe('first-message')
+      ).toBe(null)
 
       // Sidebar row shows the title with ZERO further client action (the
       // sweep's sessions.changed drives the refetch).
@@ -428,10 +483,12 @@ test.describe('Auto-title pipeline (rust)', () => {
         () => directoryTitle(page, booted.info, SESSION_ID),
         { timeout: 15_000 },
       ).toBe(AI_TITLE)
+      // The naming record's accepted Freshell AI name is the durable rung —
+      // and no scoped settings row exists.
       await expect.poll(
-        async () => (await sessionOverride(booted.info.homeDir, `claude:${SESSION_ID}`))?.titleSource ?? null,
+        async () => (await sessionOverride(booted.info.homeDir, `claude:${SESSION_ID}`)) ?? null,
         { timeout: 10_000 },
-      ).toBe('ai')
+      ).toBe(null)
 
       // The wire contract actually exercised the fake: the generateContent
       // POST arrived with the seeded settings key in x-goog-api-key.
@@ -464,7 +521,7 @@ test.describe('Auto-title pipeline (rust)', () => {
         `${booted.info.baseUrl}/api/sessions/${encodeURIComponent(`claude:${SESSION_ID}`)}`,
         {
           headers: { 'x-auth-token': booted.info.token, 'content-type': 'application/json' },
-          data: { titleOverride: 'MINE' },
+          data: { titleOverride: 'MINE', nameIntent: 'user' },
         },
       )
       expect(res.ok()).toBe(true)
@@ -475,8 +532,7 @@ test.describe('Auto-title pipeline (rust)', () => {
 
       expect(await directoryTitle(page, booted.info, SESSION_ID)).toBe('MINE')
       const override = await sessionOverride(booted.info.homeDir, `claude:${SESSION_ID}`)
-      expect(override?.titleOverride).toBe('MINE')
-      expect(override?.titleSource).toBe('user')
+      expect(override).toBe(null)
 
       // SESSION-04 stable-cold-restart clause: the ladder's final winner must
       // survive a full server stop/start on the same home (`RustServer.
@@ -496,14 +552,13 @@ test.describe('Auto-title pipeline (rust)', () => {
       await page.waitForTimeout(5_000)
       expect(await directoryTitle(page, booted.info, SESSION_ID)).toBe('MINE')
       const postRestart = await sessionOverride(booted.info.homeDir, `claude:${SESSION_ID}`)
-      expect(postRestart?.titleOverride).toBe('MINE')
-      expect(postRestart?.titleSource).toBe('user')
+      expect(postRestart).toBe(null)
     } finally {
       await cleanup(booted)
     }
   })
 
-  test('generate-title endpoint uses fake Gemini and echoes ladder-resolved result', async ({ page }) => {
+  test('scoped generate-title compatibility route answers the saved name and writes nothing', async ({ page }) => {
     const SESSION_ID = '00000000-0000-4000-8000-00000000a404'
     const AI_TITLE = 'Flux capacitor repair'
     const fake = await startFakeGemini(AI_TITLE)
@@ -526,20 +581,16 @@ test.describe('Auto-title pipeline (rust)', () => {
         },
       )
       expect(res.ok()).toBe(true)
-      // The response echoes the STORED (ladder-resolved) value.
-      expect(await res.json()).toEqual({ title: AI_TITLE, source: 'ai' })
-
-      // The fake was actually on the wire, with the seeded key.
-      const generateRequests = fake.requests.filter((r) => r.url === GEMINI_GENERATE_PATH)
-      expect(generateRequests.length).toBeGreaterThan(0)
-      expect(generateRequests[0].apiKey).toBe(FAKE_GEMINI_KEY)
-
-      // A subsequent directory read reflects the write (the route broadcasts
-      // sessions.changed; the read model applies the override directly).
-      await expect.poll(
-        () => directoryTitle(page, booted.info, SESSION_ID),
-        { timeout: 10_000 },
-      ).toBe(AI_TITLE)
+      // Unified agent names (Task 4): claude is SCOPED — the route is the
+      // compatibility arm only. The boot hydration installed the free
+      // first-message fallback record, so it answers the SAVED name (never
+      // the request's own text) and writes nothing.
+      expect(await res.json()).toEqual({
+        title: 'Repair the flux capacitor',
+        source: 'first-message',
+      })
+      expect(fake.requests.filter((r) => r.url === GEMINI_GENERATE_PATH)).toHaveLength(0)
+      expect(await sessionOverride(booted.info.homeDir, `claude:${SESSION_ID}`)).toBe(null)
     } finally {
       await cleanup(booted, fake)
     }
@@ -592,6 +643,81 @@ test.describe('Auto-title pipeline (rust)', () => {
       const generateRequests = fake.requests.filter((r) => r.url === GEMINI_GENERATE_PATH)
       expect(generateRequests.length).toBeGreaterThan(0)
       expect(generateRequests[0].apiKey).toBe(FAKE_GEMINI_KEY)
+    } finally {
+      await cleanup(booted, fake)
+    }
+  })
+
+  test('a provider-generated title does not suppress AI naming (summary record)', async ({ page }) => {
+    // Unified agent names (Task 4): a `type:'summary'` record marks the
+    // parsed claude title provider-generated — the OLD pipeline blocked
+    // both the sweep's AI branch and the generate-title route for such
+    // sessions. Provider names are FALLBACKS now: the explicitly-open
+    // session still gets its Freshell AI title.
+    const SESSION_ID = '00000000-0000-4000-8000-00000000a505'
+    const AI_TITLE = 'Summary session AI name'
+    const fake = await startFakeGemini(AI_TITLE)
+    const booted = await bootAutoTitleServer({
+      session: {
+        sessionId: SESSION_ID,
+        firstMessage: 'Investigate the dropped connection',
+        projectDirName: 'summaryproj',
+        summary: 'Provider summary title',
+      },
+      env: { FRESHELL_GEMINI_BASE_URL: fake.baseUrl },
+    })
+    try {
+      await patchSettings(page, booted.info, { ai: { geminiApiKey: FAKE_GEMINI_KEY } })
+      const harness = await bootAndConnect(page, booted.info)
+      await resumeSeededSession(page, harness, SESSION_ID)
+      await expect.poll(
+        () => directoryTitle(page, booted.info, SESSION_ID),
+        { timeout: 20_000 },
+      ).toBe(AI_TITLE)
+      const generateRequests = fake.requests.filter((r) => r.url === GEMINI_GENERATE_PATH)
+      expect(generateRequests.length).toBeGreaterThan(0)
+    } finally {
+      await cleanup(booted, fake)
+    }
+  })
+
+  test('a manual rename during an in-flight AI request wins', async ({ page }) => {
+    // Unified agent names (Task 4): the 20-second-bounded generation request
+    // is held at the fake; the user's explicit rename mid-flight must commit
+    // and the late AI answer must never clobber it.
+    const SESSION_ID = '00000000-0000-4000-8000-00000000a606'
+    const AI_TITLE = 'Late AI answer'
+    const fake = await startFakeGemini(AI_TITLE, { hold: true })
+    const booted = await bootAutoTitleServer({
+      session: { sessionId: SESSION_ID, firstMessage: 'Rename me mid-flight', projectDirName: 'midflight' },
+      env: { FRESHELL_GEMINI_BASE_URL: fake.baseUrl },
+    })
+    try {
+      await patchSettings(page, booted.info, { ai: { geminiApiKey: FAKE_GEMINI_KEY } })
+      const harness = await bootAndConnect(page, booted.info)
+      await resumeSeededSession(page, harness, SESSION_ID)
+
+      // The held request proves the generation attempt is in flight.
+      await expect.poll(
+        () => fake.requests.filter((r) => r.url === GEMINI_GENERATE_PATH).length,
+        { timeout: 20_000 },
+      ).toBeGreaterThan(0)
+
+      // The manual rename commits while the provider operation is held.
+      const res = await page.request.patch(
+        `${booted.info.baseUrl}/api/sessions/${encodeURIComponent(`claude:${SESSION_ID}`)}`,
+        {
+          headers: { 'x-auth-token': booted.info.token, 'content-type': 'application/json' },
+          data: { titleOverride: 'MINE MID-FLIGHT', nameIntent: 'user' },
+        },
+      )
+      expect(res.ok()).toBe(true)
+      expect(await directoryTitle(page, booted.info, SESSION_ID)).toBe('MINE MID-FLIGHT')
+
+      // Release the late answer: the protected manual name rejects it.
+      fake.releaseResponses!()
+      await page.waitForTimeout(3_000)
+      expect(await directoryTitle(page, booted.info, SESSION_ID)).toBe('MINE MID-FLIGHT')
     } finally {
       await cleanup(booted, fake)
     }

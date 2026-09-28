@@ -11,6 +11,12 @@ import type { PaneNode } from '../../../../src/store/paneTypes'
 import type { ClientExtensionEntry } from '../../../../shared/extension-types'
 import { applyPaneRename, applyTabRename } from '../../../../src/store/titleSync'
 import { getTabDisplayTitle } from '../../../../src/lib/tab-title'
+import sessionNamesReducer, { receiveSessionNames } from '../../../../src/store/sessionNamesSlice'
+import {
+  selectPaneDisplayName,
+  selectTabDisplayName,
+} from '../../../../src/store/selectors/sessionNameSelectors'
+import type { SessionNameUpdate } from '../../../../shared/session-names'
 
 // Mock nanoid to return predictable IDs for testing
 let mockIdCounter = 0
@@ -384,5 +390,43 @@ describe('tab-pane title sync for single-pane tabs', () => {
         opencodeExtensions,
       )).toBe('OpenCode')
     })
+  })
+
+  /**
+   * Unified agent names (Task 5): the explicit-rename coordinators are the
+   * LEGACY organization path. A scoped agent pane/tab never displays their
+   * output while a canonical record is cached — the sticky flag they arm is
+   * inert for scoped surfaces.
+   */
+  it('a scoped pane/tab keeps the canonical name over the explicit local renames', () => {
+    const sessionRef = { kind: 'session' as const, provider: 'claude' as const, sessionId: 'scoped-sync-sess' }
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer, sessionNames: sessionNamesReducer },
+    })
+    store.dispatch(receiveSessionNames([{
+      record: { ref: sessionRef, name: 'Canonical sync name', source: 'freshell_ai', revision: 2 },
+      documentGeneration: 20,
+      redirects: [],
+      changed: true,
+    } satisfies SessionNameUpdate]))
+    store.dispatch(addTab({ title: 'x', mode: 'claude' }))
+    const tabId = store.getState().tabs.tabs[0].id
+    store.dispatch(initLayout({
+      tabId,
+      content: { kind: 'terminal', mode: 'claude', terminalId: 'term-sync', sessionRef: { provider: 'claude', sessionId: 'scoped-sync-sess' } },
+    }))
+    const paneId = (store.getState().panes.layouts[tabId] as Extract<PaneNode, { type: 'leaf' }>).id
+
+    store.dispatch(applyPaneRename({ tabId, paneId, title: 'Local pane label' }) as never)
+    store.dispatch(applyTabRename({ tabId, title: 'Local tab label' }) as never)
+
+    expect(getTabDisplayTitle(
+      store.getState().tabs.tabs[0],
+      store.getState().panes.layouts[tabId],
+      store.getState().panes.paneTitles[tabId],
+    )).toBe('Local tab label') // legacy helper keeps its semantics...
+    // ...but the scoped display rules never consult it:
+    expect(selectPaneDisplayName(store.getState(), tabId, paneId)).toBe('Canonical sync name')
+    expect(selectTabDisplayName(store.getState(), tabId)).toBe('Canonical sync name')
   })
 })

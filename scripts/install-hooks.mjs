@@ -1,5 +1,6 @@
 // One-time per clone: point git's hooks at the committed scripts/hooks dir.
-// Runs from npm postinstall. Silently no-ops outside a git repo (docker
+// Runs from the package manager's postinstall hook (pnpm install in this
+// repo). Silently no-ops outside a git repo (docker
 // build contexts, electron rsync targets, containers without git).
 //
 // Uses the MAIN checkout's scripts/hooks (absolute path), so every linked

@@ -3,6 +3,29 @@
 Use the same flow for every Freshell machine. An instance is one Rust server
 and one native Windows Electron client connected to it.
 
+## Prepare the checkout (once, and after pulling changes)
+
+The server needs the locked dependency tree present before it can start —
+the Rust server launches the Claude sidecar from
+`crates/freshell-claude-sidecar` at runtime. On a pnpm-era checkout
+(development `main`), run the frozen install from the repo root:
+
+```bash
+cd /home/dan/code/freshell
+pnpm install --frozen-lockfile
+```
+
+The root workspace install covers the app plus both workspace members (the
+Claude sidecar and the MCP runtime packaging package). The launcher and the
+`dev`/`start` script hooks verify sidecar readiness before the server spawns
+and, if the tree is missing or stale, repair it with one frozen filtered
+install — never a mutable one. An npm-era checkout (for example the v0.7.5
+release) prepares with `npm install` instead.
+
+Preparing or refreshing the workspace is a normal build step and needs no
+approval. **Restarting the live production server is a different operation and
+still requires the user's explicit approval (`APPROVED`).**
+
 ## Start or verify the server
 
 Run this on the machine that owns the server:
@@ -24,8 +47,15 @@ For a remote machine, run the same command through SSH:
 ssh <machine> 'cd /home/dan/code/freshell && scripts/launch-rust.sh --port 3001'
 ```
 
-The launcher builds as needed and leaves a healthy instance running. Restarting
+The launcher builds as needed, verifies the sidecar tree as part of startup,
+and leaves a healthy instance running. Restarting
 the live port requires explicit approval (`APPROVED`).
+
+The optional systemd user unit (`installers/systemd/freshell-rust.service`)
+launches the Rust binary directly — its `ExecStart` is the
+`freshell-server` executable, no package manager involved — so it performs
+no dependency preparation; prepare the checkout once on that machine as
+above, and the service restores the server after restarts.
 
 ## Launch the native Windows client
 

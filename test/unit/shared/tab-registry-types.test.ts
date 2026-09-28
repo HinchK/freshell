@@ -71,3 +71,64 @@ describe('TabRegistryRecordSchema', () => {
     expect(result.success).toBe(false)
   })
 })
+
+describe('TabRegistryRecordSchema — unified agent names (Task 6)', () => {
+  const baseRecord = {
+    tabKey: 'device-1:tab-owned',
+    tabId: 'tab-owned',
+    serverInstanceId: 'srv-test',
+    deviceId: 'device-1',
+    deviceLabel: 'danlaptop',
+    tabName: 'freshell',
+    status: 'open',
+    revision: 1,
+    createdAt: 1,
+    updatedAt: 2,
+    paneCount: 1,
+    titleSetByUser: false,
+    panes: [
+      {
+        paneId: 'p-agent',
+        kind: 'terminal',
+        payload: {
+          mode: 'claude',
+          namingHandle: 'nh-reg-1',
+          nameRef: { kind: 'pending', id: 'nh-reg-1' },
+        },
+      },
+    ],
+  } as const
+
+  it('round-trips the tab nameSource through the registry record parse', () => {
+    const parsed = TabRegistryRecordSchema.parse({
+      ...baseRecord,
+      nameSource: { kind: 'session', paneId: 'p-agent' },
+    })
+    expect(parsed.nameSource).toEqual({ kind: 'session', paneId: 'p-agent' })
+
+    const legacy = TabRegistryRecordSchema.parse({ ...baseRecord, nameSource: { kind: 'legacy' } })
+    expect(legacy.nameSource).toEqual({ kind: 'legacy' })
+  })
+
+  it('still accepts records without nameSource (pre-Task-6 servers/clients)', () => {
+    const parsed = TabRegistryRecordSchema.parse(baseRecord)
+    expect(parsed.nameSource).toBeUndefined()
+  })
+
+  it('keeps the pane payload naming identity (namingHandle/nameRef) verbatim', () => {
+    const parsed = TabRegistryRecordSchema.parse({
+      ...baseRecord,
+      nameSource: { kind: 'session', paneId: 'p-agent' },
+    })
+    expect(parsed.panes[0].payload.namingHandle).toBe('nh-reg-1')
+    expect(parsed.panes[0].payload.nameRef).toEqual({ kind: 'pending', id: 'nh-reg-1' })
+  })
+
+  it('rejects a malformed nameSource instead of accepting a corrupt relationship', () => {
+    const result = TabRegistryRecordSchema.safeParse({
+      ...baseRecord,
+      nameSource: { kind: 'session' },
+    })
+    expect(result.success).toBe(false)
+  })
+})

@@ -1,4 +1,4 @@
-//! Server → client messages (`ServerMessage`, 66 discriminants: 65 frozen
+//! Server → client messages (`ServerMessage`, 67 discriminants: 66 frozen
 //! inventory types + the `durability.degraded` extension).
 //!
 //! These are TypeScript-typed (not runtime-validated) on the wire; their frozen
@@ -13,6 +13,7 @@ use crate::common::{
     CodexDurability, ErrorCode, OpencodeActivityRecord, SessionLocator, TerminalMetaRecord,
     TurnCompletionSnapshot,
 };
+use crate::session_names::{SessionNameRecord, SessionNameRef, SessionNameUpdated};
 use crate::settings::ServerSettings;
 
 /// A message sent from the server to a client.
@@ -95,6 +96,11 @@ pub enum ServerMessage {
     Ready(Ready),
     #[serde(rename = "session.repair.activity")]
     SessionRepairActivity(SessionRepairActivity),
+    // Unified agent names (Task 1): the canonical name broadcast — payload is
+    // a `SessionNameUpdate`. Additive server→client only; the protocol
+    // version deliberately stays 10 (pre-frame servers simply never send it).
+    #[serde(rename = "session.name.updated")]
+    SessionNameUpdated(SessionNameUpdated),
     // kata b8ke: the runtime-ownership broadcast (see [`SessionRuntimeOwner`]).
     // Additive via the frozen route — SERVER_MESSAGE_TYPES / the generated
     // inventory carry it; no protocol version bump (nothing awaits it).
@@ -168,6 +174,16 @@ pub enum ServerMessage {
     TerminalStatus(TerminalStatus),
     #[serde(rename = "terminal.stream.changed")]
     TerminalStreamChanged(TerminalStreamChanged),
+    // Wedge-backstop addition; joined the frozen inventory
+    // (SERVER_MESSAGE_TYPES + regenerated contract) in this change:
+    // the terminal-mode stuck edge — `{ terminalId, at, stuck }`, emitted ONCE
+    // per stuck/unstuck transition by the stuck monitor, and once to a
+    // freshly attaching subscriber while the row is flagged. The
+    // terminal-mode analogue of freshcodex's `freshAgent.status:"stuck"` —
+    // never a `terminal.turn.complete` fabrication. See
+    // [`TerminalStuck`] and `spawn_stuck_monitor`.
+    #[serde(rename = "terminal.stuck")]
+    TerminalStuck(TerminalStuck),
     #[serde(rename = "terminal.title.updated")]
     TerminalTitleUpdated(TerminalTitleUpdated),
     #[serde(rename = "terminal.turn.complete")]
@@ -180,7 +196,7 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 65] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 67] = [
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
     "claude.activity.list.response",
@@ -217,6 +233,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 65] = [
     "perf.logging",
     "pong",
     "ready",
+    "session.name.updated",
     "session.repair.activity",
     "session.runtimeOwner",
     "session.status",
@@ -242,6 +259,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 65] = [
     "terminal.session.associated",
     "terminal.status",
     "terminal.stream.changed",
+    "terminal.stuck",
     "terminal.title.updated",
     "terminal.turn.complete",
     "terminals.changed",
@@ -258,7 +276,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 65] = [
 /// `terminal.codex.durability.updated` (codex-sidecar durability); the
 /// name collision is nearest-neighbor only. If the client ever grows a
 /// consumer, add the Zod schema to `shared/ws-protocol.ts`, run
-/// `npm run contract:generate`, and promote this into
+/// `pnpm run contract:generate`, and promote this into
 /// [`SERVER_MESSAGE_TYPES`]. Shape pinned by `tests/activity_extension.rs`.
 pub const EXTENSION_SERVER_MESSAGE_TYPES: [&str; 1] = ["durability.degraded"];
 
@@ -337,6 +355,34 @@ pub enum TerminalOutputGapReason {
     QueueOverflow,
     ReplayWindowExceeded,
     ReplayBudgetExceeded,
+    /// Responsive-terminal-restore W1 (round-4, plan:146): the paced
+    /// session's FIXED delivery boundary was reached with output staged
+    /// beyond it — the connection missed the declared interval's sequenced
+    /// output, but the ring RETAINED it (delivery loss, not retention
+    /// loss). Emitted ONLY on connections that negotiated
+    /// `pacedTerminalReplayV1` (the paced completion core is its only
+    /// emitter). The client repairs from its surface cursor (the same
+    /// checkpoint-cursor delta repair as `queue_overflow`): a finite
+    /// delivery window cannot guarantee convergence against indefinitely
+    /// faster output production, so the bounded session reports the exact
+    /// interval and the client's bounded baseline recovery fetches it.
+    HandoffBoundaryReached,
+}
+
+/// `terminal.attach.ready.replayResetReason` — why the attach's effective
+/// replay position was reset instead of honoring the requested one
+/// (responsive-terminal-restore shared contract).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalReplayResetReason {
+    /// The geometry-authority check rejected the requested position (the
+    /// only pre-restore-contract value; const on the wire).
+    GeometryAuthorityUnknown,
+    /// The requested position predates the retained replay window
+    /// (retention loss). Emitted ONLY on connections that negotiated
+    /// `pacedTerminalReplayV1` — task 3's negotiated retention-gap emission;
+    /// this increment only extends the value space, no emitter sets it yet.
+    RetentionLost,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -528,6 +574,17 @@ pub struct TerminalIdle {
     pub terminal_id: String,
     pub at: i64,
     pub reason: TerminalIdleReason,
+}
+
+/// `terminal.stuck` — the agent-pane wedged flag (surface-only; the client
+/// renders the "Agent appears stuck" card from it and offers kill/restart).
+/// Pinned wire contract: `port/contract/ws-server-messages.schema.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalStuck {
+    pub terminal_id: String,
+    pub at: i64,
+    pub stuck: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -783,6 +840,17 @@ pub struct FreshAgentCreated {
     pub session_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
+    /// Unified agent names (Task 1 wire / Task 2 Rust side): canonical
+    /// session-name projection for this session's naming ref (last-known;
+    /// the `session.name.updated` broadcast is the live authority).
+    /// Additive optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<SessionNameRecord>,
+    /// Unified agent names: the naming identity this session's name resolves
+    /// through (the pending handle before durable materialization).
+    /// Additive optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_ref: Option<SessionNameRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -849,6 +917,16 @@ pub struct FreshAgentSessionMaterialized {
     pub session_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
+    /// Unified agent names (Task 1 wire / Task 2 Rust side): the canonical
+    /// name record AFTER the materialization's pending→durable transfer (the
+    /// commit happens BEFORE this frame publishes the identity). Additive
+    /// optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<SessionNameRecord>,
+    /// Unified agent names: the durable naming identity the materialized
+    /// session's name now resolves through. Additive optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_ref: Option<SessionNameRef>,
 }
 
 // --- pane.reconcile.result ----------------------------------------------------
@@ -936,6 +1014,19 @@ pub struct ReadyCapabilities {
     pub pane_reconcile_fresh_agent_v1: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_interest_v1: Option<bool>,
+    /// Paced terminal restore (responsive-terminal-restore Workstream 1):
+    /// `Some(true)` iff the connection's `hello` opted in via
+    /// `capabilities.pacedTerminalReplayV1` — omitted from the wire entirely
+    /// otherwise (frozen-client inertness).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paced_terminal_replay_v1: Option<bool>,
+    /// Hidden-pane lifetime claims (responsive-terminal-restore Workstream 1):
+    /// `Some(true)` iff the connection's `hello` opted in via
+    /// `capabilities.terminalLifetimeClaimV1` — omitted from the wire entirely
+    /// otherwise (frozen-client inertness). Present iff the client may send
+    /// `terminal.interest.claimedTerminalIds`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_lifetime_claim_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1176,9 +1267,16 @@ pub struct TerminalAttachReady {
     pub geometry_authority: Option<GeometryAuthority>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub geometry_epoch: Option<i64>,
-    /// const `"geometry_authority_unknown"`.
+    /// Restore contract (responsive-terminal-restore): the earliest sequence
+    /// position still available for replay — the retained ring's front
+    /// `seqStart`, or `head_seq + 1` when nothing older than the head is
+    /// retained. Emitted ONLY on connections that negotiated
+    /// `pacedTerminalReplayV1`; omitted otherwise so the frozen client's
+    /// frame stays byte-identical.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub replay_reset_reason: Option<String>,
+    pub oldest_retained_seq: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_reset_reason: Option<TerminalReplayResetReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_since_seq: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1233,6 +1331,17 @@ pub struct TerminalCreated {
     pub restore_error: Option<TerminalRestoreError>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
+    /// Unified agent names (Task 1 wire / Task 2 Rust side): canonical
+    /// session-name projection for this terminal's naming ref (last-known;
+    /// the `session.name.updated` broadcast is the live authority).
+    /// Additive optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<SessionNameRecord>,
+    /// Unified agent names: the naming identity this terminal's name
+    /// resolves through (the pending handle before durable materialization).
+    /// Additive optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_ref: Option<SessionNameRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1268,6 +1377,15 @@ pub struct InventoryTerminal {
     pub runtime_status: Option<RuntimeStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
+    /// Unified agent names (Task 1 wire / Task 2 Rust side): canonical
+    /// session-name projection (last-known display cache; never an accepted
+    /// name input). Additive optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<SessionNameRecord>,
+    /// Unified agent names: the naming identity this terminal's name
+    /// resolves through. Additive optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_ref: Option<SessionNameRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1351,6 +1469,18 @@ pub struct TerminalOutputGap {
     pub to_seq: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attach_request_id: Option<String>,
+    /// Restore contract (responsive-terminal-restore): the terminal's current
+    /// `headSeq` at gap-emission time. Emitted ONLY on connections that
+    /// negotiated `pacedTerminalReplayV1`; omitted otherwise so the frozen
+    /// client's gap frame stays byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_seq: Option<i64>,
+    /// Restore contract (responsive-terminal-restore): the earliest sequence
+    /// position still available for replay (the retained ring's front
+    /// `seqStart`, or `head_seq + 1` when the ring is empty) at
+    /// gap-emission time. Emitted ONLY on negotiated connections.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_retained_seq: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

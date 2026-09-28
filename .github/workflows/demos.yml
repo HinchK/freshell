@@ -1,0 +1,50 @@
+name: Demos
+
+# Each demo is an independent pnpm project with its own lock (plan §3.3 item 5):
+# prove they still install and build from their own locks, without the parent
+# workspace, whenever their manifests/locks/config change.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/demos.yml'
+      - 'examples/demo-projects/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        demo:
+          - examples/demo-projects/synth
+          - examples/demo-projects/dataviz/viz-a
+          - examples/demo-projects/dataviz/viz-b
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm must exist before setup-node resolves its pnpm cache. The action
+      # reads the exact version from the root packageManager pin; each demo
+      # enforces the same pin against its own install via its workspace
+      # policy (packageManagerStrictVersion).
+      # Pinned revision of the v4 major; reads the exact version from the root
+      # packageManager pin (no floating duplicate).
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: examples/demo-projects/**/pnpm-lock.yaml
+
+      - name: Frozen install (demo-local lock, no parent workspace)
+        run: pnpm install --frozen-lockfile
+        working-directory: ${{ matrix.demo }}
+
+      - name: Build
+        run: pnpm run build
+        working-directory: ${{ matrix.demo }}

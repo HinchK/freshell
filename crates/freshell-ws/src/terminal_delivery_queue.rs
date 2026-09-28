@@ -40,6 +40,21 @@ pub enum Delivery<T> {
     Gap { terminal_id: String, range: Range },
 }
 
+/// One admission-time eviction record (responsive-terminal-restore W3
+/// observability, task-007 review M2): the evicted frame's own terminal and
+/// range, in global-oldest eviction order. The connection writer drains
+/// these after `push` (under the same admission lock) and emits its
+/// rate-limited `ws.terminal_stream.queue_overflow_spill` event at the
+/// moment the eviction happens — a connection that dies while backlogged
+/// (its coalesced gap never leased) still leaves spill evidence in the log.
+/// Supersede discards (`discard_terminal`) are not evictions and produce no
+/// records.
+#[derive(Clone, Debug)]
+pub struct EvictedOutput {
+    pub terminal_id: String,
+    pub range: Range,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CapacityError {
     MetadataLimit,
@@ -85,6 +100,12 @@ pub struct DeliveryQueue<T> {
     byte_limit: usize,
     metadata_limit: usize,
     gap_count: usize,
+    /// Admission-time eviction records (task-007 review M2): drained by the
+    /// caller via [`Self::take_evictions`] right after `push`. `Vec::new()`
+    /// allocates nothing, so admissions that evict nothing pay no cost, and
+    /// `std::mem::take` returns the buffer without retaining a flood-peak
+    /// capacity on the queue.
+    evictions: Vec<EvictedOutput>,
     class_served: [u128; 3],
     class_clock: u128,
     lane_clock: [u128; 3],
@@ -102,6 +123,7 @@ impl<T> DeliveryQueue<T> {
             byte_limit: byte_limit.max(1),
             metadata_limit: metadata_limit.max(1),
             gap_count: 0,
+            evictions: Vec::new(),
             class_served: [0; 3],
             class_clock: 0,
             lane_clock: [0; 3],
@@ -193,6 +215,10 @@ impl<T> DeliveryQueue<T> {
                 .expect("entry has lane");
             lane.ids.remove(&id);
             let range = entry.range.expect("only output is evictable");
+            self.evictions.push(EvictedOutput {
+                terminal_id: entry.terminal_id,
+                range: range.clone(),
+            });
             if let Some(last) = lane.gaps.back_mut() {
                 if last.stream_id == range.stream_id
                     && last.attach_request_id == range.attach_request_id
@@ -210,6 +236,15 @@ impl<T> DeliveryQueue<T> {
             // entry while adding at most one gap.
         }
         Ok(())
+    }
+
+    /// Drain the eviction records accumulated by [`Self::push`] (task-007
+    /// review M2): one record per evicted entry, in eviction order, taken
+    /// atomically so the next admission starts from a clean slate. Call
+    /// under the caller's admission lock immediately after `push`; an empty
+    /// return means no eviction happened.
+    pub fn take_evictions(&mut self) -> Vec<EvictedOutput> {
+        std::mem::take(&mut self.evictions)
     }
 
     /// Atomic caller snapshot: update scheduling only, never attachment,

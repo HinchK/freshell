@@ -32,8 +32,8 @@ const COMMAND_FLAG_KEYS_ALLOWING_DASH_PREFIX_VALUES: Partial<Record<string, Set<
   'send-keys': new Set(['l', 'literal', 'pane', 't', 'target', 'keys', 'session-ref', 'sessionRef']),
   // rename commands accept generated tab/pane ids positionally or via flags, and
   // those ids come from nanoid(), which can start with "-".
-  'rename-pane': new Set(['n', 'name', 'pane', 't', 'target', 'title']),
-  'rename-tab': new Set(['n', 'name', 't', 'tab', 'target', 'title']),
+  'rename-pane': new Set(['n', 'name', 'name-intent', 'nameIntent', 'pane', 't', 'target', 'title']),
+  'rename-tab': new Set(['n', 'name', 'name-intent', 'nameIntent', 't', 'tab', 'target', 'title']),
 }
 
 const COMMANDS_TREATING_UNKNOWN_DASH_TOKENS_AS_POSITIONALS = new Set([

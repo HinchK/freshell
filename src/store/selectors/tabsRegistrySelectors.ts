@@ -4,6 +4,10 @@ import type { RegistryTabRecord } from '@/store/tabRegistryTypes'
 import { buildOpenTabRegistryRecord } from '@/lib/tab-registry-snapshot'
 import { UNKNOWN_SERVER_INSTANCE_ID } from '@/store/tabRegistryConstants'
 import { deriveTabRecencyAt } from '@/lib/tab-recency'
+import { selectScopedTabDisplayTitles, selectSessionNameRecord } from '@/store/selectors/sessionNameSelectors'
+import { parsePaneNamingIdentityInput } from '@/lib/tab-name-source'
+import type { SessionNameRef } from '@shared/session-names'
+import type { SessionNamesState } from '@/store/sessionNamesSlice'
 
 const EMPTY_PANE_LAST_INPUT_AT: Record<string, number | undefined> = {}
 const EMPTY_REGISTRY_RECORDS: RegistryTabRecord[] = []
@@ -71,6 +75,58 @@ function sortUpdatedDesc(a: RegistryTabRecord, b: RegistryTabRecord): number {
   return b.updatedAt - a.updatedAt
 }
 
+/**
+ * Unified agent names (Task 6): refresh a snapshot record's CURRENT name —
+ * a closed/remote record's stored `tabName` is the last-known projection at
+ * capture time; the record's own `nameSource` pane payload carries the
+ * naming identity (nameRef/namingHandle/sessionRef), so the live canonical
+ * cache can overlay the session's current name and a renamed-after-close
+ * session never shows stale in the registry. Legacy/unresolvable records
+ * pass through unchanged.
+ */
+function overlayRecordCanonicalName(
+  record: RegistryTabRecord,
+  sessionNames: SessionNamesState | undefined,
+): RegistryTabRecord {
+  if (!sessionNames || record.nameSource?.kind !== 'session') return record
+  const sourcePaneId = record.nameSource.paneId
+  const payload = record.panes.find((pane) => pane.paneId === sourcePaneId)?.payload
+  if (!payload || typeof payload !== 'object') return record
+  const ref = parseRecordPaneNamingRef(payload)
+  if (!ref) return record
+  const name = selectSessionNameRecord(
+    { sessionNames } as unknown as RootState,
+    ref,
+  )?.name
+  return name && name !== record.tabName ? { ...record, tabName: name } : record
+}
+
+/** The naming ref a record pane payload carries, in resolution order: the
+ * shared pane-identity parse (nameRef, then the provisional handle), then
+ * the durable session ref fallback. */
+function parseRecordPaneNamingRef(payload: Record<string, unknown>): SessionNameRef | undefined {
+  const identity = parsePaneNamingIdentityInput(payload)
+  if (identity.nameRef) return identity.nameRef
+  if (identity.namingHandle) return { kind: 'pending', id: identity.namingHandle }
+  const sessionRef = payload.sessionRef
+  if (
+    sessionRef && typeof sessionRef === 'object'
+    && typeof (sessionRef as { provider?: unknown }).provider === 'string'
+    && ((sessionRef as { provider: string }).provider === 'claude'
+      || (sessionRef as { provider: string }).provider === 'codex'
+      || (sessionRef as { provider: string }).provider === 'opencode')
+    && typeof (sessionRef as { sessionId?: unknown }).sessionId === 'string'
+    && (sessionRef as { sessionId: string }).sessionId.length > 0
+  ) {
+    return {
+      kind: 'session',
+      provider: (sessionRef as { provider: 'claude' | 'codex' | 'opencode' }).provider,
+      sessionId: (sessionRef as { sessionId: string }).sessionId,
+    }
+  }
+  return undefined
+}
+
 function sortClosedDesc(a: RegistryTabRecord, b: RegistryTabRecord): number {
   const aClosedAt = a.closedAt ?? a.updatedAt
   const bClosedAt = b.closedAt ?? b.updatedAt
@@ -105,8 +161,8 @@ const selectClosedRetentionDays = (state: RootState) => Math.min(30, Math.max(1,
 )))
 
 export const selectLiveLocalTabRecords = createSelector(
-  [selectTabs, selectLayouts, selectPaneTitles, selectPaneLastInputAt, selectDeviceId, selectDeviceLabel, selectServerInstanceId, selectExtensionEntries],
-  (tabs, layouts, paneTitles, paneLastInputAt, deviceId, deviceLabel, serverInstanceId, extensions): RegistryTabRecord[] => {
+  [selectTabs, selectLayouts, selectPaneTitles, selectPaneLastInputAt, selectDeviceId, selectDeviceLabel, selectServerInstanceId, selectExtensionEntries, selectScopedTabDisplayTitles],
+  (tabs, layouts, paneTitles, paneLastInputAt, deviceId, deviceLabel, serverInstanceId, extensions, scopedTabTitles): RegistryTabRecord[] => {
     const records: RegistryTabRecord[] = []
     for (const tab of tabs) {
       const layout = layouts[tab.id]
@@ -116,7 +172,7 @@ export const selectLiveLocalTabRecords = createSelector(
         layout,
         paneLastInputAt,
       })
-      records.push(buildOpenTabRegistryRecord({
+      const record = buildOpenTabRegistryRecord({
         tab,
         layout,
         serverInstanceId,
@@ -126,30 +182,53 @@ export const selectLiveLocalTabRecords = createSelector(
         deviceLabel,
         revision: 0,
         updatedAt,
-      }))
+      })
+      // Unified agent names (Task 5): a session-owned local tab's registry
+      // summary shows its canonical session name (the tab keeps no
+      // independently stored name); legacy tabs keep the built title.
+      const canonicalTitle = scopedTabTitles?.[tab.id]
+      if (canonicalTitle) {
+        record.tabName = canonicalTitle
+      }
+      records.push(record)
     }
     return records.sort(sortUpdatedDesc)
   },
 )
 
 export const selectMergedClosedRecords = createSelector(
-  [selectClosed, selectLocalClosed, selectClosedRetentionDays],
-  (closed, localClosed, closedRetentionDays): RegistryTabRecord[] => {
+  [selectClosed, selectLocalClosed, selectClosedRetentionDays, (state: RootState) => state.sessionNames],
+  (closed, localClosed, closedRetentionDays, sessionNames): RegistryTabRecord[] => {
     const closedCutoff = Date.now() - closedRetentionDays * 24 * 60 * 60 * 1000
     const merged = dedupeByTabKey([
       ...(closed || []),
       ...Object.values(localClosed || {}).filter((record) => (record.closedAt ?? record.updatedAt) >= closedCutoff),
     ])
-    return merged.sort(sortClosedDesc)
+    return merged
+      .map((record) => overlayRecordCanonicalName(record, sessionNames))
+      .sort(sortClosedDesc)
   },
 )
 
 export const selectTabsRegistryGroups = createSelector(
-  [selectLiveLocalTabRecords, selectSameDeviceOpen, selectRemoteOpen, selectMergedClosedRecords],
-  (localOpen, sameDeviceOpen, remoteOpen, closed) => ({
+  [
+    selectLiveLocalTabRecords,
+    selectSameDeviceOpen,
+    selectRemoteOpen,
+    selectMergedClosedRecords,
+    (state: RootState) => state.sessionNames,
+  ],
+  (localOpen, sameDeviceOpen, remoteOpen, closed, sessionNames) => ({
     localOpen,
-    sameDeviceOpen: [...(sameDeviceOpen || [])].sort(sortUpdatedDesc),
-    remoteOpen: [...(remoteOpen || [])].sort(sortUpdatedDesc),
+    // Registry snapshot overlays (Task 6): remote and same-device OPEN
+    // records refresh their current names from the canonical cache, exactly
+    // like closed records — a session renamed elsewhere never shows stale.
+    sameDeviceOpen: [...(sameDeviceOpen || [])]
+      .map((record) => overlayRecordCanonicalName(record, sessionNames))
+      .sort(sortUpdatedDesc),
+    remoteOpen: [...(remoteOpen || [])]
+      .map((record) => overlayRecordCanonicalName(record, sessionNames))
+      .sort(sortUpdatedDesc),
     closed,
   }),
 )

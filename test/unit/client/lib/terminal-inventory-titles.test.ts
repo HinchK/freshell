@@ -58,6 +58,26 @@ describe('foldTerminalInventoryTitles', () => {
     expect(store.getState().panes.paneTitleSetByUser['tab-1']?.['pane-1']).toBeFalsy()
   })
 
+  /**
+   * Unified agent names (Task 5): a scoped coding-agent terminal pane never
+   * takes the terminal-level title pipeline's fold — its display is the
+   * canonical session name from the sessionNames cache, so an unrevisioned
+   * inventory string cannot land on it (shell panes keep the fold above).
+   */
+  it('never folds an inventory title into a scoped coding-agent terminal pane', () => {
+    const store = buildStore()
+    store.dispatch(addTab({ id: 'tab-scoped', title: 'tab-scoped' }))
+    store.dispatch(initLayout({
+      tabId: 'tab-scoped',
+      paneId: 'pane-scoped',
+      content: { kind: 'terminal', mode: 'claude', terminalId: 't-scoped', createRequestId: 'cr-scoped', status: 'running' },
+    }))
+    const n = foldTerminalInventoryTitles(store, [{ terminalId: 't-scoped', title: 'Stale inventory string' }])
+    expect(n).toBe(0)
+    expect(store.getState().panes.paneTitles['tab-scoped']?.['pane-scoped']).toBe('Claude')
+    expect(store.getState().panes.paneTitleSetByUser['tab-scoped']?.['pane-scoped']).toBeFalsy()
+  })
+
   it('never overwrites a user-set pane title (and does not count it as a fold)', () => {
     const store = buildStore()
     seedTerminalPane(store, 'tab-1', 'pane-1', 't-9')

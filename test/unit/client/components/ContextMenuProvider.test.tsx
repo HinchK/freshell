@@ -13,6 +13,7 @@ import extensionsReducer from '@/store/extensionsSlice'
 import tabRecencyReducer from '@/store/tabRecencySlice'
 import freshAgentReducer, { sessionInit } from '@/store/freshAgentSlice'
 import tabRegistryReducer, { setTabRegistrySnapshot } from '@/store/tabRegistrySlice'
+import sessionNamesReducer from '@/store/sessionNamesSlice'
 import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { registerFreshAgentTurnItems } from '@/lib/pane-action-registry'
@@ -117,7 +118,8 @@ vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => wsMocks,
 }))
 
-vi.mock('@/lib/api', () => ({
+vi.mock('@/lib/api', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/api')>()),
   api: {
     get: apiMocks.get,
     post: apiMocks.post,
@@ -128,6 +130,10 @@ vi.mock('@/lib/api', () => ({
   setSessionMetadata: apiMocks.setSessionMetadata,
   requestSessionHandoff: apiMocks.requestSessionHandoff,
 }))
+
+// The canonical rename's conflict extraction `instanceof`-checks the REAL
+// ApiError — tests that exercise the conflict lane reject with THIS class.
+const realApi = await import('@/lib/api')
 
 vi.mock('@/lib/clipboard', () => ({
   copyText: clipboardMocks.copyText,
@@ -310,6 +316,7 @@ function createStoreWithSidebarWindowAgentSession() {
       connection: connectionReducer,
       settings: settingsReducer,
       extensions: extensionsReducer,
+      sessionNames: sessionNamesReducer,
     },
     middleware: (getDefaultMiddleware) =>
       getDefaultMiddleware({ serializableCheck: false }),
@@ -399,6 +406,8 @@ function createStoreWithSidebarWindowAgentSession() {
                     cwd: '/sidebar/project',
                     createdAt: 1000,
                     updatedAt: 2000,
+                    nameRef: { kind: 'session', provider: 'claude', sessionId: VALID_SESSION_ID },
+                    sessionName: 'Sidebar Agent Session',
                   },
                 ],
               },
@@ -414,6 +423,42 @@ function createStoreWithSidebarWindowAgentSession() {
       connection: {
         status: 'ready',
         platform: null,
+      },
+    },
+  })
+}
+
+/**
+ * The live-registry shape: the sidebar can render a row (from the running
+ * terminals registry) while NO directory collection carries the session —
+ * a single-turn transcript is filtered from the directory listing
+ * (non-interactive), so the right-clicked ROW is the only identity source.
+ */
+function createStoreWithEmptyDirectoryCollections() {
+  const store = createStoreWithSidebarWindowAgentSession()
+  const state = store.getState()
+  return configureStore({
+    reducer: {
+      tabs: tabsReducer,
+      panes: panesReducer,
+      sessions: sessionsReducer,
+      connection: connectionReducer,
+      settings: settingsReducer,
+      extensions: extensionsReducer,
+      sessionNames: sessionNamesReducer,
+    },
+    middleware: (getDefaultMiddleware) =>
+      getDefaultMiddleware({ serializableCheck: false }),
+    preloadedState: {
+      ...state,
+      sessions: {
+        ...state.sessions,
+        projects: [],
+        windows: {
+          ...state.sessions.windows,
+          sidebar: { ...state.sessions.windows?.sidebar, projects: [] },
+          history: { ...state.sessions.windows?.history, projects: [] },
+        },
       },
     },
   })
@@ -2172,6 +2217,190 @@ describe('ContextMenuProvider', () => {
         sessionType: 'freshclaude',
       },
     })
+  })
+
+  it('renames a scoped session through the canonical route with user intent and folds the accepted record', async () => {
+    const user = userEvent.setup()
+    const promptSpy = vi.spyOn(window, 'prompt').mockReturnValue('Renamed canonically')
+    apiMocks.patch.mockResolvedValueOnce({
+      record: {
+        ref: { kind: 'session', provider: 'claude', sessionId: VALID_SESSION_ID },
+        name: 'Renamed canonically',
+        source: 'manual',
+        revision: 4,
+        renamedAt: 1_700_000_000_000,
+      },
+      documentGeneration: 6,
+      redirects: [],
+      changed: true,
+    })
+
+    const store = createStoreWithSidebarWindowAgentSession()
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.SidebarSession}
+            data-session-id={VALID_SESSION_ID}
+            data-provider="claude"
+            data-session-type="freshclaude"
+          >
+            Sidebar Agent Session
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Sidebar Agent Session'), keys: '[MouseRight]' })
+    await user.click(screen.getByText('Rename'))
+
+    await waitFor(() => {
+      expect(apiMocks.patch).toHaveBeenCalledWith(
+        '/api/session-names',
+        {
+          target: { kind: 'session', provider: 'claude', sessionId: VALID_SESSION_ID },
+          name: 'Renamed canonically',
+          nameIntent: 'user',
+        },
+        expect.anything(),
+      )
+    })
+    // No legacy alias-store patch rode along.
+    const legacyCalls = apiMocks.patch.mock.calls.filter(([pathArg]) => (
+      typeof pathArg === 'string' && pathArg.startsWith('/api/sessions/')
+    ))
+    expect(legacyCalls).toEqual([])
+    // The accepted record folded into the canonical cache.
+    const key = JSON.stringify(['session', 'claude', VALID_SESSION_ID])
+    await waitFor(() => {
+      expect(store.getState().sessionNames.records[key]?.name).toBe('Renamed canonically')
+    })
+    promptSpy.mockRestore()
+  })
+
+  it('renames a live scoped session row even when no directory collection has it', async () => {
+    // The sidebar renders LIVE registry rows (a running terminal's session)
+    // whose directory entry is not loaded — for a single-turn session the
+    // directory listing's parity filter excludes it (non-interactive), and
+    // for a fresh pane the registry row can exist before any directory row
+    // does. The right-clicked ROW carries the identity (sessionId +
+    // provider + sessionType); the Rename entry must proceed from THAT,
+    // not silently no-op because the directory collections miss.
+    const user = userEvent.setup()
+    const promptSpy = vi.spyOn(window, 'prompt').mockReturnValue('Renamed from the live row')
+    apiMocks.patch.mockResolvedValueOnce({
+      record: {
+        ref: { kind: 'session', provider: 'claude', sessionId: VALID_SESSION_ID },
+        name: 'Renamed from the live row',
+        source: 'manual',
+        revision: 7,
+        renamedAt: 1_700_000_000_000,
+      },
+      documentGeneration: 9,
+      redirects: [],
+      changed: true,
+    })
+
+    const store = createStoreWithEmptyDirectoryCollections()
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.SidebarSession}
+            data-session-id={VALID_SESSION_ID}
+            data-provider="claude"
+            data-session-type="freshclaude"
+          >
+            Live Agent Session
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Live Agent Session'), keys: '[MouseRight]' })
+    await user.click(screen.getByText('Rename'))
+
+    await waitFor(() => {
+        expect(apiMocks.patch).toHaveBeenCalledWith(
+        '/api/session-names',
+        {
+          target: { kind: 'session', provider: 'claude', sessionId: VALID_SESSION_ID },
+          name: 'Renamed from the live row',
+          nameIntent: 'user',
+        },
+        expect.anything(),
+      )
+    })
+    promptSpy.mockRestore()
+  })
+
+  it('folds the server-accepted winner when the scoped rename loses a revision conflict (the bare-record payload the routes really answer)', async () => {
+    // The scoped rename routes answer a lost revision race with 409 + the
+    // CURRENT record as a bare `sessionName` — not the update envelope.
+    // The provider's conflict fold must surface the WINNER into the
+    // sessionNames cache so every surface converges to the accepted name —
+    // reading the rename error's acceptedRecord (the canonical route) or
+    // the response body's sessionName (raw ApiError details), never a
+    // `.data` field the real ApiError never had.
+    const user = userEvent.setup()
+    const promptSpy = vi.spyOn(window, 'prompt').mockReturnValue('Losing rename')
+    apiMocks.patch.mockRejectedValueOnce(new realApi.ApiError(
+      409,
+      'conflict: another rename won',
+      {
+        error: 'NAME_REVISION_CONFLICT',
+        sessionName: {
+          ref: { kind: 'session', provider: 'claude', sessionId: VALID_SESSION_ID },
+          name: 'Winner from another browser',
+          source: 'manual',
+          revision: 9,
+          renamedAt: 1_700_000_000_000,
+        },
+      },
+    ))
+
+    const store = createStoreWithEmptyDirectoryCollections()
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.SidebarSession}
+            data-session-id={VALID_SESSION_ID}
+            data-provider="claude"
+            data-session-type="freshclaude"
+          >
+            Live Agent Session
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Live Agent Session'), keys: '[MouseRight]' })
+    await user.click(screen.getByText('Rename'))
+
+    await waitFor(() => {
+      const cache = store.getState().sessionNames as { records?: Record<string, { name?: string }> }
+      const winner = Object.values(cache.records ?? {}).find(
+        (r) => r.name === 'Winner from another browser',
+      )
+      expect(winner, 'the accepted winner must fold into the canonical cache').toBeTruthy()
+    })
+    promptSpy.mockRestore()
   })
 
   it('uses the history session window for history-session actions even when sidebar has a conflicting session snapshot', async () => {

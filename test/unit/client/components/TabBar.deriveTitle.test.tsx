@@ -8,6 +8,7 @@ import panesReducer from '../../../../src/store/panesSlice'
 import connectionReducer from '../../../../src/store/connectionSlice'
 import settingsReducer, { defaultSettings } from '../../../../src/store/settingsSlice'
 import extensionsReducer from '../../../../src/store/extensionsSlice'
+import sessionNamesReducer, { receiveSessionNames } from '../../../../src/store/sessionNamesSlice'
 import type { ClientExtensionEntry } from '../../../../shared/extension-types'
 
 const defaultCliExtensions: ClientExtensionEntry[] = [
@@ -76,7 +77,7 @@ describe('TabBar tab title derivation', () => {
     cleanup()
   })
 
-  it('displays user-set title when titleSetByUser is true', () => {
+  it('displays user-set title when titleSetByUser is true (out-of-scope shell pane)', () => {
     const store = createStore(
       {
         tabs: [
@@ -100,7 +101,7 @@ describe('TabBar tab title derivation', () => {
             id: 'pane-1',
             content: {
               kind: 'terminal',
-              mode: 'claude',
+              mode: 'shell',
               createRequestId: 'req-1',
               status: 'running',
             },
@@ -116,9 +117,78 @@ describe('TabBar tab title derivation', () => {
       </Provider>
     )
 
-    // Should show user's custom title, not derived "Claude CLI"
+    // Should show user's custom title (legacy tabs keep the stored title)
     expect(screen.getByText('My Custom Title')).toBeInTheDocument()
-    expect(screen.queryByText('Claude CLI')).not.toBeInTheDocument()
+  })
+
+  /**
+   * Unified agent names (Task 5): a scoped single-pane coding-agent tab has
+   * no separately stored name — its display is its source pane's canonical
+   * session name, and the old user-set tab flag can NEVER override a cached
+   * canonical record.
+   */
+  it('a scoped session-owned tab displays the canonical name over the old sticky tab flag', () => {
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        connection: connectionReducer,
+        settings: settingsReducer,
+        extensions: extensionsReducer,
+        sessionNames: sessionNamesReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [
+            {
+              id: 'tab-1',
+              createRequestId: 'tab-1',
+              title: 'Old sticky title',
+              titleSetByUser: true,
+              status: 'running',
+              mode: 'claude',
+              shell: 'system',
+              createdAt: Date.now(),
+            },
+          ],
+          activeTabId: 'tab-1',
+        },
+        panes: {
+          layouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'terminal',
+                mode: 'claude',
+                createRequestId: 'req-1',
+                status: 'running',
+                sessionRef: { provider: 'claude', sessionId: 'scoped-tab-sess' },
+              },
+            },
+          },
+          activePane: { 'tab-1': 'pane-1' },
+        },
+        extensions: { entries: defaultCliExtensions },
+        connection: { status: 'connected', error: null, reconnectAttempts: 0 },
+        settings: { settings: defaultSettings, loaded: true },
+      },
+    })
+    store.dispatch(receiveSessionNames([{
+      record: { ref: { kind: 'session', provider: 'claude', sessionId: 'scoped-tab-sess' }, name: 'Canonical tab name', source: 'freshell_ai', revision: 1 },
+      documentGeneration: 10,
+      redirects: [],
+      changed: true,
+    }]))
+
+    render(
+      <Provider store={store}>
+        <TabBar />
+      </Provider>
+    )
+
+    expect(screen.getByText('Canonical tab name')).toBeInTheDocument()
+    expect(screen.queryByText('Old sticky title')).not.toBeInTheDocument()
   })
 
   it('derives title from CLI pane when titleSetByUser is false', () => {

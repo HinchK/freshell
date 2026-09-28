@@ -11,6 +11,7 @@ import {
 import { nanoid } from 'nanoid'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import type { PaneReconcileRequest } from '@shared/ws-protocol'
+import { isUnifiedAgentMode } from '@shared/session-names'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import type { AppStore } from '@/store/store'
 import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
@@ -21,7 +22,7 @@ import { createLogger } from '@/lib/client-logger'
 import { api, getFreshAgentModelCapabilities, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
 import { clearReconcilePendingPane, consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
 import { FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE } from '@/lib/fresh-agent-model-capabilities'
-import { clearPendingCreateFailure, clearRestoreFailure, clearSessionError, clearSessionLost, sessionError, setSessionStatus } from '@/store/freshAgentSlice'
+import { applyRefusalFence, clearPendingCreateFailure, clearRestoreFailure, clearSessionError, clearSessionLost, sessionError, setSessionStatus } from '@/store/freshAgentSlice'
 import { openSessionTab } from '@/store/tabsSlice'
 import { buildReconcileRequestForPanes, foldVerdicts, isFreshAgentReconcileActive } from '@/lib/pane-reconcile'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
@@ -462,6 +463,37 @@ function isLostFreshOpencodeThreadError(error: unknown): boolean {
   return status === 404 && code === 'FRESH_AGENT_LOST_SESSION'
 }
 
+// LB-05 scoping: fresh-agent owners are the 2026-09-20 incident class (the
+// pane's OWN stale-claim refusal — the daemon died while the session key
+// stayed Live{FreshAgent}) and the fenced attach proceeds for them. Terminal
+// owners are a different scenario (a genuinely terminal-owned session); their
+// recovery door is the session-directory handoff, so the client does not
+// attempt the (refused) attach for them.
+function isRestoreUnavailableSnapshotError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false
+  const status = 'status' in error ? (error as { status?: unknown }).status : undefined
+  const details = 'details' in error ? (error as { details?: unknown }).details : undefined
+  const code = details && typeof details === 'object' && 'code' in details
+    ? (details as { code?: unknown }).code
+    : undefined
+  const ownerKind = details && typeof details === 'object' && 'ownerKind' in details
+    ? (details as { ownerKind?: unknown }).ownerKind
+    : undefined
+  return status === 409 && code === 'RESTORE_UNAVAILABLE' && ownerKind === 'fresh-agent'
+}
+
+// The 409 refusal always names its fence-relevant generation; a malformed
+// envelope without one cannot fence the recovery attach, so the caller skips
+// the recovery (the honest error surfaces below take it) instead of sending an
+// attach bound to a stale or absent generation.
+function readRestoreRefusalOwnerGeneration(error: unknown): number | undefined {
+  if (!error || typeof error !== 'object' || !('details' in error)) return undefined
+  const details = (error as { details?: unknown }).details
+  if (!details || typeof details !== 'object' || !('ownerGeneration' in details)) return undefined
+  const ownerGeneration = (details as { ownerGeneration?: unknown }).ownerGeneration
+  return typeof ownerGeneration === 'number' ? ownerGeneration : undefined
+}
+
 function getRestoreErrorMessage(reason: RestoreErrorReason): string {
   switch (reason) {
     case 'invalid_legacy_restore_target':
@@ -802,6 +834,13 @@ export function FreshAgentView({
   const revealRefreshRetryTimerRef = useRef<number | null>(null)
   const snapshotRefreshSerialRef = useRef(0)
   const [snapshotRevealError, setSnapshotRevealError] = useState<string | null>(null)
+  // 2026-09-20 incident (Task 5): the once-per-identity 409 RESTORE_UNAVAILABLE
+  // recovery latch. The ENTIRE recovery (fenced attach + refetch) runs at most
+  // once per pane identity (`${createRequestId}:${snapshotThreadId}`); a second
+  // 409 falls through to the honest error surfaces, never re-fetching. A
+  // suppressed attach restores the previous value so it does NOT consume the
+  // latch.
+  const restoreUnavailableRecoveryRef = useRef<string | null>(null)
   // Non-null while the snapshot key is rate-limited (429/backoff): the last
   // good snapshot stays visible and a single retry is armed at expiry.
   // Task 17 also consumes this for the snapshot `trigger` query param.
@@ -1408,8 +1447,13 @@ export function FreshAgentView({
     previousSessionId: string | undefined,
     nextSessionId: string | undefined,
     provider: string,
+    sessionType?: string,
   ) => {
     if (!previousSessionId || !nextSessionId || previousSessionId === nextSessionId) return
+    // Unified agent names (Task 5): scoped fresh types never ran the local
+    // pending-title machinery (sendUserText skips it), so there is nothing to
+    // migrate — kilroy keeps the legacy behavior.
+    if (isUnifiedAgentMode(provider, sessionType)) return
     const firstMessage = pendingAutoTitleBySessionIdRef.current.get(previousSessionId)
     if (!firstMessage) return
     pendingAutoTitleBySessionIdRef.current.delete(previousSessionId)
@@ -1417,6 +1461,7 @@ export function FreshAgentView({
       tabId,
       paneId,
       provider,
+      sessionType,
       sessionId: nextSessionId,
       firstMessage,
     }))
@@ -1488,6 +1533,17 @@ export function FreshAgentView({
   ])
 
   const buildCreateMessage = useCallback((content: FreshAgentPaneContent, observedFence?: ObservedOwnerFence) => {
+    // Unified agent names (T6-R3 sender repair): a NEW scoped fresh
+    // conversation carries its pre-durable namingHandle on the create —
+    // minted before the send and persisted in the pane content, so the
+    // pane's rename capture resolves the PENDING record while no durable
+    // identity exists, and create retries re-send the SAME handle. A
+    // resume/switch create (a sessionRef) targets the durable record and
+    // deliberately sends no handle.
+    const namingHandle = !content.sessionRef && !content.resumeSessionId
+      && isUnifiedAgentMode(undefined, content.sessionType)
+      ? content.namingHandle ?? `nh-${nanoid()}`
+      : undefined
     return {
       type: 'freshAgent.create',
       requestId: content.createRequestId,
@@ -1504,6 +1560,7 @@ export function FreshAgentView({
       // D8 (restore-open-sessions-only): the server composes the ledger row's
       // tabKey as `deviceId:tabId` from the connection identity + this field.
       tabId,
+      ...(namingHandle ? { namingHandle } : {}),
       // kata b8ke delayed-request fence (round-2 review: the fence is the
       // (epoch, generation) PAIR from the runtime-owner record observed when
       // the create was decided). A pair sent together is the fence;
@@ -1581,6 +1638,12 @@ export function FreshAgentView({
           createError: undefined,
           status: 'creating',
           pendingLocalEcho: undefined,
+          // Unified agent names: a deliberate NEW conversation never
+          // inherits the previous conversation's pre-durable identity or
+          // canonical projection — the new conversation mints its own
+          // handle and gets its own name lifecycle.
+          namingHandle: undefined,
+          nameRef: undefined,
         },
       }))
     })()
@@ -1753,7 +1816,17 @@ export function FreshAgentView({
           sessionRef: current.sessionRef,
           cwd: current.initialCwd,
         })
-        sendFreshAgentMessage(buildCreateMessage(current, observedFence))
+        const createMessage = buildCreateMessage(current, observedFence)
+        if (createMessage.namingHandle && !current.namingHandle) {
+          // T6-R3 sender repair: persist the minted pre-durable handle BEFORE
+          // the send so create retries re-send the SAME handle.
+          dispatch(updatePaneContent({
+            tabId,
+            paneId,
+            content: { ...current, namingHandle: createMessage.namingHandle },
+          }))
+        }
+        sendFreshAgentMessage(createMessage)
       }
     }
 
@@ -2011,7 +2084,17 @@ export function FreshAgentView({
         releasePendingRebind()
         pendingRebindReleaseRef.current = release
       }
-      sendFreshAgentMessage(buildCreateMessage(current, observedFence))
+      const createMessage = buildCreateMessage(current, observedFence)
+      if (createMessage.namingHandle && !current.namingHandle) {
+        // T6-R3 sender repair: persist the minted pre-durable handle BEFORE
+        // the send so create retries re-send the SAME handle.
+        dispatch(updatePaneContent({
+          tabId,
+          paneId,
+          content: { ...current, namingHandle: createMessage.namingHandle },
+        }))
+      }
+      sendFreshAgentMessage(createMessage)
     }
     if (hiddenRef.current) {
       getRebindQueue().enqueue({
@@ -2298,7 +2381,7 @@ export function FreshAgentView({
           sessionType: message.sessionType,
           sessionRef,
         })
-        migratePendingAutoTitle(current.sessionId, message.sessionId, message.provider)
+        migratePendingAutoTitle(current.sessionId, message.sessionId, message.provider, message.sessionType)
         requestSnapshotRefresh('materialized')
         dispatch(updatePaneContent({
           tabId,
@@ -2684,7 +2767,7 @@ export function FreshAgentView({
       const nextSessionRef = snapshotSessionRef ?? fresh.sessionRef
       const nextResumeSessionId = snapshotSessionRef?.sessionId ?? fresh.resumeSessionId ?? sessionId
       if (snapshotSessionRef) {
-        migratePendingAutoTitle(fresh.sessionId, snapshotSessionRef.sessionId, provider)
+        migratePendingAutoTitle(fresh.sessionId, snapshotSessionRef.sessionId, provider, requestSessionType)
       }
       const hasBlockingLocalEchoForSession = hasUnresolvedLocalEchoForSessionRef.current
       const sessionStatus = nextStatus === 'create-failed' ? null : nextStatus
@@ -2818,6 +2901,69 @@ export function FreshAgentView({
         }))
         return
       }
+      // 2026-09-20 incident: with the daemon dead, daemon-absent snapshot GETs
+      // answer the typed 409 RESTORE_UNAVAILABLE for as long as the session
+      // key stays Live{FreshAgent}. The documented recovery is the
+      // generation-fenced attach (a map-hit freshAgent.attach respawns the
+      // daemon and re-bridges server-side) — drive it ONCE per pane identity,
+      // then refetch. Repeated 409s fall through to the honest error surfaces
+      // below; never reset the pane (that is the 404 lost-thread arm above).
+      if (paneContent.provider === 'opencode' && isRestoreUnavailableSnapshotError(error)) {
+        const fresh = paneContentRef.current
+        const recoveryKey = `${fresh.createRequestId}:${sessionId}`
+        const refusalOwnerGeneration = readRestoreRefusalOwnerGeneration(error)
+        if (
+          refusalOwnerGeneration !== undefined
+          && restoreUnavailableRecoveryRef.current !== recoveryKey
+        ) {
+          const previousRecoveryKey = restoreUnavailableRecoveryRef.current
+          restoreUnavailableRecoveryRef.current = recoveryKey
+          // Bind the fence to the 409's CURRENT generation — refresh the
+          // observed owner fence from the refusal itself (the refusal names
+          // the coordinator's live generation; the record's epoch is
+          // preserved). Without this, a stale owner record sends a
+          // stale-generation attach the wired server refuses with
+          // FENCE_REQUIRED — preserving the dead-end. The fold keys the
+          // CANONICAL session (Task 5 review M2): the recovery attach's
+          // fence read resolves the stored aliasOf chain, so a pane holding
+          // a superseded id must fold onto the same record the attach reads
+          // — the raw pane id would land on the inert alias mirror.
+          const canonicalSession = resolveCanonicalPaneSession(appStore.getState(), fresh)
+          dispatch(applyRefusalFence({
+            provider: canonicalSession?.provider ?? fresh.provider,
+            sessionId: canonicalSession?.sessionId ?? sessionId,
+            ownerKind: 'fresh-agent',
+            ownerGeneration: refusalOwnerGeneration,
+          }))
+          attachDecisionSerialRef.current += 1
+          const attempt = captureFreshAgentAttachmentAttempt(fresh)
+          if (sendFencedFreshAgentAttach(attempt)) {
+            // LB-04: a reveal-lane 409 with snapshotDirty set must refetch
+            // through the reveal path ('reveal' trigger), or the success-path
+            // reveal-dirty clear never runs and the pane hides behind the
+            // "Refreshing conversation" overlay forever. Otherwise refetch
+            // via 'manual'.
+            if (trigger === 'reveal' && snapshotDirtyRef.current) {
+              revealRefreshStartedAtRef.current = null
+              setSnapshotRevealError(null)
+              requestRevealRefresh(true)
+            } else {
+              setLoadError(null)
+              requestSnapshotRefresh('manual')
+            }
+            return
+          }
+          // The attach was suppressed (lifecycle superseded or attempt-key
+          // mismatch). Do NOT consume the one-shot recovery and do NOT
+          // refetch — restore the latch and fall through to the honest error
+          // surfaces below.
+          restoreUnavailableRecoveryRef.current = previousRecoveryKey
+        }
+        // Recovery already attempted for this identity (or the refusal
+        // carried no fenceable generation): do NOT clear errors and do NOT
+        // refetch again — fall through to the reveal error arm /
+        // setLoadError below so the user sees the honest state.
+      }
       if (trigger === 'reveal' && snapshotDirtyRef.current) {
         revealRefreshStartedAtRef.current = null
         setSnapshotRevealError(error instanceof Error ? error.message : 'Failed to refresh conversation')
@@ -2879,6 +3025,7 @@ export function FreshAgentView({
     // paneContentRef.current inside the effect.
   }, [
     agentSession?.lost,
+    captureFreshAgentAttachmentAttempt,
     claudeSession,
     isRestoring,
     dispatch,
@@ -2891,6 +3038,7 @@ export function FreshAgentView({
     migratePendingAutoTitle,
     requestRevealRefresh,
     requestSnapshotRefresh,
+    sendFencedFreshAgentAttach,
     setLocalEcho,
     snapshotThreadId,
     snapshotRefreshNonce,
@@ -3168,14 +3316,23 @@ export function FreshAgentView({
     if (isFirstMessage) {
       autoTitleFreshBoundaryRef.current = false
       autoTitleSentRef.current = true
-      pendingAutoTitleBySessionIdRef.current.set(current.sessionId, text)
-      dispatch(finalizeCodingAgentSessionName({
-        tabId,
-        paneId,
-        provider: current.provider,
-        sessionId: current.sessionId,
-        firstMessage: text,
-      }))
+      // Unified agent names (Task 5): scoped fresh types (freshclaude,
+      // freshcodex, freshopencode) never trigger client-side generation —
+      // the server's input-activity pipeline owns their fallback and AI
+      // naming, and the accepted name arrives through the canonical
+      // session.name.updated push. Kilroy keeps the legacy first-message
+      // finalize.
+      if (!isUnifiedAgentMode(current.provider, current.sessionType)) {
+        pendingAutoTitleBySessionIdRef.current.set(current.sessionId, text)
+        dispatch(finalizeCodingAgentSessionName({
+          tabId,
+          paneId,
+          provider: current.provider,
+          sessionType: current.sessionType,
+          sessionId: current.sessionId,
+          firstMessage: text,
+        }))
+      }
     }
     const nextLocalEcho: LocalEcho = {
       text,

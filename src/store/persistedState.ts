@@ -14,6 +14,12 @@ import {
 } from '@shared/session-contract'
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState } from '@shared/fresh-agent'
+import { TabNameSourceSchema } from '@shared/session-names'
+import { parsePaneNamingIdentityInput } from '@/lib/tab-name-source'
+import {
+  stripScopedPaneTitleMetadata,
+  stripSessionOwnedTabFreezeFlags,
+} from '@/lib/session-name-migration'
 import { normalizeFreshAgentPaneModelSelection } from './paneTypes'
 import { createLogger } from '@/lib/client-logger'
 import { isValidMachineIdStamp } from '@/lib/machine-identity'
@@ -184,6 +190,7 @@ function normalizePersistedTab(tab: Record<string, unknown>): PersistedTab {
     sessionRef: _legacySessionRef,
     codingCliSessionId: _codingCliSessionId,
     claudeSessionId: _claudeSessionId,
+    nameSource: _unvalidatedNameSource,
     ...rest
   } = tab
 
@@ -191,6 +198,11 @@ function normalizePersistedTab(tab: Record<string, unknown>): PersistedTab {
     ...rest,
     ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
     ...(codexDurability ? { codexDurability } : {}),
+    // Unified agent names (Task 6): a valid tab nameSource survives the
+    // persisted parse; a malformed one drops (never a corrupt relationship).
+    ...(TabNameSourceSchema.safeParse(tab.nameSource).success
+      ? { nameSource: tab.nameSource }
+      : {}),
   } as PersistedTab
 }
 
@@ -208,7 +220,7 @@ export function parsePersistedTabsRaw(raw: string): ParsedPersistedTabs | null {
   const version = typeof res.data.version === 'number' ? res.data.version : 0
   if (version > TABS_SCHEMA_VERSION) return null
 
-  return {
+  return sanitizeParsedTabsHalf({
     version,
     tabs: {
       ...res.data.tabs,
@@ -216,7 +228,42 @@ export function parsePersistedTabsRaw(raw: string): ParsedPersistedTabs | null {
       tabs: salvageTabs(res.data.tabs.tabs),
     },
     tombstones: res.data.tombstones || [],
+  })
+}
+
+/**
+ * Unified agent names (Task 7): the persisted-parse gate for the ONE client
+ * sanitizer — a scoped agent pane's local title/user-flag and a
+ * session-owned tab's freeze flag are retired legacy aliases (the canonical
+ * server record owns those names); identity, source pointers and canonical
+ * title projections survive. Applied at every parse exit so every hydrate
+ * path (slice initial loads, crossTabSync, boot loaders, recovery) consumes
+ * sanitized metadata. The tabs half needs only each tab's own nameSource
+ * (a session-owned tab is one whose pointer exists).
+ */
+function sanitizeParsedTabsHalf(parsed: ParsedPersistedTabs): ParsedPersistedTabs {
+  return {
+    ...parsed,
+    tabs: {
+      ...parsed.tabs,
+      tabs: stripSessionOwnedTabFreezeFlags(parsed.tabs.tabs),
+    },
   }
+}
+
+function sanitizeParsedPanesHalf(parsed: {
+  version: number
+  layouts: Record<string, unknown>
+  activePane: Record<string, string>
+  paneTitles: Record<string, Record<string, string>>
+  paneTitleSetByUser: Record<string, Record<string, boolean>>
+}): ParsedPersistedPanes {
+  const { paneTitles, paneTitleSetByUser } = stripScopedPaneTitleMetadata(
+    parsed.layouts,
+    parsed.paneTitles,
+    parsed.paneTitleSetByUser,
+  )
+  return { ...parsed, paneTitles, paneTitleSetByUser }
 }
 
 const zPaneTitles = z.record(z.string(), z.record(z.string(), z.string()))
@@ -238,6 +285,23 @@ export type ParsedPersistedPanes = {
   activePane: Record<string, string>
   paneTitles: Record<string, Record<string, string>>
   paneTitleSetByUser: Record<string, Record<string, boolean>>
+}
+
+/**
+ * Unified agent names (Task 6): validate a persisted pane content's naming
+ * identity — the SHARED parse point (`parsePaneNamingIdentityInput`) keeps
+ * only a schema-valid `nameRef` and a non-empty `namingHandle`; malformed
+ * values drop so a corrupt persisted/hydrated identity never enters pane
+ * content (the transient runtime id strip elsewhere never touches these
+ * fields).
+ */
+function sanitizePaneNamingIdentity(content: Record<string, unknown>): Record<string, unknown> {
+  if (content.kind !== 'terminal' && content.kind !== 'fresh-agent') return content
+  const { nameRef: _nameRef, namingHandle: _namingHandle, ...rest } = content
+  return {
+    ...rest,
+    ...parsePaneNamingIdentityInput(content),
+  }
 }
 
 function normalizeTerminalContent(content: Record<string, unknown>): Record<string, unknown> {
@@ -361,9 +425,9 @@ function normalizePersistedNode(node: unknown): unknown {
     const content = migrateLegacyFreshAgentContent(candidate.content as Record<string, unknown>) as Record<string, unknown>
     let nextContent = content
     if (content.kind === 'terminal') {
-      nextContent = normalizeTerminalContent(content)
+      nextContent = sanitizePaneNamingIdentity(normalizeTerminalContent(content))
     } else if (content.kind === 'fresh-agent') {
-      nextContent = normalizeFreshAgentContent(content)
+      nextContent = sanitizePaneNamingIdentity(normalizeFreshAgentContent(content))
     } else if ('sessionRef' in content) {
       const sanitizedSessionRef = sanitizeSessionRef(content.sessionRef)
       const { sessionRef: _legacySessionRef, ...rest } = content
@@ -412,13 +476,13 @@ export function parsePersistedPanesRaw(raw: string): ParsedPersistedPanes | null
   if (version < 1) version = 1
   if (version > PANES_SCHEMA_VERSION) return null
 
-  return {
+  return sanitizeParsedPanesHalf({
     version,
     layouts: normalizePersistedLayouts((res.data.layouts || {}) as Record<string, unknown>),
     activePane: (res.data.activePane || {}) as Record<string, string>,
     paneTitles: (res.data.paneTitles || {}) as Record<string, Record<string, string>>,
     paneTitleSetByUser: (res.data.paneTitleSetByUser || {}) as Record<string, Record<string, boolean>>,
-  }
+  })
 }
 
 // --- Combined layout key (v4) ---
@@ -586,20 +650,21 @@ export function parsePersistedLayoutRaw(raw: string): ParsedPersistedLayout | nu
   let panesVersion = typeof panes.version === 'number' ? panes.version : 1
   if (panesVersion < 1) panesVersion = 1
 
+  const sanitizedPanes = sanitizeParsedPanesHalf({
+    version: Math.max(panesVersion, PANES_SCHEMA_VERSION),
+    layouts: normalizePersistedLayouts((panes.layouts || {}) as Record<string, unknown>),
+    activePane: (panes.activePane || {}) as Record<string, string>,
+    paneTitles: (panes.paneTitles || {}) as Record<string, Record<string, string>>,
+    paneTitleSetByUser: (panes.paneTitleSetByUser || {}) as Record<string, Record<string, boolean>>,
+  })
   return {
     version: Math.max(structural.version, LAYOUT_SCHEMA_VERSION),
     tabs: {
       ...structural.tabs,
       activeTabId: structural.tabs.activeTabId ?? null,
-      tabs: salvageTabs(structural.tabs.tabs),
+      tabs: stripSessionOwnedTabFreezeFlags(salvageTabs(structural.tabs.tabs)),
     },
-    panes: {
-      version: Math.max(panesVersion, PANES_SCHEMA_VERSION),
-      layouts: normalizePersistedLayouts((panes.layouts || {}) as Record<string, unknown>),
-      activePane: (panes.activePane || {}) as Record<string, string>,
-      paneTitles: (panes.paneTitles || {}) as Record<string, Record<string, string>>,
-      paneTitleSetByUser: (panes.paneTitleSetByUser || {}) as Record<string, Record<string, boolean>>,
-    },
+    panes: sanitizedPanes,
     tombstones: structural.tombstones || [],
     persistedAt: typeof (structural as any).persistedAt === 'number' ? (structural as any).persistedAt : undefined,
     machineId: typeof (structural as any).machineId === 'string' ? (structural as any).machineId : undefined,

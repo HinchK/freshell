@@ -761,6 +761,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         sink.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "codex".into(),
             session_id: "t1".into(),
             mode: "freshcodex".into(),
@@ -860,6 +861,7 @@ mod tests {
         );
         // The identity lanes keep their silent-degrade policy on a disabled store.
         sink.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "claude".into(),
             session_id: "s".into(),
             mode: "freshclaude".into(),
@@ -908,6 +910,7 @@ mod tests {
             cwd: Some("/w".into()),
         };
         sink.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "claude".into(),
             session_id: "fork-new-uuid".into(),
             mode: "freshclaude".into(),
@@ -934,6 +937,7 @@ mod tests {
         );
 
         sink.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "codex".into(),
             session_id: "new-thread".into(),
             mode: "freshcodex".into(),
@@ -978,6 +982,7 @@ mod tests {
 
         // The pre-handoff fresh-agent row (the old owner's pair: gen 3).
         sink.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: SESSION.into(),
             mode: "freshopencode".into(),
@@ -1000,6 +1005,7 @@ mod tests {
         // The handoff target's binding write carries the SUPPLIED handoff
         // pair (the new owner: gen 4) — the row's fence baseline advances.
         sink.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: SESSION.into(),
             mode: "freshopencode".into(),
@@ -1023,6 +1029,7 @@ mod tests {
         // upsert, carrying its PRE-handoff pair) — refused typed.
         let err = sink
             .record_binding(FreshAgentBindingUpsert {
+                name_transition: None,
                 provider: "opencode".into(),
                 session_id: SESSION.into(),
                 mode: "freshopencode".into(),
@@ -1078,6 +1085,7 @@ mod tests {
 
         // The pre-handoff fresh-agent row (the old owner's pair: gen 3).
         sink.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: SESSION.into(),
             mode: "freshopencode".into(),
@@ -1117,6 +1125,7 @@ mod tests {
         // carrying its OBSERVED pre-handoff pair) — refused typed.
         let err = sink
             .record_binding(FreshAgentBindingUpsert {
+                name_transition: None,
                 provider: "opencode".into(),
                 session_id: SESSION.into(),
                 mode: "freshopencode".into(),
@@ -1227,6 +1236,7 @@ mod tests {
             authoritative: bool,
         ) -> FreshAgentBindingUpsert {
             FreshAgentBindingUpsert {
+                name_transition: None,
                 provider: "claude".into(),
                 session_id: SID.into(),
                 mode: "freshclaude".into(),
@@ -1972,6 +1982,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         sink.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_prov".into(),
             mode: "freshopencode".into(),
@@ -2018,6 +2029,7 @@ mod tests {
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         let asserted = now_ms() - 30_000; // "provenance captured 30s before the write"
         sink.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_late".into(),
             mode: "freshopencode".into(),
@@ -2077,6 +2089,7 @@ mod tests {
 
         // A stamped LINEAGE-ONLY row (blank settings) answers its stamps.
         sink.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_prov".into(),
             mode: "freshopencode".into(),
@@ -2109,6 +2122,7 @@ mod tests {
         // A conn-less refresh (all-`None` stamps) keeps them — the REAL
         // ledger's `Inherit` preserve, end to end.
         sink.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_prov".into(),
             mode: "freshopencode".into(),
@@ -2131,6 +2145,7 @@ mod tests {
 
         // A genuinely unattributed row answers None — never Some(default).
         sink.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_unstamped".into(),
             mode: "freshopencode".into(),
@@ -2196,6 +2211,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         let upsert = |provenance: freshell_freshagent::ProvenanceUpdate| FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_clr".into(),
             mode: "freshopencode".into(),
@@ -2254,6 +2270,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         sink.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_lookup".into(),
             mode: "freshopencode".into(),
@@ -2299,6 +2316,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         sink.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "claude".into(),
             session_id: "ses-to-kill".into(),
             mode: "freshclaude".into(),
@@ -2388,6 +2406,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         let bind = |id: &str, cr: &str| FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: id.into(),
             mode: "freshopencode".into(),
@@ -2513,6 +2532,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger, None);
         sink.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "claude".into(),
             session_id: "ses-rb".into(),
             mode: "freshclaude".into(),
@@ -2562,6 +2582,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         sink.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "claude".into(),
             session_id: "ses-comp".into(),
             mode: "freshclaude".into(),
@@ -2628,6 +2649,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         sink.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "claude".into(),
             session_id: "d-alias".into(),
             mode: "freshclaude".into(),
@@ -2725,6 +2747,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         let upsert = |session_id: &str| FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "claude".into(),
             session_id: session_id.into(),
             mode: "freshclaude".into(),
@@ -2820,6 +2843,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         let upsert = |session_id: &str| FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "claude".into(),
             session_id: session_id.into(),
             mode: "freshclaude".into(),
@@ -2944,6 +2968,7 @@ mod tests {
         )));
         let sink = LedgerIdentitySink::new(ledger.clone(), None);
         sink.record_binding(FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "opencode".into(),
             session_id: "ses_lineage".into(),
             mode: "freshopencode".into(),

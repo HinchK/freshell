@@ -1,4 +1,13 @@
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, vi, beforeEach } from 'vitest'
+
+const apiMocks = vi.hoisted(() => ({ post: vi.fn() }))
+// The rebind bootstrap read rides the real retry wrapper; the mock keeps it
+// a passthrough (the fixtures never 429).
+vi.mock('@/lib/api', () => ({
+  with429Retry: async (attempt: () => Promise<unknown>) => attempt(),
+  api: { post: apiMocks.post },
+}))
+
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
 import { reconcileTerminalSessionRefByTerminalId } from '@/store/panesSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
@@ -485,5 +494,48 @@ describe('canonical activity fold on accepted rebind (previousSessionId)', () =>
     expect(result).toBe('reconciled')
     expect(harness.state.sessionActivity.sessions['codex:child-1']).toBeUndefined()
     expect(harness.state.sessionActivity.sessions['codex:parent-1']).toBe(1111)
+  })
+})
+
+describe('unified agent names (Task 5): rebind fetches the new session record', () => {
+  beforeEach(() => {
+    apiMocks.post.mockReset()
+    apiMocks.post.mockResolvedValue({ names: [] })
+  })
+
+  it('an accepted rebind bootstraps the new session canonical record (fold by revision)', async () => {
+    const { dispatch, getState } = makeStateWithTerminalPane({
+      terminalId: 't-1',
+      sessionRef: { provider: 'codex', sessionId: 'old-session' },
+    })
+    const update = {
+      record: { ref: { kind: 'session', provider: 'codex', sessionId: 'new-session' }, name: 'Forked name', source: 'freshell_ai', revision: 2 },
+      documentGeneration: 12,
+      redirects: [],
+      changed: true,
+    }
+    apiMocks.post.mockResolvedValue({ names: [update] })
+
+    const result = reconcileTerminalSessionAssociation({
+      dispatch,
+      getState,
+      terminalId: 't-1',
+      sessionRef: { provider: 'codex', sessionId: 'new-session' },
+      previousSessionId: 'old-session',
+    })
+
+    expect(result).toBe('reconciled')
+    // The naming bootstrap read carries ONLY the new session's ref.
+    await vi.waitFor(() => {
+      expect(apiMocks.post).toHaveBeenCalledWith(
+        '/api/session-names/read',
+        { refs: [{ kind: 'session', provider: 'codex', sessionId: 'new-session' }] },
+        expect.anything(),
+      )
+    })
+    // The returned update folds into the canonical cache on delivery.
+    await vi.waitFor(() => {
+      expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ type: 'sessionNames/receiveSessionNames' }))
+    })
   })
 })

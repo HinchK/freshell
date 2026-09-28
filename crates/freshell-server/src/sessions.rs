@@ -72,10 +72,23 @@ pub struct SessionsState {
     /// Trait-injected Gemini transport (same seam as
     /// `AutoTitleSweepState.gemini`) so tests fake the wire -- no live calls.
     pub gemini: Arc<dyn crate::ai_title::GeminiTransport>,
+    /// Delta-review round 4, finding 1: the SESSION-06 metadata store —
+    /// the per-session `sessionType` tags the shared kilroy-lane seam
+    /// (`crate::kilroy_lane`) reads to decide whether a provider-claude
+    /// title request belongs to a KILROY-ONLY session (which keeps this
+    /// route's legacy override ladder) or to a scoped coding-agent session
+    /// (which renames through the naming authority). The same store the
+    /// sweep and the directory read; `get_all()` is a cached read.
+    pub metadata: crate::session_metadata::SessionMetadataStore,
     /// The shared session index, consulted ONLY for the provider-generated
     /// short-circuit (`sessions-router.ts:186-192`). `None` when no provider
     /// home resolves (the same `Option` main.rs threads everywhere else).
     pub index: Option<Arc<freshell_sessions::directory_index::SessionIndex>>,
+    /// Unified agent names (Task 4): the shared generation participant, so
+    /// the SCOPED compatibility path of `generate-title` can wake the
+    /// worker's already-eligible unattempted work (never rearm it). `None`
+    /// degrades the wake to the worker's ordinary poll.
+    pub generation_wake: Option<Arc<crate::session_name_generation::SessionNameGenerator>>,
 }
 
 /// The sessions sub-router (`PATCH`/`DELETE /api/sessions/:id` + `POST .../generate-title`).
@@ -145,6 +158,63 @@ async fn patch_session(
             .into_response();
     }
     let key = composite_key(&raw_id, &provider_of(&q));
+
+    // Unified agent names (Task 2): a scoped provider's title rename routes
+    // to the ONE naming authority — the settings override store never
+    // acquires a competing scoped title. The scoped provider/session is
+    // taken from the composite id when one was passed (its prefix is the
+    // real provider; `provider_of`'s claude default must never retarget an
+    // opencode/codex composite), else from the query. A scoped null/reset
+    // is refused absolutely (NAME_RESET_UNSUPPORTED); the unwired-authority
+    // case fails unavailable. Non-title fields in the same request still
+    // patch through the legacy store.
+    let (scoped_provider, scoped_session_id) = match raw_id.split_once(':') {
+        Some((prefix, rest)) => (prefix.to_string(), rest.to_string()),
+        None => (provider_of(&q), raw_id.clone()),
+    };
+    if body.get("titleOverride").is_some() {
+        if let Some(named) =
+            freshell_freshagent::naming::named_provider_for(Some(&scoped_provider), None)
+        {
+            // Delta-review round 4, finding 1: the shared kilroy-lane seam.
+            // Kilroy sessions are provider `claude` — the provider string
+            // alone must never route them into the naming authority. A
+            // KILROY-ONLY session (metadata-typed kilroy, no canonical
+            // record, no live scoped terminal) keeps this route's LEGACY
+            // override path below: its rename writes the settings override
+            // (and cascades a live terminal retitle), and its still-offered
+            // reset clears the override — never the scoped path's 404
+            // NAME_NOT_FOUND / 400 NAME_RESET_UNSUPPORTED. A DUAL-MODE
+            // session (a canonical record through the claude mode, or a live
+            // scoped terminal) is NOT kilroy-only, so the authority keeps
+            // owning its ONE singular name and the rename routes scoped —
+            // the Global Constraint's never-a-competing-kilroy-record rule.
+            let kilroy_only = crate::kilroy_lane::is_kilroy_only_session(
+                &state.metadata.get_all().await,
+                state.identity.naming().as_ref(),
+                &state.identity,
+                Some(&state.registry),
+                &scoped_provider,
+                &scoped_session_id,
+                None,
+            )
+            .await;
+            if !kilroy_only {
+                return scoped_session_rename(
+                    &state,
+                    &key,
+                    freshell_protocol::SessionNameRef::Session {
+                        provider: named,
+                        session_id: scoped_session_id,
+                    },
+                    clean_string(body.get("titleOverride")),
+                    &body,
+                )
+                .await;
+            }
+            // Kilroy-only: fall through to the legacy ladder below.
+        }
+    }
 
     let title = clean_string(body.get("titleOverride"));
     let mut patch: Vec<(&str, Option<Value>)> = Vec::new();
@@ -230,6 +300,105 @@ async fn patch_session(
         broadcast_sessions_changed_from(&state);
     }
 
+    Json(Value::Object(out)).into_response()
+}
+
+/// Unified agent names (Task 2): the scoped-provider title-rename path of
+/// `PATCH /api/sessions/:id` — ONE `rename` call through the wired authority
+/// (`state.identity`'s naming sink). The response is the accepted update:
+/// additive `sessionName` (the full `SessionNameUpdate`) + `nameRef`, plus
+/// the legacy merged row for the request's NON-title fields (which still
+/// patch through the settings store). Never writes a settings title
+/// override, never cascades a terminal retitle (the naming publisher owns
+/// the live registry refresh), and a null/blank title is the absolute
+/// NAME_RESET_UNSUPPORTED refusal.
+async fn scoped_session_rename(
+    state: &SessionsState,
+    key: &str,
+    target: freshell_protocol::SessionNameRef,
+    title: Option<String>,
+    body: &Value,
+) -> Response {
+    let Some(name) = title.as_deref().map(str::trim).filter(|t| !t.is_empty()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": freshell_freshagent::naming::NAME_RESET_UNSUPPORTED,
+                "message": "a scoped session's saved name is never cleared; rename it instead",
+                "nameRef": target,
+            })),
+        )
+            .into_response();
+    };
+    let Some(sink) = state.identity.naming() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "NAMING_UNAVAILABLE",
+                "message": "session naming is unavailable on this server",
+                "nameRef": target,
+            })),
+        )
+            .into_response();
+    };
+    let (intent, if_revision) = match crate::session_name_routes::parse_rename_intents(body) {
+        Ok(parsed) => parsed,
+        Err(details) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "Invalid request",
+                    "details": details,
+                })),
+            )
+                .into_response()
+        }
+    };
+    let update = match crate::session_name_routes::rename_through_authority(
+        sink.as_ref(),
+        target,
+        name.to_string(),
+        intent,
+        if_revision,
+    )
+    .await
+    {
+        Ok(update) => update,
+        Err(response) => return response,
+    };
+
+    // The request's NON-title fields still patch through the legacy store
+    // (title keys excluded — the authority owns the title).
+    let mut patch: Vec<(&str, Option<Value>)> = Vec::new();
+    if body.get("summaryOverride").is_some() {
+        patch.push((
+            "summaryOverride",
+            clean_string(body.get("summaryOverride")).map(Value::from),
+        ));
+    }
+    if let Some(a) = body.get("archived") {
+        patch.push(("archived", Some(a.clone())));
+    }
+    if let Some(d) = body.get("deleted") {
+        patch.push(("deleted", Some(d.clone())));
+    }
+    if let Some(c) = body.get("createdAtOverride") {
+        patch.push(("createdAtOverride", Some(c.clone())));
+    }
+    let merged = state.settings.patch_session_override(key, &patch).await;
+    let mut out = merged.as_object().cloned().unwrap_or_default();
+    out.insert(
+        "sessionName".into(),
+        serde_json::to_value(&update).unwrap_or(Value::Null),
+    );
+    out.insert(
+        "nameRef".into(),
+        serde_json::to_value(&update.record.name_ref).unwrap_or(Value::Null),
+    );
+    out.insert("cascadedTerminalId".into(), Value::Null);
+    if !patch.is_empty() {
+        broadcast_sessions_changed_from(state);
+    }
     Json(Value::Object(out)).into_response()
 }
 
@@ -360,6 +529,59 @@ fn extract_title_from_message(content: &str, max_len: usize) -> String {
     cleaned.chars().take(max_len).collect()
 }
 
+/// The legacy source-string vocabulary for the scoped compatibility answer
+/// (`{title, source}` keeps the old route's shape for old clients).
+fn scoped_name_source(source: freshell_protocol::session_names::NameSource) -> &'static str {
+    use freshell_protocol::session_names::NameSource;
+    match source {
+        NameSource::Manual => "user",
+        NameSource::LegacyProtected => "legacy",
+        NameSource::FreshellAi => "ai",
+        NameSource::ProviderAi => "provider-generated",
+        NameSource::FirstMessage => "first-message",
+        NameSource::Directory => "dir",
+    }
+}
+
+/// Unified agent names (Task 4): the SCOPED compatibility arm of
+/// `generate-title` — "may only ensure already eligible unattempted work;
+/// they cannot reset/rearm the series". The worker's own claim enforces the
+/// policy; this side answers the current saved name and wakes the worker so
+/// eligible work dispatches promptly.
+async fn scoped_generate_title(
+    state: &SessionsState,
+    provider: freshell_protocol::session_names::NamedProvider,
+    session_id: String,
+) -> Response {
+    use freshell_protocol::session_names::SessionNameRef;
+    let target = SessionNameRef::Session {
+        provider,
+        session_id,
+    };
+    let record = match state.identity.naming() {
+        Some(sink) => sink
+            .get(vec![target])
+            .await
+            .ok()
+            .and_then(|updates| updates.into_iter().next())
+            .map(|update| update.record),
+        None => None,
+    };
+    if let Some(generator) = &state.generation_wake {
+        // Ensure already-eligible unattempted work: the wake makes the
+        // worker's next pass immediate. Never replenishes anything.
+        generator.notify_capability_change();
+    }
+    match record {
+        Some(record) => Json(json!({
+            "title": record.name,
+            "source": scoped_name_source(record.source),
+        }))
+        .into_response(),
+        None => Json(json!({ "title": null, "source": "none" })).into_response(),
+    }
+}
+
 /// `POST /api/sessions/:sessionId/generate-title` — a blank `firstMessage` is
 /// the only 400 this emits (`sessions-router.ts:167-179`); everything else
 /// resolves to `200`, never `5xx` (Global Constraint 8). Resolution order
@@ -398,6 +620,45 @@ async fn generate_title(
             .into_response();
     }
     let key = composite_key(&raw_id, &provider_of(&q));
+
+    // Unified agent names (Task 4): a SCOPED session's generate-title call is
+    // the compatibility route only — the old user-facing generate control is
+    // removed for the six modes. It answers the current saved session name
+    // (mapped into the legacy source vocabulary), may wake the shared
+    // worker's ALREADY-eligible unattempted work, and can never reset or
+    // re-arm the durable series, never writes the settings ladder, and
+    // never calls Gemini itself.
+    //
+    // Delta-review round 4, finding 1: the shared kilroy-lane seam runs
+    // FIRST — a KILROY-ONLY session (metadata-typed kilroy, no canonical
+    // record, no live scoped terminal) keeps kilroy's RETAINED server-side
+    // AI titling below (the provider-generated short-circuit, the
+    // first-message heuristic, Gemini through the settings ladder), instead
+    // of being routed into the scoped compatibility arm that can only
+    // answer `{title:null}` for it. A dual-mode session (canonical record /
+    // live scoped terminal) stays scoped like every other surface.
+    let (scoped_provider, scoped_session_id) = match raw_id.split_once(':') {
+        Some((prefix, rest)) => (prefix.to_string(), rest.to_string()),
+        None => (provider_of(&q), raw_id.clone()),
+    };
+    if let Some(named) =
+        freshell_freshagent::naming::named_provider_for(Some(&scoped_provider), None)
+    {
+        let kilroy_only = crate::kilroy_lane::is_kilroy_only_session(
+            &state.metadata.get_all().await,
+            state.identity.naming().as_ref(),
+            &state.identity,
+            Some(&state.registry),
+            &scoped_provider,
+            &scoped_session_id,
+            None,
+        )
+        .await;
+        if !kilroy_only {
+            return scoped_generate_title(&state, named, scoped_session_id).await;
+        }
+        // Kilroy-only: fall through to the retained legacy AI-titling ladder.
+    }
 
     // (1) provider-generated short-circuit (`sessions-router.ts:186-192`): a
     // session whose PARSED title is provider-authored is never renamed by

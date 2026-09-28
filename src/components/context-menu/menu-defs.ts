@@ -19,6 +19,7 @@ import type { TerminalActions, EditorActions, BrowserActions } from '@/lib/pane-
 import { getFreshAgentPaneActions, getFreshAgentTurnItemsBuilder } from '@/lib/pane-action-registry'
 import type { ActionSheetItem } from '@/components/fresh-agent/FreshAgentActionSheet'
 import { buildResumeCommand, isResumeCommandProvider, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
+import { isScopedSessionRow } from '@/store/selectors/sessionNameSelectors'
 import {
   resolveReopenPaneSessionTarget,
   type ReopenPaneActivity,
@@ -620,6 +621,10 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     const archived = sessionInfo?.session.archived ?? false
     const isRunning = !!target.runningTerminalId
     const provider = target.provider || 'claude'
+    // Unified agent names (Task 5): scoped coding-agent sessions expose
+    // Rename only — no Generate title, no Reset to provider title (a scoped
+    // saved name is never cleared or regenerated from the UI).
+    const scoped = isScopedSessionRow(provider, sessionInfo?.session.sessionType)
     const resumeCandidate = isResumeCommandProvider(provider, extensions)
       ? {
           provider,
@@ -637,8 +642,8 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       // Reviewed reset (b5fb): offered only when an override is applied AND its
       // recorded source is not a sweep rung ('first-message'/'dir') the
       // auto-title sweep would instantly re-apply. Source-less historical
-      // (pane-era) overrides still qualify.
-      ...(sessionInfo?.session.titleOverridden
+      // (pane-era) overrides still qualify. Never offered for scoped sessions.
+      ...(!scoped && sessionInfo?.session.titleOverridden
           && sessionInfo.session.titleOverrideSource !== 'first-message'
           && sessionInfo.session.titleOverrideSource !== 'dir'
         ? [{
@@ -648,7 +653,7 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
             onSelect: () => actions.resetSessionTitle(target.sessionId, target.provider),
           }]
         : []),
-      ...(ctx.aiEnabled
+      ...(!scoped && ctx.aiEnabled
         ? [{ type: 'item' as const, id: 'session-generate-title', label: 'Generate title', onSelect: () => actions.generateSessionTitle(target.sessionId, target.provider) }]
         : []),
       {
@@ -693,10 +698,16 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     const sessionInfo = getSessionById(sessions, target.sessionId, target.provider)
     const hasSummary = !!sessionInfo?.session.summary
     const isOpen = isSessionOpen(target.sessionId, target.provider)
+    // Unified agent names (Task 5): scoped sessions expose Rename only — no
+    // Reset to provider title.
+    const scoped = isScopedSessionRow(
+      target.provider || sessionInfo?.session.provider || 'claude',
+      sessionInfo?.session.sessionType,
+    )
     return [
       { type: 'item', id: 'history-session-open', label: 'Open session', onSelect: () => actions.openSessionInNewTab(target.sessionId, target.provider) },
       { type: 'item', id: 'history-session-rename', label: 'Rename', onSelect: () => actions.renameSession(target.sessionId, target.provider, true) },
-      ...(sessionInfo?.session.titleOverridden
+      ...(!scoped && sessionInfo?.session.titleOverridden
           && sessionInfo.session.titleOverrideSource !== 'first-message'
           && sessionInfo.session.titleOverrideSource !== 'dir'
         ? [{

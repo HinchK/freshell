@@ -16,6 +16,16 @@ import TabItem from './TabItem'
 import { useMobile } from '@/hooks/useMobile'
 import { MobileTabStrip } from './MobileTabStrip'
 import { TabSwitcher } from './TabSwitcher'
+import { api } from '@/lib/api'
+import { renamePaneAfterMirrorReady } from '@/lib/pane-rename'
+import { parseSessionNameRecordOrUpdate, parseSessionNameUpdate } from '@/lib/session-names'
+import { receiveSessionNameProjections, receiveSessionNames } from '@/store/sessionNamesSlice'
+import {
+  resolvePaneRenameCapture,
+  selectTabNameSourcePaneId,
+  selectTabDisplayTitles,
+} from '@/store/selectors/sessionNameSelectors'
+import type { SessionNameRef } from '@shared/session-names'
 import {
   DndContext,
   closestCenter,
@@ -77,6 +87,7 @@ interface SortableTabProps {
   isDragging: boolean
   isRenaming: boolean
   renameValue: string
+  renameError?: string
   multirow: boolean
   /** Locked uniform width when the strip wraps to 2+ rows; null keeps CSS stretch-to-fill. */
   uniformWidthPx: number | null
@@ -103,6 +114,7 @@ function SortableTab({
   isDragging,
   isRenaming,
   renameValue,
+  renameError,
   multirow,
   uniformWidthPx,
   paneEntries,
@@ -180,6 +192,15 @@ function SortableTab({
         onClick={onClick}
         onDoubleClick={onDoubleClick}
       />
+      {isRenaming && renameError ? (
+        <div
+          className="px-1 pb-1 text-[10px] leading-tight text-destructive truncate"
+          role="alert"
+          title={renameError}
+        >
+          {renameError}
+        </div>
+      ) : null}
     </div>
   )
 }
@@ -216,6 +237,9 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   const renameRequestTabId = tabsState?.renameRequestTabId ?? null
   const paneLayouts = useAppSelector((s) => s.panes?.layouts) ?? EMPTY_LAYOUTS
   const paneTitles = useAppSelector((s) => s.panes?.paneTitles) ?? EMPTY_PANE_TITLES
+  // Unified agent names (Task 5): canonical session names for session-owned
+  // tabs (memoized; recomputes only when its slice references change).
+  const tabDisplayTitles = useAppSelector(selectTabDisplayTitles)
   const attentionByTab = useAppSelector((s) => s.turnCompletion?.attentionByTab) ?? EMPTY_ATTENTION
   const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
   const claudeActivityByTerminalId = useAppSelector((s) => s.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID)
@@ -235,11 +259,15 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   const tabBarRows = useAppSelector((s) => s.settings?.settings?.panes?.tabBarRows ?? TAB_BAR_ROWS_DEFAULT)
   const extensions = useAppSelector((s) => s.extensions?.entries)
 
-  // Compute display title for a single tab
-  // Priority: user-set title > programmatically-set title (e.g., from Claude) > derived name
+  // Compute display title for a single tab.
+  // Unified agent names (Task 5): the scoped selector owns the rule — a
+  // session-owned tab shows its source pane's canonical session name; legacy
+  // tabs keep the existing derivation (user title > programmatic title >
+  // derived name) inside the selector.
   const getDisplayTitle = useCallback(
-    (tab: Tab): string => getTabDisplayTitle(tab, paneLayouts[tab.id], paneTitles[tab.id], extensions),
-    [paneLayouts, paneTitles, extensions]
+    (tab: Tab): string => tabDisplayTitles[tab.id]
+      || getTabDisplayTitle(tab, paneLayouts[tab.id], paneTitles[tab.id], extensions),
+    [tabDisplayTitles, paneLayouts, paneTitles, extensions]
   )
 
   const getPaneEntries = useCallback((tab: Tab): Array<{ paneId: string; content: PaneContent; repoCwd?: string }> | undefined => {
@@ -315,8 +343,26 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
 
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
+  const [tabRenameError, setTabRenameError] = useState<{ tabId: string; message: string } | null>(null)
   const [activeId, setActiveId] = useState<string | null>(null)
   const [showSwitcher, setShowSwitcher] = useState(false)
+  // Unified agent names (Task 5): the rename editor's captured naming target
+  // + revision at open time, and the abort controller for an in-flight
+  // canonical rename (same pending/error pattern as the pane rename).
+  const tabRenameCaptureRef = useRef<{ paneId: string; ref?: SessionNameRef; revision?: number } | null>(null)
+  const tabRenameAbortRef = useRef<AbortController | null>(null)
+
+  useEffect(() => () => {
+    tabRenameAbortRef.current?.abort()
+  }, [])
+
+  const captureTabRename = useCallback((tabId: string): { paneId: string; ref?: SessionNameRef; revision?: number } | null => {
+    const state = appStore.getState()
+    const paneId = selectTabNameSourcePaneId(state, tabId)
+    if (!paneId) return null
+    const capture = resolvePaneRenameCapture(state, tabId, paneId)
+    return { paneId, ...capture }
+  }, [appStore])
 
   useEffect(() => {
     if (!renameRequestTabId) return
@@ -328,8 +374,95 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
 
     setRenamingId(tab.id)
     setRenameValue(getDisplayTitle(tab))
+    setTabRenameError(null)
+    tabRenameCaptureRef.current = captureTabRename(tab.id)
     dispatch(clearTabRenameRequest())
-  }, [dispatch, getDisplayTitle, renameRequestTabId, tabs])
+  }, [dispatch, getDisplayTitle, renameRequestTabId, tabs, captureTabRename])
+
+  /**
+   * Unified agent names (Task 5): a session-owned tab has NO separately
+   * stored name — its rename targets the stable source pane's canonical
+   * session with explicit user intent and the captured target/revision, and
+   * folds the accepted record into the canonical cache. Legacy tabs keep
+   * the local applyTabRename exactly as before. The scoped branch keeps the
+   * editor open (async pending) and shows errors visibly, exactly like the
+   * pane rename.
+   */
+  const commitTabRename = useCallback((tab: Tab, value: string) => {
+    const trimmed = value.trim()
+    const capture = tabRenameCaptureRef.current
+    if (!trimmed) {
+      setRenamingId(null)
+      setRenameValue('')
+      tabRenameCaptureRef.current = null
+      setTabRenameError(null)
+      return
+    }
+    if (!capture) {
+      dispatch(applyTabRename({ tabId: tab.id, title: value || tab.title }))
+      setRenamingId(null)
+      setTabRenameError(null)
+      return
+    }
+    tabRenameAbortRef.current?.abort()
+    const controller = new AbortController()
+    tabRenameAbortRef.current = controller
+    setTabRenameError(null)
+    void (async () => {
+      try {
+        const result = await renamePaneAfterMirrorReady(tab.id, capture.paneId, trimmed, {
+          signal: controller.signal,
+          get: (path, options) => api.get(path, options),
+          patch: (path, body, options) => api.patch(path, body, options),
+          nameIntent: 'user',
+          ...(capture.ref !== undefined ? { expectedNameRef: capture.ref } : {}),
+          ...(capture.revision !== undefined ? { ifRevision: capture.revision } : {}),
+        })
+        if (controller.signal.aborted) return
+        if (!result.ok) {
+          setTabRenameError({ tabId: tab.id, message: result.message })
+          return
+        }
+        const accepted = parseSessionNameUpdate(result.response?.data?.sessionName)
+        if (accepted) dispatch(receiveSessionNames([accepted]))
+        setRenamingId(null)
+        setRenameValue('')
+        tabRenameCaptureRef.current = null
+      } catch (error: any) {
+        if (controller.signal.aborted) return
+        // A conflict carries the server's accepted record: fold it so the
+        // winning name is visible everywhere while the error stays shown,
+        // and REFRESH the editor's capture from the accepted record (its
+        // new revision) so a resubmit from the still-open editor can
+        // succeed — the stale edit-start revision would conflict forever.
+        // The editor seeds the accepted text. The real ApiError carries
+        // the parsed body in `details` (never `.data`), and the scoped
+        // routes answer the accepted CURRENT record as a bare
+        // `sessionName` (the record-or-update extraction).
+        const accepted = parseSessionNameRecordOrUpdate(error?.details?.sessionName)
+        if (accepted) {
+          dispatch(receiveSessionNameProjections([{ record: accepted, ref: accepted.ref }]))
+          if (tabRenameCaptureRef.current?.paneId === capture.paneId) {
+            tabRenameCaptureRef.current = {
+              paneId: capture.paneId,
+              ...resolvePaneRenameCapture(appStore.getState(), tab.id, capture.paneId),
+            }
+            setRenameValue(accepted.name)
+          }
+        }
+        setTabRenameError({
+          tabId: tab.id,
+          message: typeof error?.message === 'string' && error.message
+            ? error.message
+            : 'Failed to rename tab',
+        })
+      } finally {
+        if (tabRenameAbortRef.current === controller) {
+          tabRenameAbortRef.current = null
+        }
+      }
+    })()
+  }, [dispatch, appStore])
 
   const sensors = useSensors(
     useSensor(PointerSensor, {
@@ -380,6 +513,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
         isDragging={activeId === tab.id}
         isRenaming={renamingId === tab.id}
         renameValue={renameValue}
+        renameError={tabRenameError?.tabId === tab.id ? tabRenameError.message : undefined}
         multirow={multirowTabs}
         uniformWidthPx={uniformTabWidthPx}
         paneEntries={getPaneEntries(tab)}
@@ -388,10 +522,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
         repoIcons={repoIconInfoByCwd}
         tabAttentionStyle={tabAttentionStyle}
         onRenameChange={setRenameValue}
-        onRenameBlur={() => {
-          dispatch(applyTabRename({ tabId: tab.id, title: renameValue || tab.title }))
-          setRenamingId(null)
-        }}
+        onRenameBlur={() => commitTabRename(tab, renameValue)}
         onRenameKeyDown={(e) => {
           e.stopPropagation() // Prevent dnd-kit from intercepting keys (esp. space)
           if (e.key === 'Enter' || e.key === 'Escape') {
@@ -446,6 +577,8 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
         onDoubleClick={() => {
           setRenamingId(tab.id)
           setRenameValue(getDisplayTitle(tab))
+          setTabRenameError(null)
+          tabRenameCaptureRef.current = captureTabRename(tab.id)
         }}
       />
     )
@@ -454,6 +587,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     activeTabId,
     attentionByTab,
     attentionDismiss,
+    commitTabRename,
     dispatch,
     getDisplayTitle,
     getBusyPaneIds,
@@ -467,6 +601,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     renameValue,
     renamingId,
     tabAttentionStyle,
+    tabRenameError,
   ])
 
   useEffect(() => {

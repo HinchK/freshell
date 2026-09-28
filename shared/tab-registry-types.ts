@@ -1,6 +1,9 @@
 import { z } from 'zod'
 
 import { migrateLegacyFreshAgentContent } from './fresh-agent.js'
+import { TabNameSourceSchema, type TabNameSource } from './session-names.js'
+
+export type { TabNameSource }
 
 export const RegistryTabStatusSchema = z.enum(['open', 'closed'])
 export type RegistryTabStatus = z.infer<typeof RegistryTabStatusSchema>
@@ -71,6 +74,12 @@ export const TabRegistryRecordBaseSchema = z.object({
   closedAt: z.number().int().nonnegative().optional(),
   paneCount: z.number().int().nonnegative(),
   titleSetByUser: z.boolean(),
+  /** Unified agent names (Task 1): which session names this tab — a stable
+   * source-pane relationship, never a stored tab label. Absent until initial
+   * content or migration resolves ownership (undefined ⇒ legacy rules).
+   * Additive optional; schema parsing strips unknown fields, so this must be
+   * declared here to survive registry snapshots. */
+  nameSource: TabNameSourceSchema.optional(),
   panes: z.array(RegistryPaneSnapshotSchema),
 })
 

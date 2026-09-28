@@ -323,6 +323,10 @@ pub fn parse_amplifier_metadata(content: &str) -> ParsedSessionMeta {
         // (`providers/amplifier.ts:93`) — the amplifier `name` IS
         // provider-generated whenever present.
         title_provider_generated: title.is_some(),
+        custom_title: None,
+        ai_title: None,
+        agent_name_title: None,
+        summary_title: None,
         title,
         summary,
         title_source,

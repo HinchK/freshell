@@ -678,15 +678,17 @@ describe('tabs-card menu', () => {
 })
 
 describe('buildMenuItems — session reset-to-provider-title gating (b5fb)', () => {
-  const target = { kind: 'sidebar-session', sessionId: 's1', provider: 'claude' } as ContextTarget
+  // Legacy alias-title gating is pinned on a NON-scoped provider (kimi);
+  // scoped coding-agent rows (claude/codex/opencode) expose Rename only.
+  const target = { kind: 'sidebar-session', sessionId: 's1', provider: 'kimi' } as ContextTarget
 
-  function ctxWithSession(sessionOverrides: Record<string, unknown>) {
+  function ctxWithSession(sessionOverrides: Record<string, unknown>, provider = 'kimi') {
     const actions = createMockActions()
     const ctx = createMockContext(actions)
     ctx.sessions = [{
       projectPath: '/repo/x',
       sessions: [{
-        provider: 'claude', sessionId: 's1', projectPath: '/repo/x', lastActivityAt: 1,
+        provider, sessionId: 's1', projectPath: '/repo/x', lastActivityAt: 1,
         title: 'Shown title', ...sessionOverrides,
       } as never],
     }] as never
@@ -699,7 +701,7 @@ describe('buildMenuItems — session reset-to-provider-title gating (b5fb)', () 
     const reset = items.find((i) => i.type === 'item' && i.id === 'session-reset-title')
     expect(reset).toBeTruthy()
     if (reset?.type === 'item') reset.onSelect()
-    expect(actions.resetSessionTitle).toHaveBeenCalledWith('s1', 'claude')
+    expect(actions.resetSessionTitle).toHaveBeenCalledWith('s1', 'kimi')
   })
 
   it('omits the reset item for rows without an applied override', () => {
@@ -728,11 +730,27 @@ describe('buildMenuItems — session reset-to-provider-title gating (b5fb)', () 
 
   it('offers the same item on the history-session menu, wired to resetSessionTitle', () => {
     const { actions, ctx } = ctxWithSession({ titleOverridden: true, providerTitle: 'Native title' })
-    const historyTarget = { kind: 'history-session', sessionId: 's1', provider: 'claude' } as ContextTarget
+    const historyTarget = { kind: 'history-session', sessionId: 's1', provider: 'kimi' } as ContextTarget
     const items = buildMenuItems(historyTarget, ctx)
     const reset = items.find((i) => i.type === 'item' && i.id === 'history-session-reset-title')
     expect(reset).toBeTruthy()
     if (reset?.type === 'item') reset.onSelect()
-    expect(actions.resetSessionTitle).toHaveBeenCalledWith('s1', 'claude')
+    expect(actions.resetSessionTitle).toHaveBeenCalledWith('s1', 'kimi')
+  })
+
+  it('offers no reset item for a scoped session row even when an override is recorded', () => {
+    const scopedTarget = { kind: 'sidebar-session', sessionId: 's1', provider: 'claude' } as ContextTarget
+    const { ctx } = ctxWithSession({ titleOverridden: true, providerTitle: 'Native title' }, 'claude')
+    const items = buildMenuItems(scopedTarget, ctx)
+    expect(items.some((i) => i.type === 'item' && i.id === 'session-reset-title')).toBe(false)
+  })
+
+  it('offers no generate-title item for a scoped session row', () => {
+    const scopedTarget = { kind: 'sidebar-session', sessionId: 's1', provider: 'claude' } as ContextTarget
+    const { ctx } = ctxWithSession({}, 'claude')
+    const items = buildMenuItems(scopedTarget, ctx)
+    expect(items.some((i) => i.type === 'item' && i.id === 'session-generate-title')).toBe(false)
+    // The rename affordance remains the only naming verb for scoped rows.
+    expect(items.some((i) => i.type === 'item' && i.id === 'session-rename')).toBe(true)
   })
 })

@@ -1,8 +1,27 @@
 export type PendingReplay = { fromSeq: number; toSeq: number } | null
 export type LostSeqRange = { fromSeq: number; toSeq: number }
 
+export type SeqRange = { fromSeq: number; toSeq: number }
+
 export type OutputFrameDecision =
-  | { accept: true; freshReset: boolean; state: AttachSeqState }
+  | {
+      accept: true
+      freshReset: boolean
+      state: AttachSeqState
+      /**
+       * Restore contract (responsive-terminal-restore): the frame started
+       * beyond the expected next sequence with NO gap frame received — an
+       * UNEXPLAINED forward jump. The hole was folded into the state as an
+       * implicit gap (known lost range + surface quarantine); the caller
+       * must surface it honestly (local notice) instead of letting the
+       * applied cursor advance silently across the missing instructions.
+      * Absent for legitimate session starts (attach.ready's effective
+      * from-seq), a legacy ready's covered-window resume (the first live
+      * frame at exactly replayToSeq + 1 when the whole declared window is
+      * unconsumed), and contiguous frames.
+       */
+      implicitGap?: SeqRange
+    }
   | { accept: false; reason: 'overlap' }
 
 export type OutputGapDecision = {
@@ -18,6 +37,8 @@ export type OutputBatchAcceptedSegment = {
   parserAppliedSeq: number
   previousState: AttachSeqState
   state: AttachSeqState
+  /** The segment's implicit gap (see `OutputFrameDecision.implicitGap`). */
+  implicitGap?: SeqRange
 }
 
 export type OutputBatchDecision =
@@ -26,6 +47,8 @@ export type OutputBatchDecision =
       freshReset: boolean
       state: AttachSeqState
       segments: OutputBatchAcceptedSegment[]
+      /** Every implicit gap raised by this batch's segments, in order. */
+      implicitGaps: SeqRange[]
     }
   | {
       accept: false
@@ -211,16 +234,45 @@ export function onOutputFrame(
       })
     : current
 
-  const overlapsExisting = seqStart <= effectiveState.highestObservedSeq
-  const offersNewData = seqEnd > effectiveState.highestObservedSeq
+  // Implicit gap (responsive-terminal-restore): a frame starting beyond
+  // the expected next sequence, with NO gap frame received, is an
+  // UNEXPLAINED forward jump — never a silent applied-cursor advance.
+  // The hole is folded into the state exactly like an explicit gap
+  // (known lost range + surface quarantine, pinning the applied cursor
+  // below it), with TWO exemptions, both server-declared baselines:
+  // (1) a legitimate session start at attach.ready's effective from-seq
+  // (the pending replay window's first frame — e.g. a retention-adjusted
+  // resume), and (2) the LEGACY (non-negotiated) ready's covered window:
+  // its inline snapshot covers replayFromSeq..replayToSeq, so when no
+  // replay frame was consumed from the window and the live stream
+  // resumes at exactly replayToSeq + 1, that frame is contiguous with
+  // the covered baseline — the legacy mirror of the negotiated path's
+  // session-start exemption.
+  const expectedNextSeq = effectiveState.highestObservedSeq + 1
+  const resumesAfterCoveredReplayWindow = Boolean(
+    effectiveState.pendingReplay
+      && seqStart === effectiveState.pendingReplay.toSeq + 1
+      && expectedNextSeq === effectiveState.pendingReplay.fromSeq
+  )
+  const implicitGap: SeqRange | undefined = seqStart > expectedNextSeq
+    && effectiveState.pendingReplay?.fromSeq !== seqStart
+    && !resumesAfterCoveredReplayWindow
+    ? { fromSeq: expectedNextSeq, toSeq: seqStart - 1 }
+    : undefined
+  const gapFoldedState = implicitGap
+    ? onOutputGap(effectiveState, implicitGap).state
+    : effectiveState
+
+  const overlapsExisting = seqStart <= gapFoldedState.highestObservedSeq
+  const offersNewData = seqEnd > gapFoldedState.highestObservedSeq
   // We treat any overlap with pendingReplay as replay-context data. Server stream-v2
   // currently emits per-sequence frames, so partial-range replays that would duplicate
   // already-rendered bytes are not expected in practice. This assumption is load-bearing
   // for overlap acceptance inside pending replay windows.
   const inPendingReplay = Boolean(
-    effectiveState.pendingReplay
-      && seqEnd >= effectiveState.pendingReplay.fromSeq
-      && seqStart <= effectiveState.pendingReplay.toSeq,
+    gapFoldedState.pendingReplay
+      && seqEnd >= gapFoldedState.pendingReplay.fromSeq
+      && seqStart <= gapFoldedState.pendingReplay.toSeq,
   )
   const allowsReplayAdvance = inPendingReplay && offersNewData
   const isDuplicateOrStaleOverlap = overlapsExisting && !allowsReplayAdvance
@@ -231,16 +283,17 @@ export function onOutputFrame(
     return { accept: false, reason: 'overlap' }
   }
 
-  const nextHighestObservedSeq = Math.max(effectiveState.highestObservedSeq, seqEnd)
-  const pendingReplay = effectiveState.pendingReplay && seqEnd >= effectiveState.pendingReplay.toSeq
+  const nextHighestObservedSeq = Math.max(gapFoldedState.highestObservedSeq, seqEnd)
+  const pendingReplay = gapFoldedState.pendingReplay && seqEnd >= gapFoldedState.pendingReplay.toSeq
     ? null
-    : effectiveState.pendingReplay
+    : gapFoldedState.pendingReplay
 
   return {
     accept: true,
     freshReset: shouldFreshReset,
+    implicitGap,
     state: buildState({
-      ...effectiveState,
+      ...gapFoldedState,
       lastSeq: nextHighestObservedSeq,
       highestObservedSeq: nextHighestObservedSeq,
       pendingReplay,
@@ -257,6 +310,7 @@ export function onOutputBatchSegments(
   let current = initialState
   let freshReset = false
   const acceptedSegments: OutputBatchAcceptedSegment[] = []
+  const implicitGaps: SeqRange[] = []
 
   for (const segment of segments) {
     const previousState = current
@@ -274,6 +328,9 @@ export function onOutputBatchSegments(
     }
     freshReset = freshReset || decision.freshReset
     current = decision.state
+    if (decision.implicitGap) {
+      implicitGaps.push(decision.implicitGap)
+    }
     acceptedSegments.push({
       seqStart: normalizeSeq(segment.seqStart),
       seqEnd: Math.max(normalizeSeq(segment.seqStart), normalizeSeq(segment.seqEnd)),
@@ -281,6 +338,7 @@ export function onOutputBatchSegments(
       parserAppliedSeq: decision.state.highestObservedSeq,
       previousState,
       state: decision.state,
+      implicitGap: decision.implicitGap,
     })
   }
 
@@ -289,6 +347,7 @@ export function onOutputBatchSegments(
     freshReset,
     state: current,
     segments: acceptedSegments,
+    implicitGaps,
   }
 }
 

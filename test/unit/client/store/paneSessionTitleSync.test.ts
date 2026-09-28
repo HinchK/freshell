@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer, { addTab } from '@/store/tabsSlice'
-import panesReducer, { initLayout, updatePaneTitle, updatePaneTitleBySessionRef } from '@/store/panesSlice'
+import panesReducer, { initLayout, updatePaneTitle } from '@/store/panesSlice'
 import { applySessionRenameCascade, clearSessionTitleOverride } from '@/store/titleSync'
 import { renameOverviewTerminal } from '@/components/OverviewView'
 
@@ -10,46 +10,65 @@ vi.mock('nanoid', () => { let n = 0; return { nanoid: vi.fn(() => `pane-${++n}`)
 const apiMocks = vi.hoisted(() => ({ patch: vi.fn().mockResolvedValue({}) }))
 vi.mock('@/lib/api', () => ({ api: { patch: apiMocks.patch } }))
 
-function freshAgentStore() {
+function freshAgentStore(sessionType: 'freshclaude' | 'kilroy' = 'freshclaude') {
   const store = configureStore({ reducer: { tabs: tabsReducer, panes: panesReducer } })
   store.dispatch(addTab({ title: 'freshell', mode: 'claude' }))
   const tabId = store.getState().tabs.tabs[0].id
   store.dispatch(initLayout({
     tabId,
-    content: { kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
+    content: { kind: 'fresh-agent', sessionType, provider: 'claude',
                sessionId: 's1', createRequestId: 'r1', status: 'running' },
   }))
   const paneId = (store.getState().panes.layouts[tabId] as { id: string }).id
   return { store, tabId, paneId }
 }
 
-describe('updatePaneTitleBySessionRef', () => {
-  it('writes the pane title for a matching fresh-agent pane', () => {
-    const { store, tabId, paneId } = freshAgentStore()
-    store.dispatch(updatePaneTitleBySessionRef({ provider: 'claude', sessionId: 's1', title: 'New', setByUser: true }))
-    expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('New')
-  })
-  it('non-matching sessionRef leaves titles alone', () => {
-    const { store, tabId, paneId } = freshAgentStore()
-    store.dispatch(updatePaneTitleBySessionRef({ provider: 'codex', sessionId: 's1', title: 'New' }))
-    expect(store.getState().panes.paneTitles[tabId]?.[paneId]).not.toBe('New')
-  })
-  it('setByUser:false respects the sticky flag; setByUser:true overrides it (D6 policy)', () => {
-    const { store, tabId, paneId } = freshAgentStore()
-    store.dispatch(updatePaneTitle({ tabId, paneId, title: 'Mine' })) // sticky
-    store.dispatch(updatePaneTitleBySessionRef({ provider: 'claude', sessionId: 's1', title: 'Auto', setByUser: false }))
-    expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('Mine')
-    store.dispatch(updatePaneTitleBySessionRef({ provider: 'claude', sessionId: 's1', title: 'UserWins', setByUser: true }))
-    expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('UserWins')
-  })
-})
-
 describe('applySessionRenameCascade', () => {
-  it('mirrors a sidebar session rename into the pane by sessionRef (D3/D4)', () => {
-    const { store, tabId, paneId } = freshAgentStore()
-    applySessionRenameCascade({ dispatch: store.dispatch, provider: 'claude',
+  /**
+   * Unified agent names (Task 5): the session→pane user-flag cascade is the
+   * retained LEGACY mirror for out-of-scope panes (kilroy and others) only.
+   * A scoped agent pane never takes the cascade — its display comes from the
+   * canonical sessionNames cache, and no local sticky flag is armed.
+   */
+  it('mirrors a sidebar session rename into an out-of-scope (kilroy) pane by sessionRef (D3/D4)', () => {
+    const { store, tabId, paneId } = freshAgentStore('kilroy')
+    applySessionRenameCascade({ dispatch: store.dispatch, getState: store.getState, provider: 'claude',
       sessionId: 's1', title: 'Renamed', cascadedTerminalId: null })
     expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('Renamed')
+    expect(store.getState().panes.paneTitleSetByUser?.[tabId]?.[paneId]).toBe(true)
+  })
+
+  it('never cascades into a scoped fresh pane: no pane title, no user flag', () => {
+    const { store, tabId, paneId } = freshAgentStore('freshclaude')
+    applySessionRenameCascade({ dispatch: store.dispatch, getState: store.getState, provider: 'claude',
+      sessionId: 's1', title: 'Renamed', cascadedTerminalId: null })
+    // The pane keeps its derived default — the cascade never wrote it.
+    expect(store.getState().panes.paneTitles[tabId]?.[paneId]).toBe('Freshclaude')
+    expect(store.getState().panes.paneTitleSetByUser?.[tabId]?.[paneId]).toBeFalsy()
+  })
+
+  it('leaves panes of OTHER sessions alone (targets match provider:sessionId only)', () => {
+    const { store, tabId, paneId } = freshAgentStore('kilroy')
+    // initLayout seeds the pane's derived default title ('Kilroy'); a
+    // cascade for a different session must leave it exactly as it was.
+    const before = store.getState().panes.paneTitles[tabId][paneId]
+    expect(before).toBe('Kilroy')
+    applySessionRenameCascade({ dispatch: store.dispatch, getState: store.getState, provider: 'codex',
+      sessionId: 's1', title: 'Renamed', cascadedTerminalId: null })
+    expect(store.getState().panes.paneTitles[tabId][paneId]).toBe(before)
+    applySessionRenameCascade({ dispatch: store.dispatch, getState: store.getState, provider: 'claude',
+      sessionId: 'other-session', title: 'Renamed', cascadedTerminalId: null })
+    expect(store.getState().panes.paneTitles[tabId][paneId]).toBe(before)
+    expect(store.getState().panes.paneTitleSetByUser?.[tabId]?.[paneId]).toBeFalsy()
+  })
+
+  it('a user session rename overrides a previously sticky pane title (Scope Decision 3)', () => {
+    const { store, tabId, paneId } = freshAgentStore('kilroy')
+    store.dispatch(updatePaneTitle({ tabId, paneId, title: 'Mine' })) // sticky
+    applySessionRenameCascade({ dispatch: store.dispatch, getState: store.getState, provider: 'claude',
+      sessionId: 's1', title: 'UserWins', cascadedTerminalId: null })
+    expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('UserWins')
+    expect(store.getState().panes.paneTitleSetByUser?.[tabId]?.[paneId]).toBe(true)
   })
 })
 

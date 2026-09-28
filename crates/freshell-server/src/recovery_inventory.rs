@@ -1019,7 +1019,18 @@ pub fn build_inventory(
                         })
                     })
                     .collect();
-                json!({"tabKey": rec["tabKey"], "tabName": rec["tabName"], "panes": panes})
+                // Unified agent names (Task 6): the tab's stable
+                // naming-source relationship forwards additively so the
+                // client's recovery builder can remap it through its
+                // old→new pane-id map; absent on pre-Task-6 records.
+                let mut tab_projection = serde_json::Map::new();
+                tab_projection.insert("tabKey".to_string(), rec["tabKey"].clone());
+                tab_projection.insert("tabName".to_string(), rec["tabName"].clone());
+                if rec.get("nameSource").is_some_and(|v| !v.is_null()) {
+                    tab_projection.insert("nameSource".to_string(), rec["nameSource"].clone());
+                }
+                tab_projection.insert("panes".to_string(), Value::Array(panes));
+                Value::Object(tab_projection)
             })
             .collect();
         tabs_per_union.push(tabs);

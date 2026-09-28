@@ -6,7 +6,10 @@ import {
   type FreshAgentRuntimeProvider,
   type FreshAgentSessionType,
 } from '@shared/fresh-agent'
+import { remapTabNameSource, resolveInitialTabNameSource, parsePaneNamingIdentityInput } from '@/lib/tab-name-source'
 import type { RecoveryInventory, RecoveryPane, LedgerOnlyEntry } from './types'
+import type { TabNameSource } from '@shared/session-names'
+
 
 function terminalContent(p: {
   mode: string | null
@@ -14,6 +17,7 @@ function terminalContent(p: {
   cwd: string | null
   sessionRef: { provider: string; sessionId: string } | null
   createRequestId?: string
+  payload?: Record<string, unknown>
 }): PaneContent {
   return {
     kind: 'terminal',
@@ -36,6 +40,9 @@ function terminalContent(p: {
     // terminal (`applyReattachToLiveTerminal`). Either way: reattach, never
     // a second process.
     ...(p.sessionRef ? { sessionRef: p.sessionRef } : {}),
+    // Unified agent names (Task 6): the naming identity survives the
+    // rebuild even when the transient runtime ids are stripped.
+    ...(p.payload ? parsePaneNamingIdentityInput(p.payload) : {}),
   } as PaneContent
 }
 
@@ -134,6 +141,15 @@ export interface RecoveryTabPlan {
   title: string
   /** The inventory tab's tabKey this plan restores (device plans only; internal to the plan/panel pair). */
   sourceTabKey?: string
+  /**
+   * Unified agent names (Task 6): the restored tab's stable naming-source
+   * relationship, remapped through the explicit old→new pane-id map when
+   * the restore remints ids (same-machine bootstrap preserves ids, so the
+   * recorded pointer passes through verbatim). Undefined when the record
+   * carried none — the lifecycle middleware then resolves ownership once
+   * from the restored layout's initial content.
+   */
+  nameSource?: TabNameSource
   layout: PaneNode
   paneTitles: Record<string, string>
   /**
@@ -365,9 +381,16 @@ export function buildRecoveryPlan(
     .map((t) => {
       const leaves: PaneNode[] = []
       const liveTerminalReattach: Array<{ paneId: string; terminalId: string }> = []
+      // Unified agent names (Task 6): the EXPLICIT old→new pane-id map. Same-
+      // machine bootstrap preserves snapshot ids (identity map); every other
+      // restore mints fresh ids through this map so the recorded nameSource
+      // remaps to the pane that now holds the source content.
+      const paneIdMap = new Map<string, string>()
       for (const p of t.panes.filter(isRestorablePane)) {
+        const paneId = options.preserveIdsForMachine ? p.paneId : paneIdMap.get(p.paneId) ?? nanoid()
+        paneIdMap.set(p.paneId, paneId)
         const content = paneContent(p, Boolean(options.preserveIdsForMachine))
-        const node = leaf(content, options.preserveIdsForMachine ? p.paneId : undefined)
+        const node = leaf(content, paneId)
         const target = liveReattachTarget(p, content, node.id)
         if (target) liveTerminalReattach.push(target)
         leaves.push(node)
@@ -391,17 +414,27 @@ export function buildRecoveryPlan(
         }
         leaves.push(node)
       }
-      return { tab: t, leaves, liveTerminalReattach }
+      return { tab: t, leaves, liveTerminalReattach, paneIdMap }
     })
     .filter(({ leaves }) => leaves.length > 0)
-    .map(({ tab: t, leaves, liveTerminalReattach }) => ({
-      tabId: options.preserveIdsForMachine
-        ? preservedTabId(t.tabKey, options.preserveIdsForMachine)
-        : nanoid(),
-      title: t.tabName || 'Recovered',
-      sourceTabKey: t.tabKey,
-      layout: chain(leaves),
-      paneTitles: {},
-      ...(liveTerminalReattach.length ? { liveTerminalReattach } : {}),
-    }))
+    .map(({ tab: t, leaves, liveTerminalReattach, paneIdMap }) => {
+      // Unified agent names (Task 6): remap the recorded pointer through the
+      // explicit old→new pane-id map; an unresolvable pointer (its pane was
+      // dropped from the restore, or the record predates the field) derives
+      // from the rebuilt layout's initial content instead of a stale id.
+      const nameSource = t.nameSource
+        ? remapTabNameSource(t.nameSource, paneIdMap) ?? resolveInitialTabNameSource(chain(leaves))
+        : undefined
+      return {
+        tabId: options.preserveIdsForMachine
+          ? preservedTabId(t.tabKey, options.preserveIdsForMachine)
+          : nanoid(),
+        title: t.tabName || 'Recovered',
+        sourceTabKey: t.tabKey,
+        ...(nameSource ? { nameSource } : {}),
+        layout: chain(leaves),
+        paneTitles: {},
+        ...(liveTerminalReattach.length ? { liveTerminalReattach } : {}),
+      }
+    })
 }

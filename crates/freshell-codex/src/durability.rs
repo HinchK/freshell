@@ -182,6 +182,20 @@ pub fn read_rollout_history_mode(thread_id: &str) -> Option<HistoryMode> {
     HistoryMode::from_meta_value(payload.get("history_mode"))
 }
 
+/// Unified agent names (Task 3, T2-M6): the rollout-walk under an EXPLICIT
+/// `codex_home` — the same ownership-proofed walk as
+/// [`read_rollout_history_mode`], but rooted at the initialized home a
+/// connection or proxy CAPTURED rather than ambient env (the remote-proxy
+/// initialize correlation pins that a proxied client's captured home is the
+/// root its rollouts live under). The freshness-codex bind lane and the
+/// native name adapter use this to verify durability at the captured root.
+pub fn locate_thread_rollout_in_home(
+    codex_home: &Path,
+    thread_id: &str,
+) -> Option<std::path::PathBuf> {
+    locate_rollout(&codex_home.join("sessions"), thread_id)
+}
+
 /// `extractSessionIdFromFilename(filePath)` (`providers/codex.ts:417-421`): the UUID embedded
 /// in a `rollout-<ts>-<threadId>.jsonl` basename, else the basename (minus `.jsonl`) verbatim.
 pub fn extract_session_id_from_filename(file_path: &str) -> String {

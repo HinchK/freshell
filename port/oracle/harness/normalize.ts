@@ -523,6 +523,75 @@ export function normalizeTranscript(
   return new Normalizer(opts).normalize(transcript)
 }
 
+// ── field-scoped envelope shape masking (task-010) ──────────────────────────
+
+/** Stable tag per family, matching the transcript placeholder convention. */
+const SHAPE_FAMILY_TAG: Record<Family, string> = {
+  id: 'ID',
+  timestamp: 'TS',
+  seq: 'SEQ',
+  port: 'PORT',
+  path: 'PATH',
+  opaque: 'OPAQUE',
+}
+
+/**
+ * The T1 PTY-envelope flake (task-010, task-008 review F1): `terminal.attach.ready`'s
+ * raw seq values depend on whether the spawned shell's banner bytes landed in the
+ * retained ring before the attach snapshotted it — a contract-valid, inherently
+ * timing-dependent race. The transcript normalizer's value-dedup placeholders
+ * make a single-message comparison sensitive to WHICH fields happen to share a
+ * raw value (the coincidence partition flips with the race), so two boots of
+ * identical code produced different "normalized" envelopes.
+ *
+ * This mask replaces every registered nondeterministic LEAF with a stable
+ * per-(family, field) placeholder — a PURE function of the envelope's
+ * structure. Presence, nesting, array lengths, and every deterministic contract
+ * value (type, enums, booleans) survive verbatim, so a REAL structural
+ * divergence still differs, while any two boots — whatever the race produced —
+ * canonicalize to the same string. Used ONLY for single-message cross-boot
+ * envelope comparison (T1); the transcript-diff lanes keep
+ * [`normalizeTranscript`]'s value-dedup semantics, which are load-bearing for
+ * cross-message reference tracking.
+ */
+export function maskEnvelopeShape(parsed: unknown): string {
+  return stableStringify(maskShapeValue(parsed))
+}
+
+function maskShapeValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(maskShapeValue)
+  if (value && typeof value === 'object') {
+    const obj = value as Record<string, unknown>
+    const out: Record<string, unknown> = {}
+    for (const key of Object.keys(obj)) {
+      const spec = FIELD_FAMILIES[key]
+      if (spec && isLeaf(obj[key])) {
+        out[key] = maskShapeLeaf(spec.family, key, obj[key])
+      } else if (spec && Array.isArray(obj[key]) && (obj[key] as unknown[]).every(isLeaf)) {
+        // Arrays of registered leaves (e.g. `recoverableTerminalIds`) keep
+        // their element COUNT (a real structural property) with every
+        // element masked to the same per-field placeholder.
+        out[key] = (obj[key] as Array<string | number | boolean | null>).map((el) =>
+          maskShapeLeaf(spec.family, key, el),
+        )
+      } else {
+        out[key] = maskShapeValue(obj[key])
+      }
+    }
+    return out
+  }
+  return value
+}
+
+function maskShapeLeaf(family: Family, field: string, value: string | number | boolean | null): unknown {
+  if (value === null) return value
+  if (typeof value === 'string' && isPlaceholder(value)) return value // idempotent
+  // Booleans under a registered name are deterministic (parity with the
+  // transcript normalizer's leaf rule); everything else is the family tag.
+  if (typeof value === 'boolean') return value
+  return `<${SHAPE_FAMILY_TAG[family]}:${field}>`
+}
+
 /**
  * The full canonical string form of a normalized transcript — direction-tagged,
  * key-sorted, newline-delimited — suitable for persisting as a golden baseline.

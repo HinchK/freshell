@@ -8,8 +8,10 @@ import { PassThrough } from 'node:stream'
 import WebSocket from 'ws'
 import {
   cp,
+  lstat,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rm,
   writeFile,
@@ -36,6 +38,47 @@ interface WebSocketMessage {
   requestId?: string
   terminalId?: string
   data?: string
+}
+
+function runtimePlatformKey(): 'linux' | 'darwin' | 'win32' {
+  return process.platform as 'linux' | 'darwin' | 'win32'
+}
+
+function runtimeArchKey(): 'x64' | 'arm64' {
+  return process.arch as 'x64' | 'arm64'
+}
+
+/**
+ * Sweep a staged runtime tree for layout residue the pnpm stager promises
+ * never ships: links of any kind, lock files, and pnpm install-state
+ * directories.
+ */
+async function scanRuntimeLayout(root: string): Promise<{ links: string[]; lockFiles: string[]; pnpmState: string[] }> {
+  const links: string[] = []
+  const lockFiles: string[] = []
+  const pnpmState: string[] = []
+  const walk = async (directory: string, prefix: string): Promise<void> => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const relative = prefix ? `${prefix}/${entry.name}` : entry.name
+      const absolute = path.join(directory, entry.name)
+      const stats = await lstat(absolute)
+      if (stats.isSymbolicLink()) {
+        links.push(relative)
+        continue
+      }
+      if (entry.name === '.pnpm') {
+        pnpmState.push(relative)
+        continue
+      }
+      if (stats.isDirectory()) {
+        await walk(absolute, relative)
+        continue
+      }
+      if (entry.name === 'package-lock.json' || entry.name === 'pnpm-lock.yaml') lockFiles.push(relative)
+    }
+  }
+  await walk(root, '')
+  return { links, lockFiles, pnpmState }
 }
 
 function runtimeRoot(): string {
@@ -284,9 +327,82 @@ describe('checkout-free Electron runtime acceptance', () => {
     expect(await responses).toEqual([{ type: 'created' }, { type: 'sdk.status', status: 'idle' }])
   })
 
+  it('carries the real Claude SDK, its native platform package, and no lock or link residue outside the checkout', async () => {
+    const staged = runtimeRoot()
+    expect(existsSync(staged), 'run pnpm run prepare:electron-runtime before this lane').toBe(true)
+    const outsideRoot = await mkdtemp(path.join(tmpdir(), 'freshell-electron-runtime-'))
+    const runtime = path.join(outsideRoot, 'runtime')
+    const emptyCwd = path.join(outsideRoot, 'cwd')
+    try {
+      await cp(staged, runtime, { recursive: true })
+      await mkdir(emptyCwd, { recursive: true })
+      await writeFile(path.join(outsideRoot, 'root-marker'), 'outside checkout')
+      expect(existsSync(path.join(outsideRoot, 'node_modules'))).toBe(false)
+      expect(path.resolve(outsideRoot)).not.toBe(path.resolve(PROJECT_ROOT))
+
+      const layout = await scanRuntimeLayout(runtime)
+      expect(layout.links, 'staged runtime must contain zero links').toEqual([])
+      expect(layout.lockFiles, 'staged runtime must contain zero lock files').toEqual([])
+      expect(layout.pnpmState, 'staged runtime must not carry pnpm install state').toEqual([])
+
+      const nodeBinary = path.join(runtime, 'node', 'bin', process.platform === 'win32' ? 'node.exe' : 'node')
+      const sidecarManifest = JSON.parse(await readFile(path.join(runtime, 'claude-sidecar', 'package.json'), 'utf8')) as {
+        dependencies?: Record<string, string>
+      }
+      const declaredSdkSpec = (sidecarManifest.dependencies ?? {})['@anthropic-ai/claude-agent-sdk']
+      expect(declaredSdkSpec, 'staged sidecar manifest must declare the Claude SDK dependency').toEqual(expect.any(String))
+      // pnpm's deploy annotates dependency specs with (possibly nested)
+      // peer-resolution groups, e.g. "0.3.237(@anthropic-ai/sdk@0.120.0(zod@4.4.3))".
+      // The base spec is everything before the first annotation group.
+      const declaredSdkVersion = declaredSdkSpec.includes('(')
+        ? declaredSdkSpec.slice(0, declaredSdkSpec.indexOf('('))
+        : declaredSdkSpec
+
+      const installedSdkManifest = JSON.parse(
+        await readFile(path.join(runtime, 'claude-sidecar', 'node_modules', '@anthropic-ai', 'claude-agent-sdk', 'package.json'), 'utf8'),
+      ) as { version?: string }
+      expect(installedSdkManifest.version).toBe(declaredSdkVersion)
+
+      const nativeOptionalPackage = path.join(
+        runtime, 'claude-sidecar', 'node_modules', '@anthropic-ai',
+        `claude-agent-sdk-${runtimePlatformKey()}-${runtimeArchKey()}`,
+      )
+      expect(existsSync(nativeOptionalPackage), 'the SDK platform-native optional package must be staged for this target').toBe(true)
+
+      const probeScript = `
+        const { createRequire } = await import('node:module')
+        const { pathToFileURL } = await import('node:url')
+        const req = createRequire(${JSON.stringify(path.join(runtime, 'claude-sidecar', 'package.json'))})
+        const entry = req.resolve('@anthropic-ai/claude-agent-sdk')
+        const sdk = await import(pathToFileURL(entry).href)
+        if (typeof sdk.query !== 'function') {
+          throw new Error('real Claude SDK did not expose query()')
+        }
+        console.log(JSON.stringify({ query: typeof sdk.query }))
+      `.trim()
+      const probe = execFileSync(nodeBinary, ['--input-type=module', '-e', probeScript], {
+        cwd: emptyCwd,
+        env: { ...process.env, NODE_PATH: '' },
+        encoding: 'utf8',
+        timeout: 30_000,
+      })
+      expect(JSON.parse(probe)).toEqual({ query: 'function' })
+
+      const receipt = JSON.parse(await readFile(path.join(runtime, '.electron-runtime-receipt.json'), 'utf8')) as {
+        releaseVersion?: string
+        packageManager?: { name?: string }
+      }
+      const mcpPackage = JSON.parse(await readFile(path.join(runtime, 'mcp', 'package.json'), 'utf8')) as { version?: string }
+      expect(receipt.packageManager?.name).toBe('pnpm')
+      expect(receipt.releaseVersion).toBe(mcpPackage.version)
+    } finally {
+      await rm(outsideRoot, { recursive: true, force: true })
+    }
+  })
+
   it('serves Rust/client, runs fake Claude, and speaks MCP JSON-RPC outside the checkout', async () => {
     const staged = runtimeRoot()
-    expect(existsSync(staged), 'run npm run prepare:electron-runtime before this lane').toBe(true)
+    expect(existsSync(staged), 'run pnpm run prepare:electron-runtime before this lane').toBe(true)
     const outsideRoot = await mkdtemp(path.join(tmpdir(), 'freshell-electron-runtime-'))
     const runtime = path.join(outsideRoot, 'runtime')
     const emptyCwd = path.join(outsideRoot, 'cwd')

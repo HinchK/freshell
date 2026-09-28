@@ -1,9 +1,9 @@
-import { execFileSync } from 'node:child_process'
+import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { resolveNpmExecFileCommand } from '../setup/npm-command.js'
+import { resolveManagerExecFileCommand } from '../setup/manager-command.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -18,7 +18,7 @@ function findProjectRoot(): string {
 }
 
 interface EnsureFreshE2eBuildDeps {
-  execFileSync: typeof execFileSync
+  spawnSync: typeof spawnSync
   env: NodeJS.ProcessEnv
   platform: NodeJS.Platform
   log: Pick<Console, 'log'>
@@ -27,27 +27,29 @@ interface EnsureFreshE2eBuildDeps {
 export function ensureFreshE2eBuild(
   root: string,
   deps: EnsureFreshE2eBuildDeps = {
-    execFileSync,
+    spawnSync,
     env: process.env,
     platform: process.platform,
     log: console,
   },
 ): void {
   const env = { ...deps.env, NODE_ENV: 'production' }
-  const prebuild = resolveNpmExecFileCommand(['run', 'prebuild'], deps.env, deps.platform)
-  deps.execFileSync(prebuild.command, prebuild.args, {
+  const prebuild = resolveManagerExecFileCommand(['run', 'prebuild'], deps.env, deps.platform, process.execPath, root)
+  deps.spawnSync(prebuild.command, prebuild.args, {
     cwd: root,
     stdio: 'inherit',
     env,
+    shell: prebuild.viaShell ?? false,
   })
   deps.log.log('[e2e-setup] Building client and Rust server...')
-  const npm = resolveNpmExecFileCommand(['run', 'build:client'], deps.env, deps.platform)
-  deps.execFileSync(npm.command, npm.args, {
+  const client = resolveManagerExecFileCommand(['run', 'build:client'], deps.env, deps.platform, process.execPath, root)
+  deps.spawnSync(client.command, client.args, {
     cwd: root,
     stdio: 'inherit',
     env,
+    shell: client.viaShell ?? false,
   })
-  deps.execFileSync('cargo', ['build', '--release', '-p', 'freshell-server', '--locked'], {
+  deps.spawnSync('cargo', ['build', '--release', '-p', 'freshell-server', '--locked'], {
     cwd: root,
     stdio: 'inherit',
     env,

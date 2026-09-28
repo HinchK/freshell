@@ -207,3 +207,39 @@ async fn corrupt_generation_file_returns_500_not_404() {
         "list must also 500 on a corrupt store"
     );
 }
+
+#[tokio::test]
+async fn snapshot_reads_roundtrip_tab_namesource_and_pane_naming_identity() {
+    let dir = std::env::temp_dir().join(format!("freshell-t6-snap-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // One registry record carrying the Task-6 fields: the tab's stable
+    // nameSource and a pane payload's naming identity.
+    let mut record = codex_record("sess-owned", 5);
+    record["nameSource"] = json!({ "kind": "session", "paneId": "p1" });
+    record["panes"][0]["payload"]["namingHandle"] = json!("nh-snap-1");
+    record["panes"][0]["payload"]["nameRef"] = json!({ "kind": "pending", "id": "nh-snap-1" });
+
+    let reg = freshell_ws::tabs::TabsRegistry::with_persist_dir(dir.clone());
+    reg.replace_client_snapshot("srv", "dev-1", "Dev One", "client-a", 5, vec![record])
+        .unwrap();
+
+    let router = crate::tabs_snapshots::router(test_state(&dir));
+    let (status, body) = get(router, "/api/tabs-sync/snapshots/dev-1?generation=0", true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["records"][0]["nameSource"],
+        json!({ "kind": "session", "paneId": "p1" }),
+        "the on-disk generation round-trips the tab pointer"
+    );
+    assert_eq!(
+        body["records"][0]["panes"][0]["payload"]["namingHandle"],
+        json!("nh-snap-1")
+    );
+    assert_eq!(
+        body["records"][0]["panes"][0]["payload"]["nameRef"],
+        json!({ "kind": "pending", "id": "nh-snap-1" })
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

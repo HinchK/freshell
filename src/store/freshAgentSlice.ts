@@ -695,6 +695,39 @@ const freshAgentSlice = createSlice({
     },
 
     /**
+     * 2026-09-20 incident (Task 5): refresh the observed owner fence from a
+     * typed refusal itself — the REST snapshot 409 RESTORE_UNAVAILABLE always
+     * names the coordinator's CURRENT generation, which may be newer than
+     * the client's record (the pane loaded while the server was restarting
+     * and the record fold lagged). The refusal carries no epoch, so the
+     * existing record's epoch is PRESERVED (the record's epoch comes from
+     * the server's own runtime-owner broadcasts); only the generation
+     * advances. The fold is ADVANCE-ONLY (Task 5 review M1), matching the
+     * applyRuntimeOwner invariant: a newer broadcast (e.g. gen 3) may fold
+     * between the server minting the refusal (gen 2) and the client
+     * processing it — regressing to the refusal's older generation would
+     * send a stale fence the wired server refuses with FENCE_REQUIRED. An
+     * absent record is left absent: minting one would fabricate an epoch
+     * the client never observed — the recovery attach then goes out
+     * unfenced, the wired server refuses it typed, and the pane surfaces
+     * that honestly instead of the store lying about the boot epoch.
+     */
+    applyRefusalFence(state, action: PayloadAction<{
+      provider: string
+      sessionId: string
+      ownerKind: 'terminal' | 'fresh-agent'
+      ownerGeneration: number
+    }>) {
+      const refusal = action.payload
+      const key = `${refusal.provider}:${refusal.sessionId}`
+      const existing = state.runtimeOwners[key]
+      if (!existing) return
+      if (refusal.ownerGeneration < existing.generation) return
+      existing.generation = refusal.ownerGeneration
+      existing.updatedAt = Date.now()
+    },
+
+    /**
      * kata b8ke (round-2 review): the ready handler dispatches this BEFORE
      * folding the ready.runtimeOwners replay — the client resets its
      * owner/generation state on every (re)connect so a restarted server's
@@ -714,6 +747,7 @@ export const {
   addUserMessage,
   appendStreamDelta,
   applyRuntimeOwner,
+  applyRefusalFence,
   clearPendingCreate,
   clearPendingCreateFailure,
   clearPendingCreateFailureForSession,

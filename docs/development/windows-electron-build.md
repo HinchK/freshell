@@ -7,7 +7,7 @@ for the standalone MCP client and the isolated Claude SDK sidecar.
 
 ## Key constraint: build on native Windows
 
-The Windows build must run as a native Windows process. `npm run
+The Windows build must run as a native Windows process. `pnpm run
 electron:build:win` begins with `scripts/assert-native-windows-build.ts`, which
 hard-fails unless `process.platform === 'win32'`. This ensures Cargo produces a
 native `freshell-server.exe` and Electron Builder packages the Windows
@@ -15,8 +15,11 @@ artifact, rather than a Linux binary or a non-runnable installer stub.
 
 ## Prerequisites (on the Windows side)
 
-- Node.js (matching `engines.node`, currently `>=22.5.0`) and npm for the
-  client, tooling, and Electron build.
+- Node.js (matching `engines.node`, currently `>=22.5.0`) and the pinned
+  pnpm 10.34.5 for the client, tooling, and Electron build. Bootstrap pnpm
+  once with `npm install --global pnpm@10.34.5` — npm is only the bootstrap
+  tool here. The repo's `packageManager` pin is enforced; any other pnpm
+  version fails the frozen install.
 - A Rust stable toolchain with the MSVC target (`rustup`, Cargo, and the
   Visual Studio Build Tools **Desktop development with C++** workload).
 - No Node native-module compiler or Python setup is required for the
@@ -25,9 +28,9 @@ artifact, rather than a Linux binary or a non-runnable installer stub.
 ## Option A — from a native Windows shell
 
 ```powershell
-npm ci
+pnpm install --frozen-lockfile
 $env:CI = "true"
-npm run electron:build:win        # assert win32 → client/tools/Rust → Electron Builder NSIS
+pnpm run electron:build:win        # assert win32 → client/tools/Rust → Electron Builder NSIS
 ```
 
 `electron:build:win` runs, in order: the native-platform assertion, client and
@@ -35,9 +38,11 @@ tool typechecks/builds, the release `freshell-server.exe` Cargo build,
 `build:electron`, `build:wizard`, `build:launch-chooser`,
 `prepare:claude-sidecar`, `prepare:electron-runtime`, `electron-builder --win
 nsis --publish never`, and the artifact verifier. `prepare:claude-sidecar`
-runs a locked `npm ci` in `crates/freshell-claude-sidecar` and verifies the
-Claude SDK package before it is copied into the installer; no sidecar
-`node_modules` directory needs to be checked into the repository. Output lands
+verifies the sidecar workspace member's installed dependency tree and, if it
+is missing or stale, repairs it with one frozen, sidecar-filtered pnpm
+install; `prepare:electron-runtime` stages the portable sidecar and MCP client
+runtimes from pnpm deploys of the workspace lock. No sidecar `node_modules`
+directory needs to be checked into the repository. Output lands
 in `release/`.
 
 ## Option B — driving the Windows build from WSL
@@ -45,7 +50,8 @@ in `release/`.
 Your dev checkout usually lives on the WSL filesystem, but the build must run
 as a native Windows process. **Do not** build over the `\\wsl.localhost\...`
 UNC path (slow and fragile over 9p). Copy the worktree to a Windows-local path
-and run Windows' own npm and Cargo against it via interop.
+and run Windows' own pnpm and Cargo against it via interop (bootstrap pnpm on
+the Windows side with `npm install --global pnpm@10.34.5`).
 
 1. Copy the worktree to a Windows-local directory, excluding generated and
    platform-specific directories:
@@ -54,6 +60,7 @@ and run Windows' own npm and Cargo against it via interop.
    rsync -rlt --delete --no-perms --no-owner --no-group \
      --exclude='.git' --exclude='node_modules/' --exclude='dist/' \
      --exclude='target/' --exclude='release/' --exclude='electron-runtime/' \
+     --exclude='packages/freshell-mcp-runtime/generated/' \
      --exclude='.worktrees/' \
      ./ "/mnt/c/Users/<you>/AppData/Local/Temp/freshell-electron-build/"
    ```
@@ -61,19 +68,25 @@ and run Windows' own npm and Cargo against it via interop.
    `target/` and `.worktrees/` matter when copying from the **main checkout**:
    it holds multi-GB Rust build artifacts and every sibling worktree, and
    copying those over 9p stalls the sync indefinitely. They are harmless to
-   exclude when copying from a linked worktree.
+   exclude when copying from a linked worktree. `node_modules/` excludes every
+   dependency layout at any depth — the pnpm root tree and its virtual store
+   plus the workspace members' own `node_modules` — and
+   `packages/freshell-mcp-runtime/generated/` is staged build output that the
+   Windows-side run regenerates. The pnpm workspace config and lockfiles
+   (`pnpm-workspace.yaml`, `pnpm-lock.yaml`) are tracked files and get copied,
+   which is what the frozen install on the Windows side needs.
 
-2. Run Windows npm in that directory via `cmd.exe`. Always `cd /d` to a real
+2. Run Windows pnpm in that directory via `cmd.exe`. Always `cd /d` to a real
    Windows path first — `cmd.exe` launched from WSL inherits the UNC cwd and
    will warn and mangle relative paths:
 
    ```bash
-   cmd.exe /c 'cd /d C:\Users\<you>\AppData\Local\Temp\freshell-electron-build && set "CI=true" && set "PORT=39517" && npm ci && npm run electron:build:win'
+   cmd.exe /c 'cd /d C:\Users\<you>\AppData\Local\Temp\freshell-electron-build && set "CI=true" && set "PORT=39517" && pnpm install --frozen-lockfile && pnpm run electron:build:win'
    ```
 
    `PORT=<unused>` keeps the build's preflight isolated from any unrelated
-   local service. The package build installs and verifies the isolated Claude
-   sidecar from its committed lockfile as part of the command. Reusing a
+   local service. The package build verifies (and if needed frozen-installs)
+   the isolated Claude sidecar as part of the command. Reusing a
    previous Windows-local build directory keeps its native dependencies warm,
    while `target/`, `dist/`, and `electron-runtime/` are rebuilt for the copied
    checkout.
@@ -110,5 +123,5 @@ A good build should show:
   legacy backend artifact, and no backend-specific native Node addon is
   packaged.
 
-The authoritative checkout-free checks are `npm run verify:electron-artifact`
-and `npm run test:electron:runtime`.
+The authoritative checkout-free checks are `pnpm run verify:electron-artifact`
+and `pnpm run test:electron:runtime`.

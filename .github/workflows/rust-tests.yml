@@ -1,6 +1,7 @@
 name: Rust Tests
 
 on:
+  workflow_dispatch:
   pull_request:
 
 permissions:
@@ -28,8 +29,20 @@ jobs:
       - name: Detect Rust changes
         id: filter
         run: |
-          if git diff --name-only "origin/${{ github.base_ref }}...${{ github.sha }}" \
-            | grep -Eq '\.rs$|(^|/)Cargo\.(toml|lock)$|^rust-toolchain|^\.cargo/|^test/fixtures/'; then
+          # Manager and dependency configuration changes must exercise the
+          # Rust suite too: it spawns Node fixtures (the codex fake
+          # app-server imports `ws`) whose behavior depends on the installed
+          # dependency tree. A rust-gate that skips because no .rs file
+          # changed is not proof of fixture compatibility. Scoped to the
+          # root and workspace members — the independent demo locks are
+          # not part of the workspace dependency tree.
+          # `github.base_ref` exists only for pull_request events; manual
+          # dispatch (the event-routing escape hatch) compares against the
+          # default branch instead.
+          BASE="${{ github.base_ref }}"
+          [ -n "$BASE" ] || BASE="main"
+          if git diff --name-only "origin/$BASE...${{ github.sha }}" \
+            | grep -Eq '\.rs$|(^|/)Cargo\.(toml|lock)$|^rust-toolchain|^\.cargo/|^test/fixtures/|^(pnpm-lock\.yaml|pnpm-workspace\.yaml|package(-lock)?\.json|\.npmrc)$|^(crates|packages)/.*package(-lock)?\.json$|^packages/'; then
             echo "rust=true" >> "$GITHUB_OUTPUT"
           else
             echo "rust=false" >> "$GITHUB_OUTPUT"
@@ -47,14 +60,19 @@ jobs:
           toolchain: 1.96.0
       - uses: Swatinem/rust-cache@v2
       # The Rust suite spawns Node test fixtures (the codex fake app-server
-      # imports `ws`), so this job needs npm dependencies installed or those
-      # tests die at fixture boot ("fake app-server exited before listening").
+      # imports `ws`), so this job needs the workspace dependencies installed
+      # or those tests die at fixture boot ("fake app-server exited before
+      # listening").
+      # Pinned revision of the v4 major; reads the exact version from the root
+      # packageManager pin (no floating duplicate).
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-      - name: Install npm dependencies (Rust test fixtures)
-        run: npm ci
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - name: Install dependencies (Rust test fixtures)
+        run: pnpm install --frozen-lockfile
       - name: Workspace tests
         run: cargo test --workspace --exclude freshell-tauri --locked
 

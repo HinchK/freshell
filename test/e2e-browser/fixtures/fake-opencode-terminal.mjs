@@ -54,22 +54,92 @@ function opencodeDataHome() {
   return path.join(home, '.local', 'share', 'opencode')
 }
 
+// The schema mirrors fake-opencode.cjs's EXACT rich shape (the real
+// opencode's layout): a spec may pre-create an empty schema'd db in the
+// isolated home (the realistic machine where opencode ran before
+// freshell), and the listing/first-message queries the server's naming
+// lanes run must find the same columns in either fixture's db.
 function ensureSchema(db) {
   db.exec(`
-    CREATE TABLE IF NOT EXISTS project (id TEXT PRIMARY KEY, worktree TEXT);
+    CREATE TABLE IF NOT EXISTS project (
+      id text PRIMARY KEY,
+      worktree text
+    );
     CREATE TABLE IF NOT EXISTS session (
-      id TEXT PRIMARY KEY,
-      project_id TEXT NOT NULL,
-      parent_id TEXT,
-      slug TEXT NOT NULL,
-      directory TEXT NOT NULL,
-      title TEXT NOT NULL,
-      version TEXT NOT NULL,
-      time_created INTEGER NOT NULL,
-      time_updated INTEGER NOT NULL,
-      time_archived INTEGER
+      id text PRIMARY KEY,
+      project_id text NOT NULL,
+      workspace_id text,
+      parent_id text,
+      slug text NOT NULL,
+      directory text NOT NULL,
+      path text,
+      title text NOT NULL,
+      version text NOT NULL,
+      share_url text,
+      summary_additions integer,
+      summary_deletions integer,
+      summary_files integer,
+      summary_diffs text,
+      metadata text,
+      cost real NOT NULL DEFAULT 0,
+      tokens_input integer NOT NULL DEFAULT 0,
+      tokens_output integer NOT NULL DEFAULT 0,
+      tokens_reasoning integer NOT NULL DEFAULT 0,
+      tokens_cache_read integer NOT NULL DEFAULT 0,
+      tokens_cache_write integer NOT NULL DEFAULT 0,
+      revert text,
+      permission text,
+      agent text,
+      model text NOT NULL,
+      time_created integer NOT NULL,
+      time_updated integer NOT NULL,
+      time_compacting integer,
+      time_archived integer
+    );
+    CREATE TABLE IF NOT EXISTS message (
+      id text PRIMARY KEY,
+      session_id text NOT NULL,
+      time_created integer NOT NULL,
+      time_updated integer NOT NULL,
+      data text NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS part (
+      id text PRIMARY KEY,
+      message_id text NOT NULL,
+      session_id text NOT NULL,
+      time_created integer NOT NULL,
+      time_updated integer NOT NULL,
+      data text NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS message_seq (
+      session_id text PRIMARY KEY,
+      next integer NOT NULL
     );
   `)
+}
+
+// Unified agent names (Task 8): the first prompt's durable user message —
+// the `message`/`part` rows the server's targeted first-message lookup
+// parses (opencode's naming lane: the session row identifies, the message
+// rows arm). Mirrors the shape the real CLI projects.
+function writeFirstUserMessage(sessionId, prompt) {
+  const dataHome = opencodeDataHome()
+  fs.mkdirSync(dataHome, { recursive: true })
+  const db = new DatabaseSync(path.join(dataHome, 'opencode.db'))
+  try {
+    db.exec('PRAGMA busy_timeout = 5000')
+    ensureSchema(db)
+    const now = Date.now()
+    const messageId = `msg_e2e_${now}_${process.pid}`
+    db.prepare(
+      'INSERT OR REPLACE INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)',
+    ).run(messageId, sessionId, now, now, JSON.stringify({ role: 'user' }))
+    db.prepare(
+      'INSERT OR REPLACE INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)',
+    ).run(`part_${messageId}`, messageId, sessionId, now, now, JSON.stringify({ type: 'text', text: prompt }))
+  } finally {
+    db.close()
+  }
 }
 
 function writeSessionRow(sessionId, cwd) {
@@ -86,10 +156,10 @@ function writeSessionRow(sessionId, cwd) {
     )
     db.prepare(
       `INSERT OR REPLACE INTO session
-        (id, project_id, parent_id, slug, directory, title, version,
+        (id, project_id, parent_id, slug, directory, title, version, model,
          time_created, time_updated, time_archived)
-       VALUES (?, ?, NULL, ?, ?, ?, 'fake-opencode-terminal-e2e', ?, ?, NULL)`,
-    ).run(sessionId, `proj-${sessionId}`, sessionId, cwd, sessionId, now, now)
+       VALUES (?, ?, NULL, ?, ?, ?, 'fake-opencode-terminal-e2e', ?, ?, ?, NULL)`,
+    ).run(sessionId, `proj-${sessionId}`, sessionId, cwd, sessionId, 'fake-model', now, now)
   } finally {
     db.close()
   }
@@ -112,32 +182,38 @@ if (resumeSessionId) {
   // deterministically never lands before the SIGKILL.
   const rowGatePath = process.env.FAKE_OPENCODE_TERMINAL_ROW_GATE_PATH
 
-  function commitSessionRow(sessionId, cwd) {
+  function commitSessionRow(sessionId, cwd, firstPrompt) {
     writeSessionRow(sessionId, cwd)
+    // Unified agent names (Task 8): the first prompt's user-message rows —
+    // the metadata the naming lane's targeted first-message lookup reads.
+    const prompt = String(firstPrompt ?? '').trim()
+    if (prompt.length > 0) writeFirstUserMessage(sessionId, prompt)
     process.stdout.write(`opencode: session ${sessionId} started\r\n`)
   }
 
   let sessionCreated = false
   process.stdin.setEncoding('utf8')
-  process.stdin.on('data', () => {
+  process.stdin.on('data', (chunk) => {
     // Any input at all counts as "the first submit" for this fixture's
     // purposes -- the real locator arms only on Enter-shaped WS input, and
     // the pty's own cooked-mode line discipline already withholds bytes
     // from this process until the user presses Enter, so the first `data`
-    // event this process ever sees IS that submit.
+    // event this process ever sees IS that submit. The prompt text (minus
+    // the Enter) is the durable first user message.
     if (sessionCreated) return
     sessionCreated = true
 
     const cwd = process.cwd()
     const sessionId = `ses_e2e_${Date.now()}_${process.pid}`
+    const firstPrompt = String(chunk ?? '').replace(/[\r\n]+$/, '').trim()
     if (!rowGatePath) {
-      commitSessionRow(sessionId, cwd)
+      commitSessionRow(sessionId, cwd, firstPrompt)
       return
     }
     const interval = setInterval(() => {
       if (!fs.existsSync(rowGatePath)) return
       clearInterval(interval)
-      commitSessionRow(sessionId, cwd)
+      commitSessionRow(sessionId, cwd, firstPrompt)
     }, 50)
     interval.unref?.()
   })

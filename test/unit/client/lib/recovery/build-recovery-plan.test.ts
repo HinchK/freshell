@@ -779,3 +779,146 @@ describe('buildRecoveryPlan preserveIdsForMachine', () => {
     expect(collectLeafPaneIds(plan.layout)).not.toContain('pane-keep')
   })
 })
+
+describe('unified agent names (Task 6): recovery preserves naming identity', () => {
+  const agentPane = (paneId: string, payloadOver: Record<string, unknown> = {}) => pane({
+    paneId,
+    kind: 'terminal',
+    mode: 'claude',
+    payload: { createRequestId: `crid-${paneId}`, ...payloadOver },
+    sessionRef: { provider: 'claude', sessionId: `sess-${paneId}` },
+    ledgerState: 'bound' as const,
+  })
+
+  it('same-machine recovery preserves the tab nameSource verbatim', () => {
+    const inventory = inv([agentPane('p-agent')])
+    inventory.device!.tabs[0].tabKey = 'd:tab-1'
+    inventory.device!.tabs[0].nameSource = { kind: 'session', paneId: 'p-agent' }
+
+    const [plan] = buildRecoveryPlan(inventory, { preserveIdsForMachine: 'd' })
+    expect(plan.tabId).toBe('tab-1')
+    expect(plan.nameSource).toEqual({ kind: 'session', paneId: 'p-agent' })
+  })
+
+  it('cross-device recovery remints pane ids and remaps the pointer through the old->new map', () => {
+    const inventory = inv([
+      agentPane('p-shell-a'),
+      agentPane('p-agent-b'),
+      agentPane('p-agent-c'),
+    ])
+    inventory.device!.tabs[0].tabKey = 'd:tab-9'
+    inventory.device!.tabs[0].nameSource = { kind: 'session', paneId: 'p-agent-c' }
+
+    const [plan] = buildRecoveryPlan(inventory)
+    expect(plan.nameSource).toBeDefined()
+    const paneIds = collectPaneIds(plan.layout)
+    // The remapped pointer names a pane that EXISTS in the rebuilt layout,
+    // is not the stale recorded id, and is the source pane's new id.
+    expect(plan.nameSource).toEqual({ kind: 'session', paneId: paneIds[2] })
+    expect(plan.nameSource).not.toEqual({ kind: 'session', paneId: 'p-agent-c' })
+  })
+
+  it('a legacy pointer and an absent pointer both survive recovery unchanged', () => {
+    const legacyInv = inv([agentPane('p-1')])
+    legacyInv.device!.tabs[0].tabKey = 'd:tab-1'
+    legacyInv.device!.tabs[0].nameSource = { kind: 'legacy' }
+    const [legacyPlan] = buildRecoveryPlan(legacyInv, { preserveIdsForMachine: 'd' })
+    expect(legacyPlan.nameSource).toEqual({ kind: 'legacy' })
+
+    const noneInv = inv([agentPane('p-1')])
+    noneInv.device!.tabs[0].tabKey = 'd:tab-1'
+    const [nonePlan] = buildRecoveryPlan(noneInv, { preserveIdsForMachine: 'd' })
+    expect(nonePlan.nameSource).toBeUndefined()
+  })
+
+  it('recovery remints createRequestId while preserving the pane namingHandle', () => {
+    const inventory = inv([pane({
+      paneId: 'p-handle',
+      kind: 'terminal',
+      mode: 'claude',
+      payload: {
+        createRequestId: 'durable-snapshot-key',
+        namingHandle: 'nh-recover-1',
+        nameRef: { kind: 'pending', id: 'nh-recover-1' },
+      },
+      sessionRef: { provider: 'claude', sessionId: 'sess-handle' },
+      ledgerState: 'bound',
+    })])
+    inventory.device!.tabs[0].tabKey = 'd:tab-h'
+
+    // Cross-device: ids remint, the handle survives.
+    const [plan] = buildRecoveryPlan(inventory)
+    const content = leavesOf(plan.layout)[0].content as Record<string, unknown>
+    expect(content.createRequestId).not.toBe('durable-snapshot-key')
+    expect(content.namingHandle).toBe('nh-recover-1')
+    expect(content.nameRef).toEqual({ kind: 'pending', id: 'nh-recover-1' })
+
+    // Same-machine: the durable snapshot key survives too.
+    const [samePlan] = buildRecoveryPlan(inventory, { preserveIdsForMachine: 'd' })
+    const sameContent = leavesOf(samePlan.layout)[0].content as Record<string, unknown>
+    expect(sameContent.createRequestId).toBe('durable-snapshot-key')
+    expect(sameContent.namingHandle).toBe('nh-recover-1')
+  })
+
+  it('a fresh-agent recovered pane keeps its namingHandle from the snapshot payload', () => {
+    const inventory = inv([pane({
+      paneId: 'p-fa',
+      kind: 'fresh-agent',
+      mode: null,
+      payload: {
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'fa-snapshot-key',
+        namingHandle: 'nh-fa-recover',
+        sessionRef: { provider: 'claude', sessionId: 'stale' },
+      },
+      sessionRef: { provider: 'claude', sessionId: 'fa-authoritative' },
+      ledgerState: 'bound',
+    })])
+    inventory.device!.tabs[0].tabKey = 'd:tab-fa'
+
+    const [plan] = buildRecoveryPlan(inventory)
+    const content = leavesOf(plan.layout)[0].content as Record<string, unknown>
+    expect(content.kind).toBe('fresh-agent')
+    expect(content.namingHandle).toBe('nh-fa-recover')
+  })
+
+  function collectPaneIds(node: unknown): string[] {
+    return leavesOf(node).map((l) => l.id)
+  }
+})
+
+describe('unified agent names (Task 7): recovery carries no scoped title aliases', () => {
+  const agentPane = (paneId: string, payloadOver: Record<string, unknown> = {}) => pane({
+    paneId,
+    kind: 'terminal',
+    mode: 'claude',
+    payload: {
+      createRequestId: `crid-${paneId}`,
+      nameRef: { kind: 'session', provider: 'claude', sessionId: `sess-${paneId}` },
+      namingHandle: `handle-${paneId}`,
+      ...payloadOver,
+    },
+    sessionRef: { provider: 'claude', sessionId: `sess-${paneId}` },
+    ledgerState: 'bound' as const,
+  })
+
+  it('plans never carry pane-title aliases — an old server snapshot cannot smuggle a scoped label back in', () => {
+    const inventory = inv([agentPane('p-agent')])
+    inventory.device!.tabs[0].tabKey = 'd:tab-1'
+    inventory.device!.tabs[0].nameSource = { kind: 'session', paneId: 'p-agent' }
+
+    const [plan] = buildRecoveryPlan(inventory, { preserveIdsForMachine: 'd' })
+
+    expect(plan.paneTitles).toEqual({})
+    // The pane's canonical identity (which carries the migrated name)
+    // survives the rebuild.
+    const walk = (node: typeof plan.layout): unknown => {
+      if (node.type === 'leaf') return node.content
+      return walk(node.children[0]) ?? walk(node.children[1])
+    }
+    const content = walk(plan.layout) as Record<string, unknown>
+    expect(content.nameRef).toEqual({ kind: 'session', provider: 'claude', sessionId: 'sess-p-agent' })
+    expect(content.namingHandle).toBe('handle-p-agent')
+  })
+})

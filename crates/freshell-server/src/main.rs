@@ -32,6 +32,7 @@ mod fresh_agent_extras;
 mod host_stats;
 mod identity_sink;
 mod instance_id;
+mod kilroy_lane;
 mod legacy_local_seed;
 mod logging;
 mod machines;
@@ -52,6 +53,11 @@ mod screenshots;
 mod serve_client;
 mod session_directory;
 mod session_metadata;
+mod session_name_generation;
+mod session_name_migration;
+mod session_name_native;
+mod session_name_routes;
+mod session_names;
 mod sessions;
 mod settings;
 mod settings_store;
@@ -62,6 +68,8 @@ mod terminals;
 #[cfg(test)]
 pub(crate) mod test_clock_gate;
 mod test_clock_router;
+#[cfg(test)]
+pub(crate) mod test_env_lock;
 mod updater;
 
 use std::net::IpAddr;
@@ -908,6 +916,16 @@ async fn main() -> ExitCode {
     let gemini: std::sync::Arc<dyn ai_title::GeminiTransport> = std::sync::Arc::new(
         ai_title::GeminiHttp::new(reqwest::Client::new(), ai_key.clone(), gemini_base_url),
     );
+    // Unified agent names (Task 4): the generation participant of the ONE
+    // shared serial naming worker — execution only, never another loop.
+    // Capability (the naming toggle + the Gemini key) is checked before
+    // selection, so disabled naming pauses without consuming anything.
+    let session_name_generator =
+        std::sync::Arc::new(session_name_generation::SessionNameGenerator::new(
+            settings_store.clone(),
+            ai_key.clone(),
+            gemini.clone(),
+        ));
 
     // The shared server→client broadcast bus (pre-serialized frames). REST handlers
     // (fresh-agent create/send) push here; every `/ws` connection fans it out to its
@@ -1128,6 +1146,161 @@ async fn main() -> ExitCode {
                 }),
             ),
         ));
+    // Unified agent names (Task 2): the ONE durable session-name authority —
+    // constructed BEFORE publication; every rename route, create/bind lane,
+    // tick, and publisher below shares this Arc (there is no second store).
+    // A `None` home (or an unopenable document) leaves naming UNWIRED:
+    // scoped renames fail unavailable (503) and the read projections
+    // degrade — the same degraded no-home policy as the pane ledger.
+    let session_names: Option<std::sync::Arc<session_names::SessionNames>> = home
+        .as_deref()
+        .map(|h| h.join(".freshell"))
+        .and_then(|dir| match session_names::SessionNames::open(dir) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                tracing::error!(
+                    target: "freshell_server::session_names",
+                    op = "open",
+                    name_ref = "-",
+                    revision = 0,
+                    class = %error.code(),
+                    "session_names.operation_failed: {error}"
+                );
+                None
+            }
+        });
+    if let Some(names) = session_names.clone() {
+        // The identity registry is the shared sink holder the session/
+        // terminal/directory/resolve surfaces already carry; the fresh-agent
+        // states each hold their own OnceLock sink.
+        terminal_identity.set_session_naming(names.clone());
+        fresh_agent_state.set_session_naming(names.clone());
+        fresh_claude_state.set_session_naming(names.clone());
+        fresh_codex_state.set_session_naming(names.clone());
+        fresh_opencode_state.set_session_naming(names.clone());
+
+        // The 2s adoption/reconcile tick: (1) adopt a same-home cooperating
+        // process's committed generation (CLI/MCP writes) — the strict
+        // full-document re-read under the lock, never an mtime shortcut;
+        // (2) bind still-pending handles whose durability has since become
+        // verifiable. Claude: the transcript locator (the signal-first and
+        // zero-turn create lanes bind as soon as the transcript exists).
+        // Codex/opencode: their runtime edges (the rollout walk / the DB
+        // row) own the verified binds — the tick never fabricates one.
+        {
+            let names = names.clone();
+            let identity = terminal_identity.clone();
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    if let Err(error) = names.refresh_current().await {
+                        tracing::warn!(
+                            target: "freshell_server::session_names",
+                            op = "refresh_current",
+                            name_ref = "-",
+                            revision = 0,
+                            class = %error.code(),
+                            "session_names.operation_failed: {error}"
+                        );
+                    }
+                    for (terminal_id, provider, session_id, _handle) in
+                        identity.pending_naming_binds()
+                    {
+                        if provider != "claude" {
+                            continue;
+                        }
+                        // One bounded locate + bind per still-pending claude
+                        // row; a miss or failure keeps the row pending for
+                        // the next tick's visible retry (the helper logs its
+                        // own failure classes).
+                        let _ = freshell_ws::identity::bind_pending_claude_transcript(
+                            &identity,
+                            &registry,
+                            &terminal_id,
+                            &session_id,
+                        )
+                        .await;
+                    }
+                }
+            });
+        }
+
+        // The naming publisher: every committed update (this process's own
+        // writes and adopted external ones) reaches WS clients as the
+        // canonical `session.name.updated` frame, refreshes the registry
+        // display caches of every terminal bound to the record (title
+        // write-through), and invalidates the session directory
+        // (`sessions.changed`) so renamed rows re-read immediately.
+        {
+            let names = names.clone();
+            let updates = names.subscribe();
+            let registry = registry.clone();
+            let broadcast_tx = Arc::clone(&broadcast_tx);
+            let sessions_revision = Arc::clone(&sessions_revision);
+            tokio::spawn(session_names::run_naming_publisher(
+                names,
+                updates,
+                registry,
+                broadcast_tx,
+                sessions_revision,
+            ));
+        }
+
+        // Unified agent names (Task 3): the shared serial NATIVE worker — the
+        // finite writeback cycle machine under the `.session-names-worker.lock`
+        // background guard. The dispatch routes each operation to its
+        // provider adapter by the retained location: the Codex app-server
+        // client on a root-matched LIVE connection (never the cold snapshot,
+        // a resume, an unarchive, or a lease), the OpenCode serve PATCH
+        // (gated by the effective-database context), and the Claude
+        // `session-names.mjs` helper (Rust owns its timeout and kill/wait).
+        // The OpenCode adapter is ALWAYS wired: it holds the lazy shared
+        // serve-manager cell (`None` until the first freshopencode pane's
+        // lane runs it) and resolves the CURRENT manager per operation, so
+        // an armed series pauses only until the serve exists — a boot-time
+        // snapshot of that cell would freeze the `None` forever. A genuinely
+        // unwireable adapter (a missing Claude helper) degrades to `None` —
+        // that provider's native work pauses without affecting the others.
+        // Task 4 adds generation to this same owned loop and selector.
+        {
+            let names = names.clone();
+            let codex_state = fresh_codex_state.clone();
+            let agent_state = fresh_agent_state.clone();
+            let codex_adapter = session_name_native::CodexNativeNameAdapter::new(Arc::new(
+                move |codex_home: String| {
+                    let codex_state = codex_state.clone();
+                    Box::pin(
+                        async move { codex_state.management_client_for_root(&codex_home).await },
+                    )
+                        as std::pin::Pin<
+                            Box<
+                                dyn std::future::Future<
+                                        Output = Option<
+                                            Arc<freshell_codex::app_server::CodexAppServerClient>,
+                                        >,
+                                    > + Send,
+                            >,
+                        >
+                },
+            ));
+            let opencode_adapter = Some(session_name_native::OpencodeNativeNameAdapter::new(
+                agent_state.opencode_shared_handle(),
+            ));
+            let dispatch = Arc::new(session_name_native::NativeNameDispatch::new(
+                Some(session_name_native::ClaudeNativeNameAdapter::from_env()),
+                Some(codex_adapter),
+                opencode_adapter,
+            ));
+            session_name_native::SessionNameWorker::start(
+                names,
+                dispatch,
+                session_name_generator.clone(),
+            );
+        }
+    }
     // TERM-11 fix: honor `settings.safety.autoKillIdleMinutes` at boot (the
     // Rust registry previously never read it at all, so a config that raised
     // or lowered it from the default had no effect). See
@@ -1143,6 +1316,20 @@ async fn main() -> ExitCode {
         std::time::Duration::from_secs(30)
     };
     freshell_ws::spawn_idle_monitor(registry.clone(), idle_sweep_interval);
+    // Wedge-backstop Task 3: the wedged-agent-pane backstop monitor — the
+    // terminal-mode analogue of the freshcodex quiet deadman. Same cadence
+    // expression as the idle monitor above (30s production / 250ms under
+    // the test clock); the window override is seeded from
+    // `FRESHELL_TERMINAL_STUCK_WINDOW_MS` (parseable integer AS-IS; 0 or
+    // negative disables the sweep; unparseable keeps the 2h default).
+    // Surface-only: nothing is killed here — flagged panes render the
+    // "Agent appears stuck" card and the USER picks the action.
+    registry.set_stuck_window_ms(freshell_ws::stuck_window_ms_from_env());
+    freshell_ws::spawn_stuck_monitor(
+        registry.clone(),
+        Arc::clone(&broadcast_tx),
+        idle_sweep_interval,
+    );
     // e2e knob (kata znhn item 2): sub-second flap cycles would trip the
     // registry generation cap (3 per 30s liveness window) before the hub's
     // circuit breaker can ever fire. Production default unchanged.
@@ -1422,6 +1609,8 @@ async fn main() -> ExitCode {
         .with_terminal_created_hook({
             let terminal_meta = terminal_meta.clone();
             let broadcast_tx = Arc::clone(&broadcast_tx);
+            let terminal_identity = terminal_identity.clone();
+            let registry = registry.clone();
             Arc::new(move |event: freshell_freshagent::TerminalCreatedEvent| {
                 freshell_ws::terminal_meta::seed_from_terminal(
                     &terminal_meta,
@@ -1431,6 +1620,25 @@ async fn main() -> ExitCode {
                     event.resume_session_id.as_deref(),
                     event.cwd.as_deref(),
                 );
+                // Unified agent names (Task 2): write the REST create-lane
+                // naming binding onto the SHARED identity registry (the CLI
+                // locator bind lanes and every rename resolver read it) and
+                // the terminal registry row (the display cache the
+                // `/api/terminals` projection carries). The WS create path
+                // performs its own admission — this hook only fires for
+                // REST-pipeline creates, so no row is double-bound.
+                if event.naming_handle.is_some() || event.name_ref.is_some() {
+                    terminal_identity.set_name_binding(
+                        &event.terminal_id,
+                        event.name_ref.clone(),
+                        event.naming_handle.clone(),
+                    );
+                    registry.set_naming(
+                        &event.terminal_id,
+                        event.name_ref.clone(),
+                        event.naming_handle.clone(),
+                    );
+                }
             })
         });
     // Batch B: `session_directory` no longer re-walks + re-parses every
@@ -1569,10 +1777,47 @@ async fn main() -> ExitCode {
     }
     // Task 10: the opencode SSE lane's production IO seams (reqwest impls;
     // fakes in tests). Unset would leave OpencodeAttach retire-only.
+    // Unified agent names (Task 3): the lane's native-title observer folds
+    // `session.updated` titles through the naming authority — the target is
+    // the durable opencode session's record, else the terminal's own
+    // (pending) naming ref. A detached fold never disturbs the activity
+    // lane; no wired store (degraded boot) drops the observation.
+    let opencode_native_title_observer: freshell_ws::opencode_lane::NativeTitleObserver = {
+        let identity = terminal_identity.clone();
+        let names = session_names.clone();
+        std::sync::Arc::new(move |terminal_id: &str, session_id: &str, title: &str| {
+            let Some(names) = names.clone() else {
+                return;
+            };
+            let identity = identity.clone();
+            let terminal_id = terminal_id.to_string();
+            let session_id = session_id.to_string();
+            let title = title.to_string();
+            tokio::spawn(async move {
+                let sink: Option<std::sync::Arc<dyn freshell_freshagent::naming::SessionNaming>> =
+                    Some(names);
+                let target = identity
+                    .named_session_ref_of("opencode", &session_id)
+                    .or_else(|| identity.name_ref_for(&terminal_id));
+                let Some(target) = target else {
+                    return;
+                };
+                let _ = freshell_freshagent::naming::observe_native_live(
+                    &sink,
+                    target,
+                    &title,
+                    freshell_freshagent::naming::NativeNameOrigin::Snapshot,
+                    None,
+                )
+                .await;
+            });
+        })
+    };
     activity_hub.set_opencode_lane_deps(std::sync::Arc::new(
         freshell_ws::opencode_lane::OpencodeLaneDeps {
             http: std::sync::Arc::new(freshell_ws::opencode_lane::ReqwestLaneHttp::new()),
             events: std::sync::Arc::new(freshell_ws::opencode_lane::ReqwestLaneStream::new()),
+            native_title_observer: Some(opencode_native_title_observer),
         },
     ));
     // #606: the claude deadman's session-JSONL truth source (verify-then-
@@ -1807,6 +2052,44 @@ async fn main() -> ExitCode {
                     as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
             })
         });
+    // TERM-09 backpressure config, fail-fast validated
+    // (responsive-terminal-restore Workstream 3): refuse to boot on a
+    // configuration whose disconnect threshold sits at or below the spill
+    // bound — the production incident's inverted shape. Structured event for
+    // the JSONL log (names the offending env vars), plain stderr line for
+    // the console, matching the AUTH_TOKEN refusal pattern.
+    let term09 = match resolve_term09_config() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!(error = %error, "server.config.term09_invalid");
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Responsive-terminal-restore round-5 (finding 1, degenerate
+    // settings): clamp the paced-replay page budget to the queue-derived
+    // admission ceiling — the ONE place both knobs are known. The drain's
+    // reserve-then-admit gate grants a page while backlog + reservations
+    // + page stay at-or-below the watermark (queue cap / 2); a page
+    // budget above that ceiling could only admit into a fully drained
+    // queue, and one above the whole cap would self-spill on admission
+    // (a 64 KiB queue — the supported floor — is smaller than the default
+    // 128 KiB page). With default settings this is a no-op (128 KiB <<
+    // the 8 MiB watermark); the clamp only bites the small-queue
+    // settings, honestly bounding pages to what the queue can carry.
+    {
+        let paced_page_ceiling =
+            freshell_ws::backpressure::paced_page_budget_ceiling(term09.queue_max_bytes);
+        if registry.paced_page_max_bytes() > paced_page_ceiling {
+            tracing::info!(
+                page_budget = registry.paced_page_max_bytes(),
+                clamped_page_budget = paced_page_ceiling,
+                queue_max_bytes = term09.queue_max_bytes,
+                "server.config.paced_page_budget_clamped"
+            );
+            registry.set_paced_page_max_bytes(paced_page_ceiling);
+        }
+    }
     let ws_state = WsState {
         auto_resume_tx,
         auto_resume_cancels: Default::default(),
@@ -1865,7 +2148,7 @@ async fn main() -> ExitCode {
         hello_timeout_ms: resolve_hello_timeout_ms(),
         allowed_origins: Arc::new(resolve_allowed_origins()),
         ws_max_payload_bytes: resolve_ws_max_payload_bytes(),
-        term09: freshell_ws::backpressure::Term09Config::from_env(),
+        term09,
         create_protect,
         // THE kata-enn3 pin: the WS door holds the SAME gate Arc as the
         // REST door (never a second budget minted here).
@@ -2096,6 +2379,43 @@ async fn main() -> ExitCode {
         }),
     };
 
+    // SESSION-06 store (`session-metadata.json`), created here (before the
+    // sweeps and the directory state) because the `POST /api/session-metadata`
+    // write route below, Task 20's session-directory read-join, AND the
+    // auto-title sweep's kilroy-only discrimination (unified agent names
+    // Task 4, review I3) all share it. Same isolated-home `.freshell`
+    // directory the settings store resolves (`settings_store.rs:246`), so a
+    // real deployment's existing `session-metadata.json` is discovered
+    // exactly like the legacy server discovers it.
+    let session_metadata_dir = home
+        .as_deref()
+        .map(|h| h.join(".freshell"))
+        .unwrap_or_else(|| PathBuf::from(".freshell"));
+    let session_metadata_store = session_metadata::SessionMetadataStore::new(session_metadata_dir);
+
+    // Unified agent names (Task 7): the ONE-TIME legacy-name consolidation,
+    // awaited INLINE before any naming read is served — it commits winners,
+    // winning migration evidence, acknowledged candidate ids and the
+    // completion receipt in ONE strict name transaction (the same
+    // `.session-names.lock` discipline every participant uses), then runs
+    // the scope-only cleanup of the migrated config/metadata title fields.
+    // A committed receipt skips straight to the idempotent cleanup retry.
+    // A `None` store (no home) or a failed open leaves the legacy fields
+    // live — naming stays on its degraded path and the next boot retries.
+    if let (Some(names), Some(user_home)) = (session_names.clone(), home.clone()) {
+        session_name_migration::run_session_name_consolidation(
+            session_name_migration::SessionNameConsolidationInputs {
+                names,
+                settings: std::sync::Arc::new(settings_store.clone()),
+                metadata: std::sync::Arc::new(session_metadata_store.clone()),
+                identity: terminal_identity.clone(),
+                data_dir: user_home.join(".freshell"),
+                snapshots_dir: snapshots_dir.clone(),
+            },
+        )
+        .await;
+    }
+
     // The History read model (`GET /api/session-directory`, Follow-up 3.19): list
     // the coding-CLI sessions from the isolated home's provider transcript dirs,
     // reusing `freshell-sessions` parsers. Replaces the earlier empty-page stub.
@@ -2161,6 +2481,22 @@ async fn main() -> ExitCode {
                 // so the sweep's meta refresh feeds the handshake + broadcasts.
                 terminal_meta: terminal_meta.clone(),
                 git_meta_cache: Default::default(),
+                // Unified agent names (Task 4): the scoped coding-agent
+                // sessions feed the ONE naming authority (hydration + the
+                // index-observed activity that arms generation) — never the
+                // settings ladder. A `None` store (no home) degrades the
+                // scoped branch to nothing; excluded providers keep the
+                // legacy ladder either way.
+                names: session_names.clone(),
+                // Unified agent names (Task 4, review I3): the sweep
+                // consults the SAME session-metadata store the POST route
+                // and the directory read-join share — the kilroy-only
+                // discrimination for provider-claude listing rows.
+                metadata: session_metadata_store.clone(),
+                // The shared index serves the targeted opencode
+                // first-message lookup for already-named sessions.
+                index: Some(Arc::clone(index)),
+                index_hydrated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
             Arc::clone(index),
             SESSIONS_SWEEP_INTERVAL,
@@ -2266,18 +2602,9 @@ async fn main() -> ExitCode {
     // Task 6: the sessions router's provider-generated short-circuit reads
     // the SAME session index (another clone before the move below).
     let sessions_state_index = session_index.clone();
-    // SESSION-06 store (`session-metadata.json`), created here (before the
-    // directory state) because BOTH the `POST /api/session-metadata` write
-    // route below and Task 20's session-directory read-join share it. Same
-    // isolated-home `.freshell` directory the settings store resolves
-    // (`settings_store.rs:246`), so a real deployment's existing
-    // `session-metadata.json` is discovered exactly like the legacy server
-    // discovers it.
-    let session_metadata_dir = home
-        .as_deref()
-        .map(|h| h.join(".freshell"))
-        .unwrap_or_else(|| PathBuf::from(".freshell"));
-    let session_metadata_store = session_metadata::SessionMetadataStore::new(session_metadata_dir);
+    // The session-metadata store was created above (before the sweeps) —
+    // both the `POST /api/session-metadata` write route below and Task
+    // 20's session-directory read-join share that instance.
     let session_directory_state = session_directory::SessionDirectoryState {
         auth_token: Arc::clone(&auth_token),
         settings: settings_store.clone(),
@@ -2288,6 +2615,14 @@ async fn main() -> ExitCode {
         metadata: session_metadata_store.clone(),
         // STATUS-STRIP: sessions.cloned pages are client-ordered per instance.
         server_instance: Arc::clone(&server_instance_id),
+        // Unified agent names (Task 7 review M1): captured AFTER the boot
+        // consolidation above ran — once the receipt committed, a scoped
+        // coding-agent row's displayed title never consults the migrated
+        // config title fields again (see apply_session_overrides).
+        legacy_name_migration_completed: session_names
+            .as_ref()
+            .map(|names| names.migration_completed())
+            .unwrap_or(false),
     };
 
     let client_dir = Arc::new(resolve_client_dir());
@@ -2499,7 +2834,7 @@ async fn main() -> ExitCode {
     // `POST /api/session-metadata` (`server/sessions-router.ts:220-244` +
     // `session-metadata-store.ts`): persists sidebar/fresh-agent `sessionType` tags to
     // `<home>/.freshell/session-metadata.json` through the SAME store instance Task 20's
-    // session-directory read-join reads (created above, before the directory state).
+    // session-directory read-join reads (created above, before the sweeps).
     let session_metadata_state = session_metadata::SessionMetadataApiState {
         auth_token: Arc::clone(&auth_token),
         store: session_metadata_store.clone(),
@@ -2655,8 +2990,37 @@ async fn main() -> ExitCode {
             // short-circuit.
             ai_key: ai_key.clone(),
             gemini: gemini.clone(),
+            // Delta-review round 4, finding 1: the same SESSION-06 metadata
+            // store the sweep and the directory read — the kilroy-lane
+            // seam's per-session `sessionType` discriminator for this
+            // route's title decisions.
+            metadata: session_metadata_store.clone(),
             index: sessions_state_index,
+            // Unified agent names (Task 4): the scoped generate-title
+            // compatibility path wakes the shared worker through this.
+            generation_wake: Some(session_name_generator.clone()),
         }))
+        // Unified agent names (Task 2): the canonical session-name HTTP
+        // surface — `POST /api/session-names/read` + `PATCH
+        // /api/session-names` + Task 7's `POST /api/session-names/import`.
+        // Mounted ONLY when the authority opened; a degraded (no-home) boot
+        // exposes no canonical route, and the convenience surfaces answer
+        // their 503 unavailable.
+        .merge(
+            session_names
+                .clone()
+                .map(|names| {
+                    session_name_routes::router(session_name_routes::SessionNamesState {
+                        auth_token: Arc::clone(&auth_token),
+                        names,
+                        // Task 7: the identity ledger resolving legacy
+                        // terminal import targets (the same registry every
+                        // rename surface reads).
+                        identity: terminal_identity.clone(),
+                    })
+                })
+                .unwrap_or_default(),
+        )
         .merge(project_colors::router(project_colors::ProjectColorsState {
             auth_token: Arc::clone(&auth_token),
             settings: settings_store.clone(),
@@ -2700,11 +3064,19 @@ async fn main() -> ExitCode {
                     let data_home = freshell_sessions::parse::default_opencode_data_home();
                     freshell_sessions::parse::opencode_session_row_by_id(&data_home, session_id)
                         .map(|row| {
-                            row.map(|r| freshell_sessions::resume_resolve::OpencodeByIdHit {
-                                session_id: r.session_id,
-                                cwd: r.cwd,
-                                title: r.title,
-                                last_activity_at: r.last_activity_at,
+                            row.map(|r| {
+                                // Unified agent names (Task 3): retain the
+                                // exact-ID DATABASE the row was found in —
+                                // carried from THIS locator's data home, not
+                                // recomputed from the row's directory.
+                                let database = data_home.join("opencode.db");
+                                freshell_sessions::resume_resolve::OpencodeByIdHit {
+                                    session_id: r.session_id,
+                                    cwd: r.cwd,
+                                    title: r.title,
+                                    last_activity_at: r.last_activity_at,
+                                    database: Some(database.display().to_string()),
+                                }
                             })
                         })
                         .map_err(|e| {
@@ -2759,6 +3131,10 @@ async fn main() -> ExitCode {
             resolve_permits: Arc::new(tokio::sync::Semaphore::new(
                 resolve::RESOLVE_MAX_CONCURRENCY,
             )),
+            // Unified agent names (Task 2): the shared identity registry —
+            // consulted for its naming sink when projecting matches (the
+            // same authority every rename route targets).
+            identity: terminal_identity.clone(),
         }))
         .merge(files::router(files_state))
         .merge(repo_icon::router(repo_icon_state))
@@ -3131,6 +3507,23 @@ fn resolve_ws_max_payload_bytes() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&value| value > 0)
         .unwrap_or(16 * 1024 * 1024)
+}
+
+/// TERM-09 terminal-stream backpressure config from env, fail-fast validated
+/// (responsive-terminal-restore Workstream 3): normal output pressure must
+/// reach bounded admission/spill (eviction + generation-scoped gap)
+/// STRICTLY before any pressure-related disconnect, so a configuration whose
+/// disconnect threshold sits at or below the spill bound refuses to boot —
+/// the caller logs a structured error naming the offending env vars and
+/// exits before binding any port. Validation lives HERE (the boot/env path),
+/// not inside `WsState`: test harnesses inject `Term09Config` values
+/// directly, including deliberately inverted shapes that make the monitor's
+/// last-resort window observable end to end.
+fn resolve_term09_config(
+) -> Result<freshell_ws::backpressure::Term09Config, freshell_ws::backpressure::Term09ConfigError> {
+    let config = freshell_ws::backpressure::Term09Config::from_env();
+    config.validate()?;
+    Ok(config)
 }
 
 /// SAFE-03: resolve the WS Origin allow-list from process env, mirroring
@@ -4202,6 +4595,96 @@ mod tests {
         }
     }
 
+    /// TERM-09 boot wiring (responsive-terminal-restore Workstream 3): the
+    /// boot resolution must fail fast on a configuration that would restore
+    /// the spill≥disconnect inversion, naming the offending env vars — and
+    /// accept every correctly-ordered shape. Env-dependent cases in ONE test
+    /// fn (whole-process env mutation; no other test in this crate reads the
+    /// TERMINAL_* vars).
+    #[test]
+    fn term09_boot_resolution_fails_fast_on_inverted_env() {
+        let _queue = EnvVarGuard::unset("TERMINAL_CLIENT_QUEUE_MAX_BYTES");
+        let _catastrophic = EnvVarGuard::unset("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES");
+        let _stall = EnvVarGuard::unset("TERMINAL_WS_CATASTROPHIC_STALL_MS");
+
+        // Defaults must boot and satisfy the strict ordering.
+        let defaults = resolve_term09_config().expect("defaults must resolve");
+        assert!(defaults.catastrophic_buffered_bytes > defaults.queue_max_bytes);
+
+        // An inverted override (disconnect below spill — the production
+        // incident's shape) refuses to boot, naming both env vars.
+        let _inverted = EnvVarGuard::set("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES", "1048576");
+        let err = resolve_term09_config().expect_err("inverted env must refuse boot");
+        let message = err.to_string();
+        assert!(
+            message.contains("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES")
+                && message.contains("TERMINAL_CLIENT_QUEUE_MAX_BYTES"),
+            "the boot error must name the offending env vars: {message}"
+        );
+        drop(_inverted);
+
+        // An equalized pair (disconnect == spill) also refuses.
+        let _equalized_queue = EnvVarGuard::set("TERMINAL_CLIENT_QUEUE_MAX_BYTES", "268435456");
+        let _equalized_cat =
+            EnvVarGuard::set("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES", "268435456");
+        resolve_term09_config().expect_err("equalized env must refuse boot");
+        drop(_equalized_queue);
+        drop(_equalized_cat);
+
+        // A correctly-ordered override boots.
+        let _ordered_queue = EnvVarGuard::set("TERMINAL_CLIENT_QUEUE_MAX_BYTES", "2097152");
+        let _ordered_cat = EnvVarGuard::set("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES", "8388608");
+        let tuned = resolve_term09_config().expect("ordered env must boot");
+        assert_eq!(tuned.queue_max_bytes, 2 * 1024 * 1024);
+        assert_eq!(tuned.catastrophic_buffered_bytes, 8 * 1024 * 1024);
+    }
+
+    /// Responsive-terminal-restore round-5 (finding 1, degenerate
+    /// settings): the boot wiring after `resolve_term09_config` clamps
+    /// the paced page budget to the queue-derived admission ceiling, so a
+    /// supported floor-sized queue never faces a default page larger
+    /// than the queue itself — the clamp the reserve-then-admit drain
+    /// gate relies on for its always-grantable, never-self-spilling
+    /// admissions.
+    #[test]
+    fn paced_page_budget_clamps_to_the_queue_admission_ceiling() {
+        // The exact relationship the boot applies (budget vs ceiling).
+        let clamp = |budget: i64, queue_max_bytes: usize| {
+            budget.min(freshell_ws::backpressure::paced_page_budget_ceiling(
+                queue_max_bytes,
+            ))
+        };
+        // Default settings: the default 128 KiB budget is far below the
+        // 16 MiB queue's 8 MiB ceiling — the clamp is a no-op.
+        assert_eq!(
+            clamp(
+                freshell_terminal::DEFAULT_PACED_PAGE_MAX_BYTES,
+                16 * 1024 * 1024,
+            ),
+            freshell_terminal::DEFAULT_PACED_PAGE_MAX_BYTES,
+        );
+        // THE DEGENERATE FLOOR: the supported 64 KiB queue (the TERM-09
+        // env floor) is SMALLER than the default 128 KiB page — the boot
+        // clamp caps the registry's budget at the 32 KiB watermark.
+        assert_eq!(
+            clamp(
+                freshell_terminal::DEFAULT_PACED_PAGE_MAX_BYTES,
+                freshell_ws::backpressure::TERM09_QUEUE_MAX_BYTES_FLOOR,
+            ),
+            32 * 1024,
+            "a 64 KiB queue must never carry a 128 KiB page"
+        );
+        // The wiring's mechanism: the registry carries the clamped value
+        // through the real setter/getter pair the boot uses.
+        let registry = freshell_terminal::TerminalRegistry::new();
+        let clamped = clamp(
+            registry.paced_page_max_bytes(),
+            freshell_ws::backpressure::TERM09_QUEUE_MAX_BYTES_FLOOR,
+        );
+        registry.set_paced_page_max_bytes(clamped);
+        assert_eq!(registry.paced_page_max_bytes(), 32 * 1024);
+    }
+
     fn env_test_temp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "frs-main-{tag}-{}-{}",
@@ -4277,6 +4760,9 @@ mod tests {
         let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Mutates `CLAUDE_HOME` (unset) — hold the crate-wide CLAUDE env
+        // lock too, AFTER the HOME lock (`crate::test_env_lock`'s order).
+        let _claude_env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         let home = env_test_temp_dir("claude-fallback");
         let _home = EnvVarGuard::set("HOME", home.to_str().unwrap());
         let _claude_home = EnvVarGuard::unset("CLAUDE_HOME");
@@ -4309,6 +4795,9 @@ mod tests {
         let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Mutates `CLAUDE_HOME` (unset) — hold the crate-wide CLAUDE env
+        // lock too, AFTER the HOME lock (`crate::test_env_lock`'s order).
+        let _claude_env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         let profile = env_test_temp_dir("claude-fallback-userprofile");
         let _home = EnvVarGuard::unset("HOME");
         let _claude_home = EnvVarGuard::unset("CLAUDE_HOME");
@@ -4343,6 +4832,9 @@ mod tests {
         let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Mutates `CLAUDE_HOME` (unset) — hold the crate-wide CLAUDE env
+        // lock too, AFTER the HOME lock (`crate::test_env_lock`'s order).
+        let _claude_env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         let home = env_test_temp_dir("claude-fallback");
         let _claude_home = EnvVarGuard::unset("CLAUDE_HOME");
         let _userprofile = EnvVarGuard::set("USERPROFILE", home.to_str().unwrap());
@@ -4403,6 +4895,10 @@ mod tests {
 
     #[test]
     fn claude_transcript_present_is_not_absent() {
+        // Env-first reader (`claude_home` may resolve a FOREIGN root while a
+        // same-binary mutator holds `CLAUDE_HOME`) — take the crate-wide
+        // lock (see `crate::test_env_lock`).
+        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         let home = tempfile::tempdir().expect("tempdir");
         let proj = home.path().join(".claude").join("projects").join("-p");
         std::fs::create_dir_all(&proj).expect("mkdir projects/-p");
@@ -4415,6 +4911,8 @@ mod tests {
 
     #[test]
     fn claude_empty_projects_tree_is_definitively_absent() {
+        // Env-first reader — take the crate-wide lock (`crate::test_env_lock`).
+        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         let home = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(home.path().join(".claude").join("projects"))
             .expect("mkdir empty projects");
@@ -4428,6 +4926,12 @@ mod tests {
     #[test]
     fn claude_unreadable_projects_root_defers() {
         use std::os::unix::fs::PermissionsExt;
+        // Env-first reader — take the crate-wide lock (`crate::test_env_lock`).
+        // This is the final-suite gate flake: without the guard a
+        // concurrently running discovery test's CLAUDE_HOME (readable tree,
+        // no sess-1.jsonl) flipped the gate to "definitively absent" and
+        // failed the must-DEFER assert.
+        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         let home = tempfile::tempdir().expect("tempdir");
         let projects = home.path().join(".claude").join("projects");
         std::fs::create_dir_all(&projects).expect("mkdir projects");
@@ -4447,6 +4951,9 @@ mod tests {
     #[test]
     fn claude_unreadable_project_subdir_defers() {
         use std::os::unix::fs::PermissionsExt;
+        // Env-first reader — take the crate-wide lock (`crate::test_env_lock`):
+        // the gate-flake twin of the projects-root case above.
+        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         let home = tempfile::tempdir().expect("tempdir");
         let projects = home.path().join(".claude").join("projects");
         let proj = projects.join("-p");
@@ -4466,6 +4973,10 @@ mod tests {
 
     #[test]
     fn missing_projects_root_defers() {
+        // Env-first reader — take the crate-wide lock (`crate::test_env_lock`):
+        // a concurrent mutator's foreign CLAUDE_HOME HAS a projects root, so
+        // the no-root defer branch would flip to "definitively absent".
+        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         let home = tempfile::tempdir().expect("tempdir");
         assert!(
             !transcript_definitively_absent(home.path(), "claude", "sess-1"),

@@ -17,14 +17,14 @@ const projectRoot = path.resolve(import.meta.dirname, '../../..')
 describe('e2e-cloud wrapper lane provenance', () => {
   it('the default-local path prints a self-identifying lane banner and runs the base config', async () => {
     const stubDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-e2e-cloud-stub-'))
-    const argsFile = path.join(stubDir, 'npx-args.txt')
-    const npxStub = path.join(stubDir, 'npx')
-    await fsp.writeFile(npxStub, [
+    const argsFile = path.join(stubDir, 'pnpm-args.txt')
+    const pnpmStub = path.join(stubDir, 'pnpm')
+    await fsp.writeFile(pnpmStub, [
       '#!/usr/bin/env bash',
       `printf '%s\\n' "$@" > ${JSON.stringify(argsFile)}`,
       'exit 0',
     ].join('\n'))
-    await fsp.chmod(npxStub, 0o755)
+    await fsp.chmod(pnpmStub, 0o755)
 
     const env: NodeJS.ProcessEnv = { ...process.env }
     delete env.FRESHELL_E2E_BACKEND
@@ -41,8 +41,9 @@ describe('e2e-cloud wrapper lane provenance', () => {
     expect(result.stdout).toContain('CLOUD_SKIP_SPECS does not apply')
     expect(result.stdout).toContain('backend=local; source: default')
 
-    const npxArgs = (await fsp.readFile(argsFile, 'utf8')).split('\n').filter(Boolean)
-    expect(npxArgs).toEqual([
+    const pnpmArgs = (await fsp.readFile(argsFile, 'utf8')).split('\n').filter(Boolean)
+    expect(pnpmArgs).toEqual([
+      'exec',
       'playwright',
       'test',
       '--config',

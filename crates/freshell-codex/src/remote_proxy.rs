@@ -62,8 +62,9 @@ use crate::remote_proxy_envelope::{
 };
 use crate::remote_proxy_side_effects::{
     extract_fork_response_candidate, extract_fs_changed_repair_trigger,
-    extract_thread_lifecycle_event, extract_thread_start_response_candidate,
-    extract_thread_started_notification_side_effects, extract_turn_notification_event,
+    extract_initialize_codex_home, extract_thread_lifecycle_event, extract_thread_name_set_request,
+    extract_thread_start_response_candidate, extract_thread_started_notification_side_effects,
+    extract_turn_notification_event, extract_upstream_thread_name_updated,
     normalize_thread_fork_response_for_tui, rewrite_thread_fork_request_exclude_turns,
     ForkResponseOptions, RemoteProxyCandidate, ThreadLifecycleEvent, ThreadStartResponseOptions,
     ThreadStartedLifecycle, TurnEvent as SideEffectTurnEvent,
@@ -254,6 +255,23 @@ pub enum RemoteProxyEvent {
     /// (decision 5c), or connection teardown draining the pending set (decision 5b).
     ApprovalResolved {
         request_id: String,
+    },
+    /// Unified agent names (Task 3): a native thread name was observed — an
+    /// upstream `thread/name/updated` notification or a FORWARDED
+    /// `thread/name/set` client request. Codex's automatic and human callers
+    /// send the same public request, so the observation is always AUTOMATIC;
+    /// only declared Freshell user intent promotes a record.
+    NativeNameObserved {
+        thread_id: String,
+        name: String,
+    },
+    /// T2-M6 (Task 3): an upstream `initialize` response carried `codexHome`
+    /// — the INITIALIZED root this proxied connection's rollouts live under,
+    /// captured per connection so the native lanes' rollout walk uses the
+    /// captured root instead of ambient env.
+    UpstreamInitialized {
+        conn_id: u64,
+        codex_home: String,
     },
 }
 
@@ -1074,6 +1092,29 @@ impl Hub {
             return;
         }
 
+        // Unified agent names (Task 3): a forwarded `thread/name/set` is a
+        // native name observation — automatic, whether the TUI's human
+        // renamed the thread or a tool did. The frame relays verbatim
+        // regardless; a failed extraction is a log-only miss.
+        if method.as_deref() == Some("thread/name/set") {
+            match extract_thread_name_set_request(&data) {
+                Ok(Some(request)) => {
+                    self.emit(RemoteProxyEvent::NativeNameObserved {
+                        thread_id: request.thread_id,
+                        name: request.name,
+                    });
+                }
+                Ok(None) => {}
+                Err(reason) => {
+                    tracing::debug!(
+                        conn_id,
+                        reason = ?reason,
+                        "codex proxy could not observe a thread/name/set frame"
+                    );
+                }
+            }
+        }
+
         if method.as_deref() == Some("turn/interrupt") && data.len() <= MAX_FULL_PARSE_BYTES {
             if let (Ok(parsed), Some(id)) = (serde_json::from_slice::<Value>(&data), id.as_ref()) {
                 if self.completed_turn_interrupt(&parsed).is_some() {
@@ -1260,11 +1301,45 @@ impl Hub {
                 );
                 return;
             }
+            // T2-M6 (Task 3): an `initialize` response carrying `codexHome`
+            // is the initialized root this proxied connection's rollouts live
+            // under — capture it for the native lanes' rollout walk. Small
+            // frames only (the initialize result is small; thread/read
+            // results are not, and they never carry codexHome).
+            if method.as_deref() == Some("initialize") && data.len() <= MAX_FULL_PARSE_BYTES {
+                match extract_initialize_codex_home(&data) {
+                    Ok(Some(codex_home)) => {
+                        self.emit(RemoteProxyEvent::UpstreamInitialized {
+                            conn_id,
+                            codex_home,
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(reason) => {
+                        tracing::debug!(
+                            conn_id,
+                            reason = ?reason,
+                            "codex proxy could not extract the initialize codexHome"
+                        );
+                    }
+                }
+            }
             self.send_to_client(conn_id, data, binary);
             return;
         }
 
         if let Some(method) = envelope.method.as_deref() {
+            // Unified agent names (Task 3): an upstream `thread/name/updated`
+            // notification is a native name observation (automatic). Small
+            // frames only; the notification relays verbatim either way.
+            if method == "thread/name/updated" && data.len() <= MAX_FULL_PARSE_BYTES {
+                if let Ok(Some(observed)) = extract_upstream_thread_name_updated(&data) {
+                    self.emit(RemoteProxyEvent::NativeNameObserved {
+                        thread_id: observed.0,
+                        name: observed.1,
+                    });
+                }
+            }
             if method == "serverRequest/resolved" {
                 // Decision 5c: the app-server resolved its own request (fields
                 // {thread_id, request_id} under camelCase serde rename — codex

@@ -53,7 +53,7 @@ function codexSessionsDir() {
   return path.join(home, 'sessions', yyyy, mm, dd)
 }
 
-function writeRollout(threadId) {
+function writeRollout(threadId, firstPrompt) {
   const now = new Date()
   const ts = now.toISOString().slice(0, 19).replace(/:/g, '-')
   const dir = codexSessionsDir()
@@ -64,7 +64,24 @@ function writeRollout(threadId) {
     type: 'session_meta',
     payload: { id: threadId, cwd: process.cwd() },
   }
-  fs.writeFileSync(file, `${JSON.stringify(meta)}\n`)
+  const lines = [JSON.stringify(meta)]
+  // Unified agent names (Task 8): the first prompt's user records — the same
+  // record pair the real CLI writes and the server's rollout parser reads
+  // for the first-message fallback + generation arming.
+  const prompt = String(firstPrompt ?? '').trim()
+  if (prompt.length > 0) {
+    lines.push(JSON.stringify({
+      timestamp: now.toISOString(),
+      type: 'response_item',
+      payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: prompt }] },
+    }))
+    lines.push(JSON.stringify({
+      timestamp: now.toISOString(),
+      type: 'event_msg',
+      payload: { type: 'user_message', message: prompt, kind: 'plain' },
+    }))
+  }
+  fs.writeFileSync(file, `${lines.join('\n')}\n`)
 }
 
 const resumeIndex = argv.indexOf('resume')
@@ -121,9 +138,14 @@ if (resumeIndex !== -1) {
     // create the rollout — only the first Enter does.
     if (!s.includes('\r') && !s.includes('\n')) return
     wrote = true
+    // Unified agent names (Task 8): the first prompt's text is the durable
+    // user-message metadata the server's rollout/naming lanes parse —
+    // mirror the real CLI's `response_item` user `input_text` + `event_msg`
+    // `user_message` records in the rollout (strip the Enter).
+    const firstPrompt = s.replace(/[\r\n]+$/, '').trim()
     const finish = (maybeThreadId) => {
       const threadId = maybeThreadId ?? crypto.randomUUID()
-      writeRollout(threadId)
+      writeRollout(threadId, firstPrompt)
       process.stdout.write(`codex: session ${threadId} started\r\n`)
     }
     const gate = process.env.FAKE_CODEX_TERMINAL_ROLLOUT_GATE_PATH
