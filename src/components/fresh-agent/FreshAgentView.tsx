@@ -3786,15 +3786,28 @@ export function FreshAgentView({
                 />
               ) : null}
               {sessionEnded ? (
-                <div className="fresh-agent-session-ended-card flex items-center justify-between gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm">
+                <div className="fresh-agent-session-ended-card flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm">
                   <span>This session has ended{sessionErrorMessage ? '' : ' (the agent process exited)'}.</span>
-                  <button
-                    type="button"
-                    className="fresh-agent-session-ended-action shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
-                    onClick={startNewConversation}
-                  >
-                    Start new session
-                  </button>
+                  <div className="flex flex-wrap gap-2">
+                    {paneContent.provider === 'codex'
+                      && effectiveStatus === 'exited'
+                      && getCanonicalCodexResumeSessionId(paneContent) ? (
+                        <button
+                          type="button"
+                          className="fresh-agent-session-ended-action rounded border border-border/70 px-2 py-1 text-xs"
+                          onClick={triggerRecovery}
+                        >
+                          Resume session
+                        </button>
+                      ) : null}
+                    <button
+                      type="button"
+                      className="fresh-agent-session-ended-action rounded border border-border/70 px-2 py-1 text-xs"
+                      onClick={startNewConversation}
+                    >
+                      Start new session
+                    </button>
+                  </div>
                 </div>
               ) : null}
               {notice ? <FreshAgentApprovalBanner text={notice} /> : null}

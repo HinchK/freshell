@@ -182,6 +182,7 @@ async function bootCrashingFreshcodexLane(
         FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
           delayMethodsMs: { 'turn/start': 3_000 },
           exitProcessAfterMethodsOnce: ['turn/start'],
+          exitProcessAfterMethodsOnceMarkerPath: path.join(sharedRoot, 'codex-crashed-once'),
         }),
       },
       setupHome: async (homeDir) => {
@@ -1228,8 +1229,9 @@ test.describe('Restore Matrix', () => {
   // `exitProcessAfterMethodsOnce` behavior flag (`fake-app-server.mjs`) to
   // make the fixture crash ITSELF immediately after answering `turn/start`
   // -- i.e., exactly mid-turn, while the pane is still busy waiting for a
-  // completion it will now never receive from that process. This is
-  // configuration (env vars this spec sets), not a fixture code change.
+  // completion it will now never receive from that process. A shared marker
+  // limits the crash to the first process so its replacement can answer the
+  // recovery turn.
   //
   // Under the unified needs-attention contract a crash is a turn end like
   // any other, so the old single lane (which asserted "no chime" by reading
@@ -1368,16 +1370,9 @@ test.describe('Restore Matrix', () => {
         expect(exitedLeaf?.content?.sessionId ?? exitedLeaf?.content?.sessionRef?.sessionId)
           .toBe(sessionId)
 
-        // Retry/send again: the lazy self-heal respawns a replacement
-        // process and the SAME durable session continues (crates/
-        // freshell-freshagent/src/codex.rs's `ensure_session_alive`
-        // transparent respawn, exercised here end-to-end through the real
-        // browser/pane/composer path rather than only at the Rust unit
-        // level). "Start new session" is the client's own recovery
-        // affordance for this exact state -- clicking it clears
-        // `sessionEnded` and triggers the respawn, matching TERM-18's
-        // "click retry/send again".
-        await paneRoot.getByRole('button', { name: 'Start new session' }).click()
+        // Resume the same durable conversation through a replacement
+        // provider process, then send another turn.
+        await paneRoot.getByRole('button', { name: 'Resume session' }).click()
         await expect(paneRoot.getByText(/This session has ended/i)).not.toBeVisible({ timeout: 20_000 })
 
         await composer.fill('term18-retry-after-crash probe')

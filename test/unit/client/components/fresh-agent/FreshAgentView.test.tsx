@@ -6160,6 +6160,56 @@ describe('FreshAgentView', () => {
     })
   })
 
+  it('resumes an exited Codex pane without closing its durable conversation', async () => {
+    const store = createStore()
+    store.dispatch(sessionInit({
+      sessionId: 'codex-thread-exited',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      model: 'gpt-6-astra',
+    }))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-codex-exited',
+        sessionId: 'codex-thread-exited',
+        sessionRef: { provider: 'codex', sessionId: 'codex-thread-exited' },
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+    act(() => {
+      store.dispatch(sessionExited({
+        sessionId: 'codex-thread-exited',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+      }))
+    })
+
+    expect(await screen.findByRole('button', { name: 'Start new session' })).toBeVisible()
+    wsMock.send.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: 'Resume session' }))
+
+    await waitFor(() => {
+      const pane = getFreshAgentPaneContent(store)
+      expect(pane.status).toBe('creating')
+      expect(pane.sessionId).toBeUndefined()
+      expect(pane.sessionRef).toEqual({ provider: 'codex', sessionId: 'codex-thread-exited' })
+      expect(pane.resumeSessionId).toBe('codex-thread-exited')
+    })
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.recovery.stop' }))
+  })
+
   it('keeps an established freshclaude pane interactive after remount when snapshot loading is unavailable', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new TypeError('Failed to parse URL from /api/fresh-agent/threads/claude/sess-1'))
