@@ -11,10 +11,10 @@
 //! controller owns its own accept loop per listener. Retiring a listener uses
 //! `Notify::notify_one()` (permit-storing: the wakeup cannot be lost, unlike
 //! `notify_waiters`) and then AWAITS the old accept-loop `JoinHandle`, which
-//! exits only after dropping its listener — a deterministic "old socket
-//! closed" barrier, so callers may respond/probe immediately after `serve_on`
-//! returns. In-flight connections (incl. WebSockets) drain in their own
-//! spawned tasks — no mass 4009 on rebind.
+//! first hands off queued connections and then drops its listener — a
+//! deterministic "old socket closed" barrier, so callers may respond/probe
+//! immediately after `serve_on` returns. In-flight connections (incl.
+//! WebSockets) drain in their own spawned tasks — no mass 4009 on rebind.
 //!
 //! Trade-off: SO_REUSEPORT lets another process of the same effective UID bind
 //! the port. On a single-user self-hosted box that is inside the same trust
@@ -27,6 +27,8 @@ use axum::Router;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
+
+const LISTEN_BACKLOG: usize = 1024;
 
 pub fn parse_reuse_port(raw: Option<&str>) -> bool {
     match raw {
@@ -57,7 +59,7 @@ pub fn bind_reusable(addr: SocketAddr, reuse_port: bool) -> std::io::Result<StdT
     #[cfg(not(unix))]
     let _ = reuse_port;
     socket.bind(&addr.into())?;
-    socket.listen(1024)?;
+    socket.listen(LISTEN_BACKLOG as i32)?;
     let std_listener: StdTcpListener = socket.into();
     std_listener.set_nonblocking(true)?;
     Ok(std_listener)
@@ -121,6 +123,7 @@ impl RebindController {
         };
         let addr = SocketAddr::new(host, self.port);
         let std_listener = bind_reusable(addr, self.reuse_port)?; // PROOF: must succeed
+        let drain_listener = std_listener.try_clone()?;
         let listener = tokio::net::TcpListener::from_std(std_listener)?;
         // The listener's OWN address (its port when the caller bound
         // kernel-assigned port 0): the product-truth record the rollback
@@ -129,10 +132,54 @@ impl RebindController {
         let shutdown = Arc::new(Notify::new());
         let shut = Arc::clone(&shutdown);
         let accept_loop = tokio::spawn(async move {
+            let serve = |stream: tokio::net::TcpStream| {
+                let app = app.clone();
+                tokio::spawn(async move {
+                    use tower::ServiceExt as _;
+                    let socket = hyper_util::rt::TokioIo::new(stream);
+                    let hyper_service = hyper::service::service_fn(
+                        move |request: hyper::Request<hyper::body::Incoming>| {
+                            app.clone().oneshot(request)
+                        },
+                    );
+                    let _ = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection_with_upgrades(socket, hyper_service)
+                    .await;
+                });
+            };
             loop {
                 tokio::select! {
                     biased;
-                    _ = shut.notified() => break,
+                    _ = shut.notified() => {
+                        // A TCP handshake can finish before this loop accepts
+                        // it. Closing the listener with that socket queued
+                        // resets the client, so hand off the queued sockets
+                        // before dropping the retiring listener.
+                        // Bound the drain by the configured backlog so new
+                        // arrivals cannot keep a rebind open indefinitely.
+                        for _ in 0..LISTEN_BACKLOG {
+                            match drain_listener.accept() {
+                                Ok((stream, _remote)) => {
+                                    if let Err(err) = stream.set_nonblocking(true) {
+                                        tracing::warn!(error = %err, "listener drain stream setup failed");
+                                        continue;
+                                    }
+                                    match tokio::net::TcpStream::from_std(stream) {
+                                        Ok(stream) => serve(stream),
+                                        Err(err) => tracing::warn!(error = %err, "listener drain stream registration failed"),
+                                    }
+                                }
+                                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                                Err(err) => {
+                                    tracing::warn!(error = %err, "listener drain failed");
+                                    break;
+                                }
+                            }
+                        }
+                        break;
+                    },
                     res = listener.accept() => {
                         let (stream, _remote) = match res {
                             Ok(accepted) => accepted,
@@ -145,25 +192,7 @@ impl RebindController {
                                 continue;
                             }
                         };
-                        let app = app.clone();
-                        tokio::spawn(async move {
-                            // axum 0.8 "serve with hyper directly" pattern — if the
-                            // compiler objects to the service shape, mirror the
-                            // vendored axum example `serve-with-hyper` exactly.
-                            // `serve_connection_with_upgrades` keeps WebSockets working.
-                            use tower::ServiceExt as _;
-                            let socket = hyper_util::rt::TokioIo::new(stream);
-                            let hyper_service = hyper::service::service_fn(
-                                move |request: hyper::Request<hyper::body::Incoming>| {
-                                    app.clone().oneshot(request)
-                                },
-                            );
-                            let _ = hyper_util::server::conn::auto::Builder::new(
-                                hyper_util::rt::TokioExecutor::new(),
-                            )
-                            .serve_connection_with_upgrades(socket, hyper_service)
-                            .await;
-                        });
+                        serve(stream);
                     }
                 }
             }
@@ -307,6 +336,47 @@ mod tests {
         // stuck listener remains (the lost-wakeup failure mode).
         std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
             .expect("no stuck listeners after 100 swaps");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rebind_serves_a_connection_queued_on_the_retiring_listener() {
+        use axum::{routing::get, Router};
+        use std::io::Write;
+        use tokio::io::AsyncReadExt;
+
+        let port = free_port();
+        let app = Router::new().route("/ping", get(|| async { "pong" }));
+        let ctl = RebindController::new(port, true);
+        ctl.set_app(app);
+        ctl.serve_on(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .await
+            .expect("initial serve");
+
+        // A current-thread runtime has not polled the accept loop yet. The
+        // handshake and request reach the old socket before its shutdown.
+        let mut raw = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .expect("connect to the retiring listener");
+        raw.write_all(b"GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .expect("send request before rebind");
+        raw.set_nonblocking(true).expect("nonblocking client");
+        let mut client = tokio::net::TcpStream::from_std(raw).expect("register client");
+
+        ctl.serve_on(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+            .await
+            .expect("rebind serve");
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .expect("queued request completes")
+        .expect("queued request is not reset");
+        assert!(
+            response.ends_with(b"pong"),
+            "queued request must be served by the retiring listener"
+        );
+        ctl.shutdown_all().await;
     }
 
     /// Pins the DEV-0013 drain property: a connection accepted by the OLD
