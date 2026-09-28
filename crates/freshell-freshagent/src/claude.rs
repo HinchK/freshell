@@ -9984,6 +9984,31 @@ pub(crate) mod tests {
         (FreshClaudeState::new(Arc::new(tx)), rx)
     }
 
+    #[cfg(target_os = "linux")]
+    async fn spawn_term_immune_tagged_child(
+        ownership_id: &str,
+    ) -> (tokio::process::Child, tempfile::TempDir) {
+        let readiness = tempfile::tempdir().expect("readiness directory");
+        let ready_path = readiness.path().join("term-trap-ready");
+        let child = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg("trap '' TERM; printf ready > \"$FRESHELL_TEST_CHILD_READY\"; while :; do sleep 1; done")
+            .env(CLAUDE_SIDECAR_OWNERSHIP_ENV, ownership_id)
+            .env("FRESHELL_TEST_CHILD_READY", &ready_path)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the lingering tagged grandchild");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready_path.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "child never installed its TERM trap"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        (child, readiness)
+    }
+
     fn attach_msg(session_id: &str) -> FreshAgentAttach {
         FreshAgentAttach {
             observed_epoch: None,
@@ -10054,13 +10079,8 @@ pub(crate) mod tests {
         // The lingering ownership-tagged "CLI grandchild": SIGTERM-immune
         // (only the confirmed-death escalation's SIGKILL can end it).
         // `kill_on_drop` backstops the assertion's own failure path.
-        let mut grandchild = tokio::process::Command::new("bash")
-            .arg("-c")
-            .arg("trap '' TERM; while :; do sleep 1; done")
-            .env(CLAUDE_SIDECAR_OWNERSHIP_ENV, format!("test-{sid}"))
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn the lingering tagged grandchild");
+        let (mut grandchild, _readiness) =
+            spawn_term_immune_tagged_child(&format!("test-{sid}")).await;
         let grandchild_pid = grandchild.id().expect("grandchild pid");
 
         let result = st.kill_for_handoff(&sid, "test-f2").await;
@@ -10100,13 +10120,8 @@ pub(crate) mod tests {
         // The lingering ownership-tagged "CLI grandchild": SIGTERM-immune
         // (the one-round window never reaches the SIGKILL escalation).
         // `kill_on_drop` backstops the assertion's own failure path.
-        let mut grandchild = tokio::process::Command::new("bash")
-            .arg("-c")
-            .arg("trap '' TERM; while :; do sleep 1; done")
-            .env(CLAUDE_SIDECAR_OWNERSHIP_ENV, format!("test-{sid}"))
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn the lingering tagged grandchild");
+        let (mut grandchild, _readiness) =
+            spawn_term_immune_tagged_child(&format!("test-{sid}")).await;
         let grandchild_pid = grandchild.id().expect("grandchild pid");
 
         let result = st.kill_for_handoff(&sid, "test-fr3").await;
@@ -16069,13 +16084,7 @@ rl.on('line', (line) => {
                 .expect("the sidecar's ownership id")
                 .to_string()
         };
-        let mut grandchild = tokio::process::Command::new("bash")
-            .arg("-c")
-            .arg("trap '' TERM; while :; do sleep 1; done")
-            .env("FRESHELL_CLAUDE_SIDECAR_ID", &ownership_id)
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn the lingering tagged grandchild");
+        let (mut grandchild, _readiness) = spawn_term_immune_tagged_child(&ownership_id).await;
         let grandchild_pid = grandchild.id().expect("grandchild pid");
 
         while rx.try_recv().is_ok() {}
