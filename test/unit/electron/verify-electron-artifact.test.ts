@@ -290,9 +290,8 @@ describe('verify-electron-artifact', () => {
       writeArtifact(root, platform)
       writeFileSync(path.join(root, file), 'electron-builder resource')
       expect(verifyElectronArtifact(root, platform, {
-        hostPlatform: platform === 'linux' ? 'darwin' : 'linux',
-        probe: () => { throw new Error('foreign binary must not execute locally') },
-      })).toMatchObject({ ok: true, platform, executed: false })
+        probe: refusingProbe(),
+      })).toMatchObject({ ok: true, platform, executed: platform === nativePlatform })
     }
   })
 
