@@ -2367,13 +2367,17 @@ async fn the_worker_alternates_native_and_generation_under_sustained_native_requ
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
-        let named = store
-            .get(vec![pending("g4")])
-            .await
-            .expect("get")
-            .into_iter()
-            .next()
-            .and_then(|u| (u.record.source == NameSource::FreshellAi).then_some(u));
+        let named = match store.get(vec![pending("g4")]).await {
+            Ok(updates) => updates
+                .into_iter()
+                .next()
+                .and_then(|u| (u.record.source == NameSource::FreshellAi).then_some(u)),
+            // The worker is intentionally writing the same document. A
+            // bounded lock miss is a valid read result; keep polling until
+            // the overall completion deadline instead of failing this race.
+            Err(NameError::LockUnavailable(_)) => None,
+            Err(error) => panic!("get: {error:?}"),
+        };
         if named.is_some() {
             break;
         }
@@ -2429,6 +2433,17 @@ fn child_env(dir: &Path, role: &str) -> std::process::Command {
 async fn run_worker_child_role(role: &str, dir: &Path) {
     let stop_path = dir.join("child-stop");
     let store = open_store(dir);
+    if role == "worker" {
+        std::fs::write(dir.join("child-ready"), b"ready").expect("signal child store open");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !dir.join("child-start").exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "parent never started workers"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
     let cell = AiKeyCell::init(Some("child-key".to_string()), None);
     let settings = settings_for(dir);
     let (transport, native): (Arc<dyn GeminiTransport>, Arc<dyn NativeNameBackend>) = match role {
@@ -2476,9 +2491,6 @@ async fn worker_contention() {
 
     // -- Part 1: 30 sessions, two real workers, no duplicate claims --------
     let parent_store = open_store(&data_dir);
-    let child = child_env(&data_dir, "worker")
-        .spawn()
-        .expect("spawn child worker");
     for index in 0..30 {
         let handle = format!("h-two-{index:02}");
         let target = pending(&handle);
@@ -2498,8 +2510,22 @@ async fn worker_contention() {
         )
         .await;
     }
+    // Finish seeding before starting the second process: its initial store
+    // open is a bounded transaction, not part of the worker contention.
+    let child = child_env(&data_dir, "worker")
+        .spawn()
+        .expect("spawn child worker");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while !data_dir.join("child-ready").exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "child did not open its store"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let parent_transport = CountingTransport::new("Parent AI name");
     let parent_generator = generator_with(&data_dir, Some("parent-key"), parent_transport.clone());
+    std::fs::write(data_dir.join("child-start"), b"start").unwrap();
     let parent_worker = SessionNameWorker::start(
         Arc::clone(&parent_store),
         Arc::new(NoRouteNative),
@@ -2508,14 +2534,24 @@ async fn worker_contention() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let mut named = 0;
-        let updates = parent_store
+        let updates = match parent_store
             .get(
                 (0..30)
                     .map(|index| pending(&format!("h-two-{index:02}")))
                     .collect(),
             )
             .await
-            .expect("batch get");
+        {
+            Ok(updates) => updates,
+            Err(NameError::LockUnavailable(_)) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "document remained locked while workers ran"
+                );
+                continue;
+            }
+            Err(error) => panic!("batch get: {error:?}"),
+        };
         for update in updates {
             if update.record.source == NameSource::FreshellAi {
                 named += 1;
@@ -2532,7 +2568,13 @@ async fn worker_contention() {
     }
     std::fs::write(data_dir.join("child-stop"), b"stop").unwrap();
     let output = child.wait_with_output().expect("child exits");
-    assert!(output.status.success(), "child worker exited cleanly");
+    assert!(
+        output.status.success(),
+        "child worker exited cleanly: status={}, stdout={}, stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
     parent_worker.abort();
     let doc = document_json(&data_dir);
     let generation = doc["generation"].as_object().expect("generation section");
