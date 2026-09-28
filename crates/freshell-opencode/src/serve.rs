@@ -1625,18 +1625,37 @@ impl OpencodeServeManager {
     /// executing the turn while the local await is still parked on the
     /// response, so a handoff landing in that window still sees the
     /// acceptance armed and issues the daemon-side abort.
+    ///
+    /// `dispatched_witness` (send-during-compact queue, Task 5): the FRESH
+    /// per-drive guard-release witness the queued-send drain's drive block
+    /// races its ownership op guard against — the additive second witness
+    /// mirroring `compact`'s two-witness collection: both flip INSIDE the
+    /// request leg at the true send point, so the guard releases exactly
+    /// at the prompt POST's dispatch boundary (never earlier, and never
+    /// held through the turn's read-only await-idle tail).
     pub async fn prompt_async(
         &self,
         id: &str,
         body: Value,
         route: &Route,
         dispatch_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        dispatched_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<(), ServeError> {
         let path = with_route(
             &format!("/session/{}/prompt_async", encode_path_segment(id)),
             route,
         );
-        let witnesses = dispatch_witness.map(|w| vec![w]).unwrap_or_default();
+        // Both witnesses flip INSIDE the request leg at the true send point —
+        // the exact shape `compact` uses (both arrive at the dispatch boundary).
+        let mut witnesses = Vec::with_capacity(
+            dispatch_witness.is_some() as usize + dispatched_witness.is_some() as usize,
+        );
+        if let Some(w) = dispatch_witness {
+            witnesses.push(w);
+        }
+        if let Some(w) = dispatched_witness {
+            witnesses.push(w);
+        }
         self.json_request_maybe_witnessed(
             HttpMethod::Post,
             &path,
@@ -2101,6 +2120,12 @@ impl OpencodeServeManager {
     /// that moment the turn may execute INSIDE the shared serve while the
     /// local future can later fail (IdleTimeout) or be cancelled with the
     /// flag still falsely dark.
+    ///
+    /// `dispatched_witness` (send-during-compact queue, Task 5): the
+    /// additive fresh per-drive guard-release witness, threaded through
+    /// to [`Self::prompt_async`]'s request leg — the drain-driven send's
+    /// op guard releases the moment it flips (the prompt POST's dispatch
+    /// boundary), never before.
     #[allow(clippy::too_many_arguments)] // the turn field set (the compact precedent carries its witness the same way)
     pub async fn run_turn(
         &self,
@@ -2111,11 +2136,18 @@ impl OpencodeServeManager {
         timeout: Duration,
         route: Route,
         accepted_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        dispatched_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<(), ServeError> {
         let rx = self.subscribe(session_id);
         let body = build_prompt_body(text, model, effort);
-        self.prompt_async(session_id, body, &route, accepted_witness)
-            .await?;
+        self.prompt_async(
+            session_id,
+            body,
+            &route,
+            accepted_witness,
+            dispatched_witness,
+        )
+        .await?;
         self.await_idle(session_id, rx, timeout, route).await
     }
 
@@ -2833,6 +2865,7 @@ mod tests {
                 Duration::from_millis(50),
                 None,
                 Some(armed),
+                None,
             )
             .await
         });
@@ -2857,6 +2890,79 @@ mod tests {
         assert!(
             witness.load(Ordering::SeqCst),
             "an ambiguous local failure keeps the acceptance armed (fail closed)"
+        );
+    }
+
+    /// Task 5 (send-during-compact queue): the ADDITIVE trailing
+    /// `dispatched_witness` — the fresh per-drive guard-release witness
+    /// the queued-send drain's drive block races its op guard against —
+    /// flips at the prompt POST's DISPATCH boundary exactly like the
+    /// accepted witness (both ride the one request leg), and NOT before:
+    /// dark before the POST is issued, armed inside the
+    /// POST-received→response-processed window (the same parked-POST rig
+    /// as the accepted-witness test above).
+    #[tokio::test]
+    async fn run_turn_arms_the_dispatched_witness_at_the_dispatch_boundary() {
+        let http = Arc::new(ParkedPromptHttp::new());
+        let deps = ServeDeps {
+            spawner: Arc::new(FakeSpawner),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let mgr = OpencodeServeManager::new(deps, ServeConfig::default());
+        mgr.ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+
+        let accepted = Arc::new(AtomicBool::new(false));
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let armed_accepted = Arc::clone(&accepted);
+        let armed_dispatched = Arc::clone(&dispatched);
+
+        // BEFORE: no prompt POST has been issued — both witnesses are dark.
+        assert!(!accepted.load(Ordering::SeqCst));
+        assert!(!dispatched.load(Ordering::SeqCst));
+
+        let turn = tokio::spawn(async move {
+            mgr.run_turn(
+                "ses_t5",
+                "hold this daemon-side turn open",
+                None,
+                None,
+                Duration::from_millis(50),
+                None,
+                Some(armed_accepted),
+                Some(armed_dispatched),
+            )
+            .await
+        });
+
+        // The POST reached the fake daemon; its response is parked. THE
+        // assertion: the dispatched witness is ALREADY armed inside this
+        // window — it flips at the true send point, inside the request
+        // leg, NOT after the response is processed.
+        http.dispatched.notified().await;
+        assert!(
+            accepted.load(Ordering::SeqCst),
+            "the accepted witness stays armed at the dispatch boundary"
+        );
+        assert!(
+            dispatched.load(Ordering::SeqCst),
+            "the dispatched witness must flip at the prompt POST's dispatch \
+             boundary — the POST is on the wire while the response is still \
+             parked"
+        );
+
+        // Release: the response completes; the local await then settles
+        // (IdleTimeout here — the fake never emits an idle edge). The
+        // dispatched witness stays armed, exactly like the accepted one.
+        http.release.notify_one();
+        let settled = turn.await.expect("run_turn settled");
+        assert!(matches!(settled, Err(ServeError::IdleTimeout { .. })));
+        assert!(
+            dispatched.load(Ordering::SeqCst),
+            "the dispatched witness stays armed once flipped (one-way latch)"
         );
     }
 
@@ -3691,6 +3797,7 @@ mod tests {
                 "ses_discard",
                 build_prompt_body("hi", None, None),
                 &None,
+                None,
                 None,
             )
             .await

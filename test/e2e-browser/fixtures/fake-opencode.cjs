@@ -658,6 +658,7 @@ const hostname = argValue('--hostname') || '127.0.0.1'
 const port = Number(argValue('--port'))
 const sessionArg = argValue('--session')
 const sessionEventGatePath = process.env.FAKE_OPENCODE_SESSION_EVENT_GATE_PATH
+const holdSummarizeGatePath = process.env.FAKE_OPENCODE_HOLD_SUMMARIZE_GATE_PATH
 const requireDirectoryRoute = process.env.FAKE_OPENCODE_REQUIRE_DIRECTORY_ROUTE === '1'
 
 if (!Number.isInteger(port) || port <= 0 || port > 65535) {
@@ -1565,6 +1566,38 @@ const server = http.createServer(async (req, res) => {
         routeDirectory: directory,
         directory: session.directory,
       })
+      // Send-during-compaction e2e lane (FAKE_OPENCODE_HOLD_SUMMARIZE_GATE_PATH):
+      // the audit row + busy SSE above fire at REQUEST RECEIPT exactly as in
+      // the ungated arm; ONLY the response + idle emit park behind a one-shot
+      // 50ms gate-file check, so a spec can hold the compact drive
+      // deterministically in flight (parked-ness is observable in the audit:
+      // no session_idle_emitted can follow the summarize receipt until the
+      // file appears; the gate consumes/rm's the file the moment it does,
+      // then answers and emits the parked idle). Mirrors the
+      // tuiParityChildEventGate pattern, including the --pure guard (the
+      // catalog probe's sidecar must never park) and .unref?.(). Without the
+      // receipt-vs-response split, a spec's own in-flight poll would deadlock
+      // on the parked response.
+      if (holdSummarizeGatePath && !process.argv.includes('--pure')) {
+        const gateInterval = setInterval(() => {
+          if (!fs.existsSync(holdSummarizeGatePath)) return
+          clearInterval(gateInterval)
+          try {
+            fs.rmSync(holdSummarizeGatePath, { force: true })
+          } catch {
+            // ignore
+          }
+          sendJson(res, 200, true)
+          setTimeout(() => {
+            emitSessionIdle(sessionId, {
+              routeDirectory: directory,
+              directory: session.directory,
+            })
+          }, 25).unref?.()
+        }, 50)
+        gateInterval.unref?.()
+        return
+      }
       sendJson(res, 200, true)
       setTimeout(() => {
         emitSessionIdle(sessionId, {

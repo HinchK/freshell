@@ -2572,4 +2572,163 @@ test.describe('fresh-agent control surfaces — opencode lane (rust)', () => {
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
+
+  test('a raw send during a parked compaction is queued and delivered after the compact settles', async ({ page }) => {
+    // The gate dir BEFORE boot (the mkdtemp precedent in bootOpencodeLane).
+    const gateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-agentctl-opencode-'))
+    const gatePath = path.join(gateDir, 'release-summarize.flag')
+    const lane = await bootOpencodeLane(page, { FAKE_OPENCODE_HOLD_SUMMARIZE_GATE_PATH: gatePath })
+    const tabId = lane.tabId
+    try {
+      // Materialize + idle (the existing helper returns the durable ses_* id).
+      const sessionId = await sendOpencodeTurn(page, lane.harness, tabId, 'first turn before compact', 1, lane.auditLogPath)
+
+      // /compact through the composer (the compact-test precedent above): the
+      // summarize POST parks on the gate file, so the compact drive is
+      // deterministically in flight (the audit `summarize` entry lands at
+      // REQUEST RECEIPT — the knob parks only the response).
+      const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+      await paneRoot.getByRole('textbox', { name: 'Chat message input' }).fill('/compact')
+      await paneRoot.getByRole('textbox', { name: 'Chat message input' }).press('Enter')
+      await waitForLogEntry(
+        lane.auditLogPath,
+        (e) => e.event === 'summarize',
+        'the parked compact\'s summarize receipt',
+      )
+
+      // A raw WS send — the server-side queue seam, deterministic while the
+      // compact is parked (the browser's own composer would busy-gate it).
+      // The frame is deliberately UNFENCED (no observed pair): the drain's
+      // unfenced tolerance is the direct path's own tolerance, and this e2e
+      // pins exactly that end-to-end.
+      const frame = {
+        type: 'freshAgent.send',
+        requestId: 'e2e-queued-during-compact',
+        sessionId,
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        text: 'sent while compacting',
+      }
+      await page.evaluate((f) => {
+        window.__FRESHELL_TEST_HARNESS__?.sendWsMessage(f)
+      }, frame)
+      // SYNC 1: the frame provably left the page (the harness records every
+      // client-sent frame, injected ones included — only from the real
+      // socket send path). The read is ASYNC (a page.evaluate wrapper) — it
+      // MUST be awaited INSIDE the poll callback.
+      await expect
+        .poll(async () =>
+          (await lane.harness.getSentWsMessagesWithTimestamps())
+            .some((m) => m.requestId === 'e2e-queued-during-compact'))
+        .toBe(true)
+
+      // SYNC 1.5 (delta-review round 8, extension 2, Minor): the frame
+      // leaving the browser proves nothing about the SERVER - under
+      // cloud scheduling the server's handling could lag past the fixed
+      // dwell below, the gate would release first, and the send could
+      // take the ordinary direct path while the test still passed. The
+      // requestId-correlated freshAgent.send.accepted ack proves the
+      // server PROCESSED the send while the compact was still parked
+      // (the negative hold below proves the compact was parked at the
+      // same moment) - together they pin the queued path, not just an
+      // eventually-delivered message.
+      await expect
+        .poll(async () =>
+          ((await lane.harness.getReceivedWsMessages()) as Array<{
+            type?: string
+            requestId?: string
+          }>).some(
+            (m) =>
+              m.type === 'freshAgent.send.accepted' &&
+              m.requestId === 'e2e-queued-during-compact',
+          ))
+        .toBe(true)
+
+      // SYNC 2 + the NEGATIVE HOLD: the compact is provably STILL parked —
+      // the knob holds back the summarize response AND its idle emission,
+      // so while the gate is held the audit can contain NO
+      // session_idle_emitted after the summarize receipt: an ungated
+      // compact answers within ~25ms and its idle lands long before this
+      // check (exactly the round-2 vacuity finding this kills). (The plan
+      // sketch's stat(gatePath) parked-proof was unsatisfiable as written —
+      // under the consume-on-release knob the gate file cannot exist while
+      // parked, since only the test writes it, at release; the
+      // no-idle-after-receipt check is the honest replacement. Counting
+      // audit events generally does NOT prove parked-ness — the fixture
+      // records many event kinds per session — but the idle emission is
+      // the exact artifact the knob parks.) Dwell a bounded 1.5s inside
+      // that provably-parked window, then assert the queued prompt NEVER
+      // posted. (A single immediate poll would be vacuous — absence after
+      // positive syncs plus a bounded dwell while the gate is verifiably
+      // held is the honest negative form.)
+      await page.waitForTimeout(1_500)
+      const auditWhileParked = readOpencodeAudit(lane.auditLogPath)
+      const summarizeReceiptIx = auditWhileParked.findIndex((e) => e.event === 'summarize')
+      expect(
+        auditWhileParked
+          .slice(summarizeReceiptIx + 1)
+          .filter((e) => e.event === 'session_idle_emitted'),
+        'no idle emission after the summarize receipt — the compact is still parked',
+      ).toHaveLength(0)
+      expect(auditWhileParked.some(
+        (e) => e.event === 'prompt_async' && e.prompt === 'sent while compacting')).toBe(false)
+
+      // Release: the compact settles, the drain drives the queued send.
+      await fs.writeFile(gatePath, 'release')
+      await waitForLogEntry(lane.auditLogPath,
+        (e) => e.event === 'prompt_async' && e.prompt === 'sent while compacting',
+        'the queued send drains after the compact settles')
+      // ORDER: the compact's summarize POST happened BEFORE the queued prompt.
+      const all = readOpencodeAudit(lane.auditLogPath)
+      const summarizeIx = all.findIndex((e) => e.event === 'summarize')
+      const queuedIx = all.findIndex((e) => e.event === 'prompt_async' && e.prompt === 'sent while compacting')
+      expect(queuedIx).toBeGreaterThan(summarizeIx)
+
+      await waitForPaneStatus(lane.harness, tabId, 'idle')
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+      await fs.rm(gateDir, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  test('a composer-typed message during a parked compaction is held, flushed on idle, and renders as a turn', async ({ page }) => {
+    const gateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-agentctl-opencode-'))
+    const gatePath = path.join(gateDir, 'release-summarize.flag')
+    const lane = await bootOpencodeLane(page, { FAKE_OPENCODE_HOLD_SUMMARIZE_GATE_PATH: gatePath })
+    const tabId = lane.tabId
+    try {
+      await sendOpencodeTurn(page, lane.harness, tabId, 'first turn before compact', 1, lane.auditLogPath)
+      const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+      await paneRoot.getByRole('textbox', { name: 'Chat message input' }).fill('/compact')
+      await paneRoot.getByRole('textbox', { name: 'Chat message input' }).press('Enter')
+      await waitForLogEntry(
+        lane.auditLogPath,
+        (e) => e.event === 'summarize',
+        'the parked compact\'s summarize receipt',
+      )
+
+      // THE USER STORY: type while the compact is parked. The composer stays
+      // interactive; the client's own queue holds the message (busy).
+      await sendComposerText(page, 'typed while compacting')
+      // Held client-side: no prompt audit while parked.
+      await page.waitForTimeout(1_500)
+      expect(readOpencodeAudit(lane.auditLogPath).some(
+        (e) => e.event === 'prompt_async' && e.prompt === 'typed while compacting')).toBe(false)
+
+      // Release: the compact settles → idle → the client flushes → the
+      // message POSTs → the pane renders the turn AND the assistant reply
+      // (the sendOpencodeTurn response-text convention).
+      await fs.writeFile(gatePath, 'release')
+      await waitForLogEntry(lane.auditLogPath,
+        (e) => e.event === 'prompt_async' && e.prompt === 'typed while compacting',
+        'the held message flushes after the compact settles')
+      await expect(paneRoot).toContainText('Fake OpenCode response: typed while compacting', { timeout: 30_000 })
+      await waitForPaneStatus(lane.harness, tabId, 'idle')
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+      await fs.rm(gateDir, { recursive: true, force: true }).catch(() => {})
+    }
+  })
 })

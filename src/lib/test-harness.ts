@@ -58,6 +58,9 @@ export interface FreshellTestHarness {
   getSentWsMessagesWithTimestamps?: () => Array<{ __sentAt?: number; type?: string; requestId?: string }>
   clearSentWsMessages?: () => void
   recordSentWsMessage?: (msg: unknown) => void
+  getReceivedWsMessages?: () => unknown[]
+  clearReceivedWsMessages?: () => void
+  recordReceivedWsMessage?: (msg: unknown) => void
   recordTerminalWrite?: (event: TerminalWriteEvent) => void
   getTerminalWriteEvents?: () => TerminalWriteEvent[]
   clearTerminalWriteEvents?: () => void
@@ -111,6 +114,7 @@ export function installTestHarness(
     || (window as { __FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__?: boolean }).__FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__ === true
   const suppressedTerminalPaneIds = new Set<string>()
   const sentWsMessages: unknown[] = []
+  const receivedWsMessages: unknown[] = []
   const terminalWriteEvents: TerminalWriteEvent[] = []
   let terminalWriteEventBytes = 0
   const recordSentWsMessage = (msg: unknown) => {
@@ -198,6 +202,24 @@ export function installTestHarness(
       sentWsMessages.length = 0
     },
     recordSentWsMessage,
+    getReceivedWsMessages: () => receivedWsMessages.map((msg) => {
+      const { __receivedAt, ...rest } = msg as { __receivedAt?: number }
+      return rest
+    }),
+    clearReceivedWsMessages: () => {
+      receivedWsMessages.length = 0
+    },
+    recordReceivedWsMessage: (msg: unknown) => {
+      try {
+        const copy = JSON.parse(JSON.stringify(msg))
+        ;(copy as { __receivedAt?: number }).__receivedAt = Date.now()
+        receivedWsMessages.push(copy)
+      } catch {
+        ;(msg as { __receivedAt?: number }).__receivedAt = Date.now()
+        receivedWsMessages.push(msg)
+      }
+      if (receivedWsMessages.length > 500) receivedWsMessages.shift()
+    },
     recordTerminalWrite: (event: TerminalWriteEvent) => {
       const retainedEvent = { ...event }
       terminalWriteEvents.push(retainedEvent)

@@ -42,9 +42,9 @@ pub mod serve;
 pub mod transport;
 
 pub use events::{
-    is_idle_edge, is_idle_status_event, parse_serve_event, serve_event_to_sdk,
-    session_title_observation, ChangedReason, ParsedServeEvent, SdkProviderEvent, SnapshotStatus,
-    SseDecoder,
+    is_idle_edge, is_idle_status_event, is_running_status_type, parse_serve_event,
+    serve_event_to_sdk, session_title_observation, ChangedReason, ParsedServeEvent,
+    SdkProviderEvent, SnapshotStatus, SseDecoder,
 };
 pub use model::{
     normalize_opencode_effort, normalize_opencode_model, split_opencode_model, OpencodeModel,

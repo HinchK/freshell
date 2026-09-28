@@ -6514,7 +6514,7 @@ async fn send_keys(
     let body = build_opencode_prompt_body(&text, model.as_deref(), effort.as_deref());
     let accepted = Arc::clone(&turn_witness.daemon_turn_accepted);
     let prompt = manager
-        .prompt_async(&durable_id, body, &route, Some(accepted))
+        .prompt_async(&durable_id, body, &route, Some(accepted), None)
         .await;
     // The gate section ends with the POST: from here the witness is
     // either armed-and-registered (the quiesce paths see it) or the

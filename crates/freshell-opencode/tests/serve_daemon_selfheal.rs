@@ -534,6 +534,7 @@ async fn discard_running_signals_daemon_loss_and_schedules_re_warm() {
             build_prompt_body("hi", None, None),
             &None,
             None,
+            None,
         )
         .await
         .expect_err("the prompt POST must time out");
@@ -614,7 +615,13 @@ async fn stale_request_timeout_never_discards_the_replacement_daemon() {
     let r1_manager = manager.clone();
     let r1 = tokio::spawn(async move {
         r1_manager
-            .prompt_async("ses_r1", build_prompt_body("r1", None, None), &None, None)
+            .prompt_async(
+                "ses_r1",
+                build_prompt_body("r1", None, None),
+                &None,
+                None,
+                None,
+            )
             .await
     });
     // Stagger: R2 still dispatches against A (well inside R1's timeout).
@@ -622,7 +629,13 @@ async fn stale_request_timeout_never_discards_the_replacement_daemon() {
     let r2_manager = manager.clone();
     let r2 = tokio::spawn(async move {
         r2_manager
-            .prompt_async("ses_r2", build_prompt_body("r2", None, None), &None, None)
+            .prompt_async(
+                "ses_r2",
+                build_prompt_body("r2", None, None),
+                &None,
+                None,
+                None,
+            )
             .await
     });
 

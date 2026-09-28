@@ -733,6 +733,9 @@ pub(crate) struct FakeIdentitySink {
     /// Retire-on-kill round 6 (focused-ep5-r5 Finding 1) test hook — see
     /// [`Self::arm_retire_stall`].
     retire_stall: std::sync::Mutex<Option<RetireStallGate>>,
+    /// send-during-compact queue (Task 4) test hook — see
+    /// [`Self::arm_retire_fail_park`].
+    retire_fail_park: std::sync::Mutex<Option<RetireStallGate>>,
     /// kata b8ke Task 3 review M-1 test hook — see
     /// [`Self::arm_binding_stall`].
     binding_stall: std::sync::Mutex<Option<BindingStallGate>>,
@@ -1133,6 +1136,38 @@ impl FakeIdentitySink {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *self.self_weak.lock().unwrap() = std::sync::Arc::downgrade(self);
         *self.retire_stall.lock().unwrap() = Some(RetireStallGate {
+            key: (provider.into(), session_id.into()),
+            entered_tx,
+            release_rx: std::sync::Mutex::new(Some(release_rx)),
+        });
+        RetireStallHandles {
+            entered: entered_rx,
+            release: release_tx,
+        }
+    }
+    /// send-during-compact queue (Task 4, minimal test knob): arm the
+    /// PARK-THEN-CLEAN-FAIL for one identity key. The next
+    /// `retire_closed_batch` whose identity set covers the key parks its
+    /// ANSWER behind the test's release and then resolves
+    /// `Err(SinkCloseError::Clean(..))` with NOTHING durable ever applied
+    /// (the Clean contract: the arm sits above the mutation section on
+    /// purpose) — so a test can stage a kill sitting deterministically
+    /// inside its AWAITED durable close (the enumeration gate
+    /// `close_pending` armed) and then fail the close cleanly: the kill's
+    /// DURABLE_CLOSE_FAILED arm. No existing knob composes this:
+    /// `set_fail_writes` answers the failure IMMEDIATELY (no park window
+    /// a test can schedule inside), and [`Self::arm_retire_stall`] parks
+    /// but answers `Ok` (the kill would SUCCEED, never taking the failure
+    /// arm). One-shot: later batches proceed by their own knobs.
+    #[allow(dead_code)] // used by the opencode_ws Task 4 stranding-heal test
+    pub(crate) fn arm_retire_fail_park(
+        self: &std::sync::Arc<Self>,
+        provider: &str,
+        session_id: &str,
+    ) -> RetireStallHandles {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.retire_fail_park.lock().unwrap() = Some(RetireStallGate {
             key: (provider.into(), session_id.into()),
             entered_tx,
             release_rx: std::sync::Mutex::new(Some(release_rx)),
@@ -1611,6 +1646,36 @@ impl PaneIdentitySink for FakeIdentitySink {
             return Box::pin(std::future::ready(Err(SinkCloseError::Clean(
                 std::io::Error::other("fake write failure (identity-conditional)"),
             ))));
+        }
+        // send-during-compact queue (Task 4) park-then-Clean-fail arm: the
+        // batch's answer parks behind the test's release and then fails
+        // CLEAN — nothing below here runs, so NOTHING is durable (exactly
+        // the Clean contract the kill lane's DURABLE_CLOSE_FAILED arm
+        // asserts over its live state).
+        let fail_park_arm = {
+            let gate = self.retire_fail_park.lock().unwrap();
+            gate.as_ref().and_then(|g| {
+                if session_ids
+                    .iter()
+                    .any(|id| g.key == (provider.to_string(), id.clone()))
+                {
+                    let release_rx = g.release_rx.lock().unwrap().take();
+                    release_rx.map(|rx| (g.entered_tx.clone(), rx))
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some((entered_tx, release_rx)) = fail_park_arm {
+            // One-shot: disarm so later batches proceed by their own knobs.
+            *self.retire_fail_park.lock().unwrap() = None;
+            let _ = entered_tx.send(());
+            return Box::pin(async move {
+                let _ = release_rx.await;
+                Err(SinkCloseError::Clean(std::io::Error::other(
+                    "fake parked close failure",
+                )))
+            });
         }
         // Delta-r6-r3 (focused-episode-6 round 2) fake mirror of the ledger's
         // `close_identities` envelope: failure-atomic across the set — a

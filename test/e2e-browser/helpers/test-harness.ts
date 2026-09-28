@@ -366,6 +366,14 @@ export class TestHarness {
     })
   }
 
+  async getReceivedWsMessages(): Promise<unknown[]> {
+    return this.page.evaluate(() => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      if (!harness) throw new Error('Test harness not installed')
+      return harness.getReceivedWsMessages?.() ?? []
+    })
+  }
+
   async clearSentWsMessages(): Promise<void> {
     await this.page.evaluate(() => {
       const harness = window.__FRESHELL_TEST_HARNESS__
