@@ -6,8 +6,7 @@
 //! the legacy amplifier provider's activity family (`shared/ws-protocol.ts`
 //! `AmplifierActivity*Schema`) and the `terminal.idle` capability are now
 //! part of the frozen surface (`CLIENT_MESSAGE_TYPES` /
-//! `SERVER_MESSAGE_TYPES`), leaving `durability.degraded` as the only
-//! extension entry. This file still pins the wire shapes:
+//! `SERVER_MESSAGE_TYPES`). This file still pins the wire shapes:
 //!
 //! * `amplifier.activity.list` / `.list.response` / `.updated` are
 //!   byte-shape-compatible with the legacy zod schemas (the frozen client
@@ -19,11 +18,39 @@ use std::collections::BTreeSet;
 
 use freshell_protocol::{
     AmplifierActivityListResponse, AmplifierActivityRecord, AmplifierActivityUpdated,
-    AmplifierPhase, ClientMessage, ServerMessage, TerminalIdle, TerminalIdleReason,
-    TurnCompletionSnapshot, CLIENT_MESSAGE_TYPES, EXTENSION_CLIENT_MESSAGE_TYPES,
-    EXTENSION_SERVER_MESSAGE_TYPES, SERVER_MESSAGE_TYPES,
+    AmplifierPhase, ClientMessage, FreshAgentRecoveryStopped, ServerMessage, TerminalIdle,
+    TerminalIdleReason, TurnCompletionSnapshot, CLIENT_MESSAGE_TYPES,
+    EXTENSION_CLIENT_MESSAGE_TYPES, EXTENSION_SERVER_MESSAGE_TYPES, SERVER_MESSAGE_TYPES,
 };
 use serde_json::json;
+
+#[test]
+fn recovery_stop_parses_and_replies_with_the_same_request_id() {
+    let request: ClientMessage = serde_json::from_value(json!({
+        "type": "freshAgent.recovery.stop", "requestId": "stop-7",
+        "provider": "codex", "sessionId": "thread-7", "sessionType": "freshcodex"
+    }))
+    .unwrap();
+    let ClientMessage::FreshAgentRecoveryStop(stop) = request else {
+        panic!("expected recovery stop")
+    };
+    assert_eq!(stop.request_id, "stop-7");
+    assert_eq!(stop.session_id, "thread-7");
+
+    let answer = ServerMessage::FreshAgentRecoveryStopped(FreshAgentRecoveryStopped {
+        request_id: stop.request_id,
+        provider: "codex".into(),
+        session_id: stop.session_id,
+        session_type: "freshcodex".into(),
+        success: true,
+        code: None,
+        message: None,
+    });
+    let wire = serde_json::to_value(answer).unwrap();
+    assert_eq!(wire["type"], "freshAgent.recovery.stopped");
+    assert_eq!(wire["requestId"], "stop-7");
+    assert_eq!(wire["success"], true);
+}
 
 #[test]
 fn amplifier_activity_list_parses_like_the_other_activity_lists() {
@@ -134,9 +161,4 @@ fn extension_surface_is_disjoint_from_the_frozen_inventory() {
             "{extension} must not collide with the frozen inventory"
         );
     }
-    assert!(
-        EXTENSION_CLIENT_MESSAGE_TYPES.is_empty(),
-        "no client extension types remain after the 2026-07-26 reconciliation"
-    );
-    assert_eq!(EXTENSION_SERVER_MESSAGE_TYPES, ["durability.degraded"]);
 }

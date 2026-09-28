@@ -7,18 +7,12 @@
  * terminal census re-CREATES a hidden pane (new terminalId). What THIS spec
  * adds are the discriminators only the hidden-pane-rebind lane can satisfy:
  *
- * - Test 1 (terminal): `content.streamId` non-null and CHANGED. streamId is
- *   written ONLY by the terminal.attach.ready handler and explicitly reset to
- *   undefined by terminal.created (TerminalView.tsx -- create paths set
- *   `streamId: undefined`, attach-ready paths set `streamId: msg.streamId`),
- *   so it proves the hidden BACKGROUND ATTACH completed, not just re-create.
- * - Test 2 (fresh-agent): `content.createRequestId` CHANGED. A fresh nanoid
- *   is minted ONLY by the `.lost` recovery re-create (FreshAgentView.tsx),
- *   which requires the server's freshAgent.error{INVALID_SESSION_ID} round
- *   trip to this pane's post-restart attach -- unreachable pre-fix, where a
- *   hidden pane sends nothing and keeps its stale pre-restart Redux state.
- *
- * Do not weaken any conjunct in either poll.
+ * - Test 1 (terminal): the replacement terminal is claimed in the hidden
+ *   pane's terminal.interest snapshot without attaching. Reveal then attaches
+ *   and proves that the replacement shell accepts input and has real geometry.
+ * - Test 2 (fresh-agent): the sidecar request log records a resume using the
+ *   original durable session ID while the pane remains hidden, and the pane
+ *   keeps its createRequestId instead of creating a duplicate session.
  *
  * restartAbrupt() exists only on RustServer.
  *
@@ -206,7 +200,7 @@ async function revealTab(page: Page, harness: TestHarness, tabId: string): Promi
 test.describe('hidden-pane rebind (F8 / P1.11)', () => {
   test.setTimeout(180_000)
 
-  test('hidden BUSY terminal pane un-wedges after abrupt restart without reveal', async ({ page }) => {
+  test('hidden BUSY terminal pane is claimed after abrupt restart and hydrates on reveal', async ({ page }) => {
     const { server, harness, info } = await bootWall(page)
     try {
       await selectShellIfPickerShowing(page)
@@ -216,7 +210,6 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
         .not.toBeNull()
       const contentBefore = (await harness.getPaneLayout(hiddenTabId))?.content
       const terminalIdBefore = contentBefore?.terminalId as string
-      const streamIdBefore = contentBefore?.streamId ?? null
 
       // Make the pane BUSY: run a long-lived foreground command. With >1 tab
       // mounted, `.xterm` matches HIDDEN tabs' still-mounted terminals too --
@@ -235,41 +228,53 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
       await expect.poll(async () => harness.getActiveTabId(), { timeout: 15_000 }).not.toBe(hiddenTabId)
 
       // SIGKILL + revive. Do NOT touch the hidden tab.
+      await harness.clearSentWsMessages()
       await server.restartAbrupt()
       await waitForWsReady(page)
 
-      // Session rebind WITHOUT reveal. DISCRIMINATING evidence -- this poll
-      // FAILS on the unfixed base: a new terminalId + 'running' alone only
-      // proves the census re-create path, which ALREADY works while hidden on
-      // main. What this lane adds is the hidden background terminal.attach,
-      // and its only Redux-visible footprint is content.streamId: the
-      // terminal.created handler explicitly resets streamId to undefined
-      // and ONLY the terminal.attach.ready handler writes it back
-      // (TerminalView.tsx), with a fresh server-minted stream id per PTY
-      // (crates/freshell-terminal/src/registry.rs:877-892). So require new
-      // terminalId AND a non-null streamId differing from the pre-restart one
-      // AND status 'running' -- unreachable without a completed hidden
-      // background attach. Do not weaken any conjunct.
-      await expect
-        .poll(async () => {
-          const content = (await harness.getPaneLayout(hiddenTabId))?.content
-          const tid = content?.terminalId ?? null
-          const sid = content?.streamId ?? null
-          const rebound = tid && tid !== terminalIdBefore && content?.status === 'running'
-          const attached = sid && sid !== streamIdBefore
-          return rebound && attached ? `${tid}:${sid}` : null
-        }, { timeout: 30_000 })
-        .not.toBeNull()
+      // The dead-terminal census creates a replacement PTY while the tab is
+      // hidden. The negotiated lifetime claim keeps it alive without a
+      // background attach or viewport geometry claim.
+      let terminalIdAfter: string | null = null
+      await expect.poll(async () => {
+        const content = (await harness.getPaneLayout(hiddenTabId))?.content
+        terminalIdAfter = content?.terminalId ?? null
+        return terminalIdAfter && terminalIdAfter !== terminalIdBefore && content?.status === 'running'
+      }, { timeout: 30_000 }).toBe(true)
+      expect(terminalIdAfter).toBeTruthy()
+      await expect.poll(async () => {
+        const sent = await harness.getSentWsMessages() as Array<Record<string, unknown>>
+        return sent.some((message) => message.type === 'terminal.interest'
+          && Array.isArray(message.claimedTerminalIds)
+          && message.claimedTerminalIds.includes(terminalIdAfter))
+      }, { timeout: 15_000 }).toBe(true)
+      await page.waitForTimeout(500)
+      const hiddenMessages = await harness.getSentWsMessages() as Array<Record<string, unknown>>
+      expect(hiddenMessages.filter((message) => message.type === 'terminal.attach'
+        && (message.terminalId === terminalIdBefore || message.terminalId === terminalIdAfter)),
+      'the hidden pane claims its terminal without attaching').toHaveLength(0)
 
-      // Reveal and verify live content promptly (attach already happened in
-      // the background -- reveal is surface work only).
+      // Reveal hydrates the replacement PTY. A fresh attach receipt and an
+      // executed shell command prove more than the pre-restart Redux status.
+      await harness.clearSentWsMessages()
       await revealTab(page, harness, hiddenTabId)
       await expect(page.locator('.xterm:visible').first()).toBeVisible()
-      // A live shell prompt renders within the reveal budget; the pane must
-      // NOT show the blocking creating spinner.
-      await expect
-        .poll(async () => (await harness.getPaneLayout(hiddenTabId))?.content?.status, { timeout: 10_000 })
-        .toBe('running')
+      await expect.poll(async () => {
+        const sent = await harness.getSentWsMessages() as Array<Record<string, unknown>>
+        return sent.some((message) => message.type === 'terminal.attach'
+          && message.terminalId === terminalIdAfter
+          && (message.intent === 'viewport_hydrate' || message.intent === 'transport_reconnect'))
+      }, { timeout: 15_000 }).toBe(true)
+      await expect.poll(async () => {
+        const content = (await harness.getPaneLayout(hiddenTabId))?.content
+        return content?.terminalId === terminalIdAfter && content?.status === 'running'
+          && typeof content?.streamId === 'string' && content.streamId.length > 0
+      }, { timeout: 15_000 }).toBe(true)
+      await page.locator('.xterm:visible').first().click()
+      await page.keyboard.type('printf "__HIDDEN_REBIND_LIVE__:%s\\n" "$(stty size)"')
+      await page.keyboard.press('Enter')
+      await expect.poll(async () => await harness.getTerminalBuffer(terminalIdAfter!) ?? '', { timeout: 15_000 })
+        .toMatch(/__HIDDEN_REBIND_LIVE__:\d+ \d+/)
     } finally {
       await server.stop()
     }

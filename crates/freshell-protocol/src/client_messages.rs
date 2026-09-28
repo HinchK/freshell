@@ -112,6 +112,8 @@ pub enum ClientMessage {
     FreshAgentQuestionRespond(FreshAgentQuestionRespond),
     #[serde(rename = "freshAgent.kill")]
     FreshAgentKill(FreshAgentKill),
+    #[serde(rename = "freshAgent.recovery.stop")]
+    FreshAgentRecoveryStop(FreshAgentRecoveryStop),
     #[serde(rename = "freshAgent.fork")]
     FreshAgentFork(FreshAgentFork),
     #[serde(rename = "freshAgent.undo")]
@@ -176,10 +178,9 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 42] = [
 ];
 
 /// Extension client→server discriminants declared beyond the generated
-/// inventory. Empty since the 2026-07-26 contract reconciliation folded
-/// `amplifier.activity.list` into the frozen surface (it has been a
-/// first-class `shared/ws-protocol.ts` union member since PR #498).
-pub const EXTENSION_CLIENT_MESSAGE_TYPES: [&str; 0] = [];
+/// inventory. The process-only Codex recovery stop is an additive extension;
+/// the generated frozen inventory remains unchanged.
+pub const EXTENSION_CLIENT_MESSAGE_TYPES: [&str; 1] = ["freshAgent.recovery.stop"];
 
 // --- hello ------------------------------------------------------------------
 
@@ -210,6 +211,10 @@ pub struct HelloCapabilities {
     /// bump).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_lifetime_claim_v1: Option<bool>,
+    /// Phase 2 durable runtime opt-in. A server acknowledges this only when a
+    /// managed-runtime controller is actually installed for the current boot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_runtime_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1000,6 +1005,8 @@ pub struct FreshAgentConfigure {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentCompact {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     pub provider: AgentProvider,
     pub session_id: String,
     pub session_type: SessionType,
@@ -1056,6 +1063,21 @@ pub struct FreshAgentKill {
     pub cwd: Option<String>,
     /// kata b8ke delayed-request fence: kill feeds the fenced stop claim, so
     /// it carries the observed (epoch, generation) pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<u64>,
+}
+
+/// Request-correlated, process-only Codex recovery. A regular
+/// `freshAgent.kill` permanently closes the durable session instead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentRecoveryStop {
+    pub request_id: String,
+    pub provider: AgentProvider,
+    pub session_id: String,
+    pub session_type: SessionType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

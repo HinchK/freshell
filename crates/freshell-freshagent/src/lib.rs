@@ -40,6 +40,7 @@ pub mod claude;
 pub(crate) mod claude_snapshot;
 pub mod codex;
 pub(crate) mod codex_sidecar_tracking;
+pub mod hosted_rest;
 pub mod identity_sink;
 pub mod layout_store;
 pub mod layout_tree;
@@ -1878,6 +1879,16 @@ const PROVIDER: &str = "opencode";
 /// closure stays a NO-OP — the shared serve daemon is never a kill handle
 /// (OpenCode invariant).
 const PENDING_CREATE_PREFIX: &str = "pending-create-";
+
+fn rest_agent_mode(agent: &str) -> Option<(&'static str, &'static str)> {
+    match agent {
+        "claude" => Some(("claude", "freshclaude")),
+        "kilroy" => Some(("claude", "kilroy")),
+        "codex" => Some(("codex", "freshcodex")),
+        "opencode" => Some(("opencode", "freshopencode")),
+        _ => None,
+    }
+}
 /// `makePlaceholderSessionId(requestId)`'s prefix (`adapter.ts:75`, mirrored by
 /// `create_tab` above and `opencode_ws::handle_create`): this port's ONE placeholder-id
 /// format, `format!("freshopencode-{request_id}")`. By construction, an id with this shape
@@ -1935,6 +1946,9 @@ pub struct FreshAgentState {
     panes: Arc<Mutex<HashMap<String, PaneEntry>>>,
     /// The single lazily-started `opencode serve` client for this server process.
     opencode: SharedOpencodeManagerHandle,
+    /// Opt-in durable host gateway. When installed, REST/MCP fresh-agent
+    /// requests never touch this web process's legacy provider manager.
+    hosted_rest: Arc<std::sync::OnceLock<hosted_rest::SharedHostedFreshAgentRestGateway>>,
     /// Monotonic `sessions.changed` revision.
     sessions_revision: Arc<AtomicI64>,
     /// Slice 1 (`docs/plans/2026-07-18-agent-api-mcp-parity-spec.md`): the SAME
@@ -2178,6 +2192,8 @@ pub type TerminalCreatedHook = Arc<dyn Fn(TerminalCreatedEvent) + Send + Sync>;
 #[derive(Clone)]
 struct PaneEntry {
     placeholder_id: String,
+    provider: String,
+    session_type: String,
     cwd: Option<String>,
     model: Option<String>,
     effort: Option<String>,
@@ -2250,6 +2266,7 @@ impl FreshAgentState {
             broadcast_tx,
             panes: Arc::new(Mutex::new(HashMap::new())),
             opencode: Arc::new(tokio::sync::Mutex::new(None)),
+            hosted_rest: Arc::new(std::sync::OnceLock::new()),
             sessions_revision: Arc::new(AtomicI64::new(0)),
             terminal_registry: None,
             session_identity: None,
@@ -2362,6 +2379,19 @@ impl FreshAgentState {
             "freshagent.opencode.watchdog_reap_noop: the shared serve is never a kill target"
         );
         true
+    }
+
+    pub fn set_hosted_rest_gateway(
+        &self,
+        gateway: hosted_rest::SharedHostedFreshAgentRestGateway,
+    ) -> Result<(), &'static str> {
+        self.hosted_rest
+            .set(gateway)
+            .map_err(|_| "hosted fresh-agent REST gateway is already installed")
+    }
+
+    fn hosted_rest_gateway(&self) -> Option<hosted_rest::SharedHostedFreshAgentRestGateway> {
+        self.hosted_rest.get().cloned()
     }
 
     /// Install a scripted model-catalog probe (tests) — the registry's
@@ -4635,14 +4665,12 @@ async fn create_tab(
     if agent.is_empty() {
         return terminal_tabs::create_terminal_or_content_tab(state, body).await;
     }
-    // This surface is the opencode T2 slice; other agents are deferred (400, matching
-    // the original's `unknown agent` rejection for anything without a mapping here).
-    if agent != "opencode" {
+    let Some((provider, session_type)) = rest_agent_mode(agent) else {
         return fail_json(
             StatusCode::BAD_REQUEST,
             format!("unknown agent \"{agent}\""),
         );
-    }
+    };
 
     let cwd = body.get("cwd").and_then(Value::as_str).map(str::to_string);
     let model = body
@@ -4654,6 +4682,48 @@ async fn create_tab(
         .and_then(Value::as_str)
         .map(str::to_string);
     let name = body.get("name").and_then(Value::as_str).map(str::to_string);
+
+    if let Some(gateway) = state.hosted_rest_gateway() {
+        let native_session_id = match body.get("sessionRef") {
+            None => None,
+            Some(value) => match serde_json::from_value::<SessionLocator>(value.clone()) {
+                Ok(locator) if locator.provider == provider && !locator.session_id.is_empty() => {
+                    Some(locator.session_id)
+                }
+                _ => {
+                    return fail_json(
+                        StatusCode::BAD_REQUEST,
+                        format!("sessionRef must identify a {provider} session"),
+                    )
+                }
+            },
+        };
+        return create_hosted_agent_tab(
+            &state,
+            gateway,
+            hosted_rest::HostedRestCreate {
+                request_id: Uuid::new_v4().simple().to_string(),
+                provider: provider.into(),
+                session_type: session_type.into(),
+                cwd,
+                model,
+                effort,
+                native_session_id,
+            },
+            name,
+        )
+        .await;
+    }
+
+    // The retained in-process implementation is OpenCode-only. Every hosted
+    // mode above uses the common supervisor gateway; never silently fall back
+    // to a web-owned Claude/Codex provider.
+    if agent != "opencode" {
+        return fail_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "durable fresh-agent gateway is not installed".to_string(),
+        );
+    }
 
     // Task 4 (adopted kata 2, freshagent-sessionref-regression): the `sessionRef`
     // resume branch. Placed AFTER the agent gate — and strictly after the frozen
@@ -4702,6 +4772,8 @@ async fn create_tab(
         &pane_content,
         PaneEntry {
             placeholder_id: placeholder.clone(),
+            provider: PROVIDER.into(),
+            session_type: SESSION_TYPE.into(),
             cwd: cwd.clone(),
             model,
             effort,
@@ -4793,6 +4865,71 @@ async fn create_tab(
     )
 }
 
+async fn create_hosted_agent_tab(
+    state: &FreshAgentState,
+    gateway: hosted_rest::SharedHostedFreshAgentRestGateway,
+    request: hosted_rest::HostedRestCreate,
+    name: Option<String>,
+) -> Response {
+    let created = match gateway.create_agent(request.clone()).await {
+        Ok(created) => created,
+        Err(()) => {
+            return fail_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "durable fresh-agent host could not be created".to_string(),
+            )
+        }
+    };
+    let hosted_rest::HostedRestCreate {
+        request_id,
+        provider,
+        session_type,
+        cwd,
+        model,
+        effort,
+        ..
+    } = request;
+    let (tab_id, pane_id) = state.layout.create_tab(name.as_deref());
+    let mut pane_content = json!({
+        "kind": "fresh-agent",
+        "sessionType": session_type,
+        "provider": provider,
+        "sessionId": created.session_id,
+        "createRequestId": request_id,
+        "status": "connected",
+    });
+    if let Some(value) = &cwd {
+        pane_content["initialCwd"] = json!(value);
+    }
+    if let Some(value) = &model {
+        pane_content["model"] = json!(value);
+    }
+    if let Some(value) = &effort {
+        pane_content["effort"] = json!(value);
+    }
+    register_fresh_agent_tab(
+        state,
+        &tab_id,
+        &pane_id,
+        name.as_deref(),
+        &pane_content,
+        PaneEntry {
+            placeholder_id: created.session_id.clone(),
+            provider,
+            session_type,
+            cwd,
+            model,
+            effort,
+            durable_id: Some(created.session_id.clone()),
+        },
+    );
+    broadcast_tab_create(state, &tab_id, &pane_id, name.as_deref(), &pane_content);
+    ok_json(
+        json!({"tabId":tab_id,"paneId":pane_id,"sessionId":created.session_id}),
+        "fresh-agent pane created",
+    )
+}
+
 /// The registration every fresh-agent pane-minting path needs: attach the pane
 /// content to the shared store, record the legacy shadow `TabRecord` + the
 /// [`PaneEntry`], and index pane→tab. Every pane-minting path records its owning
@@ -4825,6 +4962,54 @@ fn register_fresh_agent_tab(
         .lock()
         .expect("pane_tabs mutex")
         .insert(pane_id.to_string(), tab_id.to_string());
+}
+
+/// A web restart drops the REST pane map while the shared layout and hosted
+/// runtime survive. Resolve hosted panes from the persisted layout on a miss;
+/// the gateway still checks the session against the supervisor inventory.
+fn pane_entry_for_request(state: &FreshAgentState, pane_id: &str) -> Option<PaneEntry> {
+    if let Some(pane) = state.panes.lock().expect("panes mutex").get(pane_id) {
+        return Some(pane.clone());
+    }
+    state.hosted_rest_gateway()?;
+    let snapshot = state.layout.get_pane_snapshot(pane_id)?;
+    let content = snapshot.pane_content?;
+    if content.get("kind")?.as_str()? != "fresh-agent" {
+        return None;
+    }
+    let provider = content.get("provider")?.as_str()?;
+    let session_type = content.get("sessionType")?.as_str()?;
+    if !matches!(
+        (provider, session_type),
+        ("claude", "freshclaude")
+            | ("claude", "kilroy")
+            | ("codex", "freshcodex")
+            | ("opencode", "freshopencode")
+    ) {
+        return None;
+    }
+    let session_id = content.get("sessionId")?.as_str()?.to_string();
+    if session_id.is_empty() {
+        return None;
+    }
+    Some(PaneEntry {
+        placeholder_id: session_id.clone(),
+        provider: provider.to_string(),
+        session_type: session_type.to_string(),
+        cwd: content
+            .get("initialCwd")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        model: content
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        effort: content
+            .get("effort")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        durable_id: Some(session_id),
+    })
 }
 
 /// Broadcast `ui.command{tab.create}` — AFTER registration (Node's order is
@@ -5194,6 +5379,8 @@ async fn resume_session_ref_tab(
         &pane_content,
         PaneEntry {
             placeholder_id: durable_id.clone(),
+            provider: PROVIDER.into(),
+            session_type: SESSION_TYPE.into(),
             cwd: cwd.clone(),
             model: model.clone(),
             effort: effort.clone(),
@@ -5988,13 +6175,7 @@ async fn send_keys(
         return fail_json(StatusCode::BAD_REQUEST, "text is required".to_string());
     }
 
-    let pane = match state
-        .panes
-        .lock()
-        .expect("panes mutex")
-        .get(&pane_id)
-        .cloned()
-    {
+    let pane = match pane_entry_for_request(&state, &pane_id) {
         Some(pane) => pane,
         None => return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string()),
     };
@@ -6004,6 +6185,51 @@ async fn send_keys(
         .and_then(value_as_secs)
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_TURN_TIMEOUT);
+
+    if let Some(gateway) = state.hosted_rest_gateway() {
+        let request_id = body
+            .get("requestId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+        let result = gateway
+            .send_agent(hosted_rest::HostedRestSend {
+                request_id: request_id.clone(),
+                session_id: pane.placeholder_id.clone(),
+                provider: pane.provider.clone(),
+                session_type: pane.session_type.clone(),
+                text,
+                timeout_ms: u64::try_from(turn_timeout.as_millis()).unwrap_or(u64::MAX),
+            })
+            .await;
+        return match result {
+            Ok(result) if result.completed => ok_json(
+                json!({
+                    "paneId":pane_id,
+                    "sessionId":result.session_id,
+                    "submittedTurnId":request_id,
+                    "sessionRef":{"provider":pane.provider,"sessionId":result.session_id},
+                    "status":"idle",
+                }),
+                "prompt sent",
+            ),
+            Ok(result) => approx_json(
+                json!({
+                    "paneId":pane_id,
+                    "sessionId":result.session_id,
+                    "submittedTurnId":request_id,
+                    "sessionRef":{"provider":pane.provider,"sessionId":result.session_id},
+                    "status":"approx",
+                }),
+                "prompt sent; turn did not complete within deadline",
+            ),
+            Err(()) => fail_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "durable fresh-agent input was not accepted".to_string(),
+            ),
+        };
+    }
 
     let manager = state.ensure_manager().await;
     let route = pane.cwd.clone();
@@ -6633,13 +6859,7 @@ async fn capture(
         return resp;
     }
 
-    let pane = match state
-        .panes
-        .lock()
-        .expect("panes mutex")
-        .get(&pane_id)
-        .cloned()
-    {
+    let pane = match pane_entry_for_request(&state, &pane_id) {
         Some(pane) => pane,
         None => {
             // Layout-only panes (e.g. a legacy `agent-chat` pane normalized to
@@ -6664,6 +6884,36 @@ async fn capture(
             return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string());
         }
     };
+    if let Some(gateway) = state.hosted_rest_gateway() {
+        let session_id = pane
+            .durable_id
+            .clone()
+            .unwrap_or_else(|| pane.placeholder_id.clone());
+        let max_bytes = params
+            .get("maxBytes")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(256 * 1024)
+            .clamp(1, 256 * 1024);
+        return match gateway
+            .capture(hosted_rest::HostedRestCapture {
+                session_id,
+                provider: pane.provider.clone(),
+                session_type: pane.session_type.clone(),
+                max_bytes,
+            })
+            .await
+        {
+            Ok(capture) => text_plain(capture.text),
+            Err(hosted_rest::HostedRestCaptureError::Unsupported) => fail_json(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "hosted fresh-agent provider does not support transcript capture".to_string(),
+            ),
+            Err(hosted_rest::HostedRestCaptureError::Unavailable) => fail_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "hosted fresh-agent transcript is temporarily unavailable".to_string(),
+            ),
+        };
+    }
     let Some(durable_id) = pane.durable_id else {
         // No turn yet → empty transcript (text/plain), matching a fresh pane.
         return text_plain(String::new());
@@ -8726,6 +8976,107 @@ mod tests {
 
     // -- P1.13 Task 7: REST send-keys materialization writes a binding row --
 
+    #[derive(Default)]
+    struct RecordingHostedRestGateway {
+        sends: Mutex<Vec<hosted_rest::HostedRestSend>>,
+        captures: Mutex<Vec<hosted_rest::HostedRestCapture>>,
+    }
+
+    #[async_trait::async_trait]
+    impl hosted_rest::HostedFreshAgentRestGateway for RecordingHostedRestGateway {
+        async fn create_agent(
+            self: Arc<Self>,
+            _request: hosted_rest::HostedRestCreate,
+        ) -> Result<hosted_rest::HostedRestCreated, ()> {
+            Ok(hosted_rest::HostedRestCreated {
+                session_id: "managed-kilroy-recovered".into(),
+            })
+        }
+
+        async fn send_agent(
+            &self,
+            request: hosted_rest::HostedRestSend,
+        ) -> Result<hosted_rest::HostedRestSendResult, ()> {
+            self.sends.lock().expect("sends mutex").push(request);
+            Ok(hosted_rest::HostedRestSendResult {
+                session_id: "managed-kilroy-recovered".into(),
+                completed: true,
+            })
+        }
+
+        async fn capture(
+            &self,
+            request: hosted_rest::HostedRestCapture,
+        ) -> Result<hosted_rest::HostedRestCaptureResult, hosted_rest::HostedRestCaptureError>
+        {
+            self.captures.lock().expect("captures mutex").push(request);
+            Ok(hosted_rest::HostedRestCaptureResult {
+                session_id: "managed-kilroy-recovered".into(),
+                native_session_id: "kilroy-native".into(),
+                text: "recovered transcript".into(),
+                truncated: false,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_rest_send_and_capture_recover_pane_from_persisted_layout_after_web_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        let gateway = Arc::new(RecordingHostedRestGateway::default());
+        let first = state().with_layout(layout_store::LayoutStore::with_persistence(path.clone()));
+        first.set_hosted_rest_gateway(gateway.clone()).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-auth-token", "tok".parse().unwrap());
+        let created = create_tab(
+            State(first),
+            headers.clone(),
+            Json(json!({ "agent": "kilroy", "cwd": "/tmp" })),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+        let created_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(created.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let pane_id = created_body["data"]["paneId"].as_str().unwrap().to_string();
+
+        let restarted = state().with_layout(layout_store::LayoutStore::with_persistence(path));
+        restarted.set_hosted_rest_gateway(gateway.clone()).unwrap();
+        let sent = send_keys(
+            State(restarted.clone()),
+            Path(pane_id.clone()),
+            headers.clone(),
+            Json(json!({ "data": "after restart" })),
+        )
+        .await;
+        assert_eq!(sent.status(), StatusCode::OK);
+        {
+            let sends = gateway.sends.lock().expect("sends mutex");
+            assert_eq!(sends.len(), 1);
+            assert_eq!(sends[0].session_id, "managed-kilroy-recovered");
+            assert_eq!(sends[0].text, "after restart");
+        }
+
+        let captured = capture(
+            State(restarted),
+            Path(pane_id),
+            headers,
+            Query(std::collections::HashMap::new()),
+        )
+        .await;
+        assert_eq!(captured.status(), StatusCode::OK);
+        let text = axum::body::to_bytes(captured.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&text[..], b"recovered transcript");
+        let captures = gateway.captures.lock().expect("captures mutex");
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0].session_id, "managed-kilroy-recovered");
+    }
+
     /// Like `opencode_ws::tests::FakeHttp`: `POST /session` mints `ses_1`; everything
     /// else (health, prompt, status) answers a benign `{}`.
     struct CreateCapableHttp;
@@ -8779,6 +9130,8 @@ mod tests {
             "pane-1".to_string(),
             PaneEntry {
                 placeholder_id: "freshopencode-r1".to_string(),
+                provider: PROVIDER.into(),
+                session_type: SESSION_TYPE.into(),
                 cwd: Some("/w".to_string()),
                 model: Some("big-model".to_string()),
                 effort: Some("high".to_string()),
@@ -8861,6 +9214,8 @@ mod tests {
             "pane-foreign".to_string(),
             PaneEntry {
                 placeholder_id: "freshopencode-foreign".to_string(),
+                provider: PROVIDER.into(),
+                session_type: SESSION_TYPE.into(),
                 cwd: Some("/w".to_string()),
                 model: None,
                 effort: None,
@@ -9019,6 +9374,8 @@ mod tests {
             "pane-r22-window".to_string(),
             PaneEntry {
                 placeholder_id: "freshopencode-r22-window".to_string(),
+                provider: PROVIDER.into(),
+                session_type: SESSION_TYPE.into(),
                 cwd: Some("/w".to_string()),
                 model: None,
                 effort: None,
@@ -9125,6 +9482,8 @@ mod tests {
             "pane-r22-fail".to_string(),
             PaneEntry {
                 placeholder_id: "freshopencode-r22-fail".to_string(),
+                provider: PROVIDER.into(),
+                session_type: SESSION_TYPE.into(),
                 cwd: Some("/w".to_string()),
                 model: None,
                 effort: None,
@@ -9235,6 +9594,8 @@ mod tests {
             "pane-r22-lost".to_string(),
             PaneEntry {
                 placeholder_id: "freshopencode-r22-lost".to_string(),
+                provider: PROVIDER.into(),
+                session_type: SESSION_TYPE.into(),
                 cwd: Some("/w".to_string()),
                 model: None,
                 effort: None,
@@ -9368,6 +9729,8 @@ mod tests {
             "pane-r26-race".to_string(),
             PaneEntry {
                 placeholder_id: "freshopencode-r26-race".to_string(),
+                provider: PROVIDER.into(),
+                session_type: SESSION_TYPE.into(),
                 cwd: Some("/w".to_string()),
                 model: None,
                 effort: None,
@@ -9490,6 +9853,8 @@ mod tests {
             pane_id.to_string(),
             PaneEntry {
                 placeholder_id: format!("freshopencode-{pane_id}"),
+                provider: PROVIDER.into(),
+                session_type: SESSION_TYPE.into(),
                 cwd: Some("/w".to_string()),
                 model: None,
                 effort: None,
@@ -9704,6 +10069,8 @@ mod tests {
             "pane-blank".to_string(),
             PaneEntry {
                 placeholder_id: "freshopencode-b1".to_string(),
+                provider: PROVIDER.into(),
+                session_type: SESSION_TYPE.into(),
                 cwd: None,
                 model: None,
                 effort: None,
@@ -9789,6 +10156,8 @@ mod tests {
             "pane-rest-feed".to_string(),
             PaneEntry {
                 placeholder_id: "freshopencode-feed1".to_string(),
+                provider: PROVIDER.into(),
+                session_type: SESSION_TYPE.into(),
                 cwd: Some("/w".to_string()),
                 model: None,
                 effort: None,

@@ -6,13 +6,50 @@ export const CONTINUITY_SMOKE_SPEC = /continuity-smoke\.spec\.ts$/
 export const MATCH_ALL_TEST_IGNORE = [CONTINUITY_SMOKE_SPEC]
 
 /**
- * These specs require locally installed provider binaries. Cloud selection must
- * never stand in for their receipt; `selector` is the positive local command.
+ * These specs require local provider binaries or a host Docker supervisor.
+ * Cloud selection must never stand in for their receipt; `selector` is the
+ * positive local command.
  */
 export const LOCAL_ONLY_SPECS = [{
   spec: 'mcp-qa-smoke-rust.spec.ts',
   selector: '--project=chromium test/e2e-browser/specs/mcp-qa-smoke-rust.spec.ts',
   classification: 'local-only-provider-binary',
+}, {
+  spec: 'runtime-terminal-continuity-rust.spec.ts',
+  selector: '--project=chromium test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts',
+  classification: 'local-only-docker-supervisor',
+}, {
+  spec: 'runtime-provider-resurrection-rust.spec.ts',
+  selector: '--project=chromium test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts',
+  classification: 'local-only-docker-supervisor',
+}, {
+  spec: 'runtime-opencode-provider-qualification-rust.spec.ts',
+  selector: '--project=chromium test/e2e-browser/specs/runtime-opencode-provider-qualification-rust.spec.ts',
+  classification: 'local-only-docker-supervisor',
+}, {
+  spec: 'runtime-managed-provider-qualification-rust.spec.ts',
+  selector: '--project=chromium test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts',
+  classification: 'local-only-docker-supervisor',
+}, {
+  spec: 'runtime-fresh-agent-fixture-rust.spec.ts',
+  selector: '--project=chromium test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts',
+  classification: 'local-only-docker-supervisor',
+}, {
+  spec: 'runtime-fresh-agent-qualification-rust.spec.ts',
+  selector: '--project=chromium test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts',
+  classification: 'local-only-docker-supervisor',
+}, {
+  spec: 'runtime-tabs-rehydrate-rust.spec.ts',
+  selector: '--project=chromium test/e2e-browser/specs/runtime-tabs-rehydrate-rust.spec.ts',
+  classification: 'local-only-docker-supervisor',
+}, {
+  spec: 'runtime-lost-soul-notice-rust.spec.ts',
+  selector: '--project=chromium test/e2e-browser/specs/runtime-lost-soul-notice-rust.spec.ts',
+  classification: 'local-only-docker-supervisor',
+}, {
+  spec: 'runtime-chaos-rust.spec.ts',
+  selector: '--project=chromium test/e2e-browser/specs/runtime-chaos-rust.spec.ts',
+  classification: 'local-only-docker-supervisor',
 }]
 
 const continuityRequested = process.env.FRESHELL_SMOKE

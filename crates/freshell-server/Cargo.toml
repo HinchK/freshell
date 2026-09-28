@@ -14,6 +14,23 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# Opt-in managed terminal controller. The default build keeps local terminal
+# ownership; the runtime client is only included when this feature is enabled.
+default = []
+managed-runtime-v1 = [
+  "dep:freshell-agent-runtime",
+  "dep:freshell-runtime-client",
+  "dep:freshell-runtime-protocol",
+]
+managed-provider-qualification = [
+  "managed-runtime-v1",
+  "freshell-agent-runtime/provider-qualification",
+  "freshell-ws/provider-qualification",
+  "freshell-freshagent/provider-qualification",
+]
+managed-fresh-agent-fixtures = ["managed-runtime-v1"]
+
 [[bin]]
 name = "freshell-server"
 path = "src/main.rs"
@@ -44,12 +61,17 @@ freshell-terminal = { path = "../freshell-terminal" }
 # kata b8ke Task 3: the ONE runtime-ownership coordinator minted in main and
 # injected into every fresh-agent lane (plus the Starting-state watchdog).
 freshell-ownership = { path = "../freshell-ownership" }
+freshell-agent-runtime = { path = "../freshell-agent-runtime", optional = true }
+freshell-runtime-client = { path = "../freshell-runtime-client", optional = true }
+freshell-runtime-observability = { path = "../freshell-runtime-observability" }
+freshell-runtime-protocol = { path = "../freshell-runtime-protocol", optional = true }
 # `sync` = the shared broadcast bus; `signal` = graceful SIGTERM shutdown (serve
 # reaping); `time` = the bounded wait for the `ui.screenshot.result` round-trip;
 # `process` = `fresh_agent_extras.rs` spawns `tokio::process::Command` directly
 # (this crate declares what it uses rather than relying on feature unification).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "signal", "sync", "time"] }
 axum = "0.8"
+async-trait = "0.1"
 serde_json = { workspace = true }
 # Boot-scoped identifiers: `srv-<uuidv4>` / `boot-<uuidv4>`.
 uuid = { version = "1", features = ["v4"] }

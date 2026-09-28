@@ -1014,7 +1014,10 @@ wss.on('connection', (socket) => {
       if (closeSocketAfterMethodsOnce.delete(method) && claimCrossProcessCloseSocketOnce(method)) {
         setTimeout(() => socket.close(), 0)
       }
-      if (exitProcessAfterMethodsOnce.delete(method)) {
+      if (
+        exitProcessAfterMethodsOnce.delete(method)
+        && claimCrossProcessOnce(behavior.exitProcessAfterMethodsOnceMarkerPath, `exit-process:${method}`)
+      ) {
         setTimeout(() => {
           if (behavior.stdoutBeforeExit) {
             process.stdout.write(String(behavior.stdoutBeforeExit))

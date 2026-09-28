@@ -27,16 +27,33 @@ describe('terminalLifecycleSlice', () => {
 
   it('recordAutoResumeSettled clears the notice and records resumeCycles', () => {
     let s = reducer(empty, recordAutoResumeRecovering({ paneId: 'p1', attempt: 1, maxAttempts: 2, exitCode: 1, at: 1000 }))
-    s = reducer(s, recordAutoResumeSettled({ paneId: 'p1', resumeCycles: 3 }))
+    s = reducer(s, recordAutoResumeSettled({ paneId: 'p1', terminalId: 't1', resumeCycles: 3, at: 1001 }))
     expect(selectActiveNoticeFrom(s, 'p1')).toBeUndefined()
     expect(selectResumeCycles({ terminalLifecycle: s }, 'p1')).toBe(3)
+  })
+
+  it('records a typed final crash even when terminal.exit was never attached', () => {
+    let s = reducer(empty, foldTerminalReplacement({
+      paneId: 'p1', newTerminalId: 't3', exitCode: 1,
+      attempt: 2, maxAttempts: 2, at: 1000,
+    }))
+    s = reducer(s, recordAutoResumeSettled({
+      paneId: 'p1', terminalId: 't3', exitCode: 1, at: 2000,
+    }))
+    expect(selectExitRecordFrom(s, 'p1')).toEqual({ exitCode: 1, at: 2000 })
+    expect(s.byPaneId.p1.settle).toMatchObject({ terminalId: 't3', exitCode: 1 })
+
+    const stale = reducer(s, recordAutoResumeSettled({
+      paneId: 'p1', terminalId: 't2', exitCode: 9, at: 3000,
+    }))
+    expect(stale).toBe(s)
   })
 
   it('clearRecoveringNotices clears every recovering notice (D-3 reconnect backstop)', () => {
     let s = reducer(empty, recordAutoResumeRecovering({ paneId: 'p1', attempt: 1, maxAttempts: 2, exitCode: 1, at: 1000 }))
     s = reducer(s, recordAutoResumeRecovering({ paneId: 'p2', attempt: 2, maxAttempts: 2, exitCode: 137, at: 1000 }))
     s = reducer(s, recordTerminalExit({ paneId: 'p3', terminalId: 't3', exitCode: 1, at: 1000 }))
-    s = reducer(s, recordAutoResumeSettled({ paneId: 'p4', resumeCycles: 5 }))
+    s = reducer(s, recordAutoResumeSettled({ paneId: 'p4', terminalId: 't4', resumeCycles: 5, at: 1001 }))
     s = reducer(s, clearRecoveringNotices())
     expect(selectActiveNoticeFrom(s, 'p1')).toBeUndefined()
     expect(selectActiveNoticeFrom(s, 'p2')).toBeUndefined()
@@ -46,7 +63,7 @@ describe('terminalLifecycleSlice', () => {
   })
 
   it('recordTerminalExit clears prior settle state (stale resumeCycles cannot leak into a later crash banner)', () => {
-    let s = reducer(empty, recordAutoResumeSettled({ paneId: 'p1', resumeCycles: 5 }))
+    let s = reducer(empty, recordAutoResumeSettled({ paneId: 'p1', terminalId: 't1', resumeCycles: 5, at: 1 }))
     s = reducer(s, recordTerminalExit({ paneId: 'p1', terminalId: 't1', exitCode: 1, at: 2 }))
     expect(selectResumeCycles({ terminalLifecycle: s }, 'p1')).toBeUndefined()
   })
@@ -66,7 +83,7 @@ describe('terminalLifecycleSlice', () => {
     // Pairs with the recordTerminalExit pin above (validated A15): nothing
     // else ever deletes the settle state, and the REST-door relaunch/
     // reconcile never advances lastTerminalId.
-    let s = reducer(empty, recordAutoResumeSettled({ paneId: 'p1', resumeCycles: 5 }))
+    let s = reducer(empty, recordAutoResumeSettled({ paneId: 'p1', terminalId: 't1', resumeCycles: 5, at: 1 }))
     s = reducer(s, foldTerminalReplacement({ paneId: 'p1', newTerminalId: 't2', exitCode: 1, attempt: 1, maxAttempts: 2, at: 2000 }))
     expect(selectResumeCycles({ terminalLifecycle: s }, 'p1')).toBeUndefined()
   })

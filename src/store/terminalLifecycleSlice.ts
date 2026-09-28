@@ -19,9 +19,9 @@ export interface PaneLifecycleEntry {
   lastTerminalId?: string
   exit?: TerminalExitRecord
   notice?: AutoResumeNotice
-  /** Settle frame record (znhn item 3) — resumeCycles is present only for
-   * flap-circuit-breaker settles and feeds the "crashed N times" banner. */
-  settle?: { resumeCycles?: number }
+  /** Authoritative end of auto-resume for this terminal. The exit code also
+   * covers a process that died before the browser attached for terminal.exit. */
+  settle?: { terminalId: string; exitCode?: number; resumeCycles?: number }
 }
 
 /** Wedge-backstop (LB-8): the per-pane wedged-agent flag folded from
@@ -101,24 +101,35 @@ const slice = createSlice({
     // replacement for the old 30s TTL guess (znhn item 3).
     recordAutoResumeSettled(
       state,
-      action: PayloadAction<{ paneId: string; resumeCycles?: number }>
+      action: PayloadAction<{ paneId: string; terminalId: string; exitCode?: number; resumeCycles?: number; at: number }>
     ) {
-      const { paneId, resumeCycles } = action.payload
+      const { paneId, terminalId, exitCode, resumeCycles, at } = action.payload
+      // A delayed settle for an older generation cannot overwrite a newer
+      // replacement's lifecycle after terminal.replaced advanced the ID.
+      const existing = state.byPaneId[paneId]
+      if (existing?.lastTerminalId && existing.lastTerminalId !== terminalId) return
       // Settle frames are redelivered by design (the cancel handler's
       // immediate frame + the hub's post-sleep re-emit). Bail before
       // touching the draft (entry() materializes missing entries — itself
       // a state change) so a redelivery keeps the same state reference and
       // subscribers see no change — not merely value-idempotent.
-      const existing = state.byPaneId[paneId]
       if (
         existing !== undefined
         && existing.notice === undefined
         && existing.settle !== undefined
+        && existing.settle.terminalId === terminalId
+        && existing.settle.exitCode === exitCode
         && existing.settle.resumeCycles === resumeCycles
       ) return
       const e = entry(state, paneId)
       delete e.notice
-      e.settle = resumeCycles !== undefined ? { resumeCycles } : {}
+      e.lastTerminalId = terminalId
+      if (typeof exitCode === 'number') e.exit = { exitCode, at }
+      e.settle = {
+        terminalId,
+        ...(typeof exitCode === 'number' ? { exitCode } : {}),
+        ...(resumeCycles !== undefined ? { resumeCycles } : {}),
+      }
     },
     // D-3 backstop (validated): the settle/replaced frames are fire-and-forget
     // on a bounded broadcast (no replay; lagged receivers are force-closed),
@@ -187,6 +198,8 @@ export const selectActiveNotice = (root: { terminalLifecycle?: TerminalLifecycle
   selectActiveNoticeFrom(root.terminalLifecycle, paneId)
 export const selectResumeCycles = (root: { terminalLifecycle?: TerminalLifecycleState }, paneId: string) =>
   root.terminalLifecycle?.byPaneId[paneId]?.settle?.resumeCycles
+export const selectAutoResumeSettle = (root: { terminalLifecycle?: TerminalLifecycleState }, paneId: string) =>
+  root.terminalLifecycle?.byPaneId[paneId]?.settle
 // Wedge-backstop: the pane's wedged-agent flag (undefined = not flagged).
 // `?.` on the stuck map mirrors the slice-level tolerance for partial test
 // stores materialized before the key existed.

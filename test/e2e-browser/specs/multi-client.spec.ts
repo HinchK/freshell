@@ -458,17 +458,11 @@ test.describe('Multi-Client', () => {
   // ------------------------------------------------------------------
   // Geometry authority regression (attach-geometry-resume-panes): a
   // reload-restored tab that boots HIDDEN must never claim viewport geometry
-  // on the wire -- servers resize the PTY unconditionally for
-  // viewport_hydrate, so a hidden tab's stale/never-fitted dims would stomp
-  // the visible pane's geometry. The deterministic mount-hidden shape comes
-  // from persistence restore (the production boot-time path): a REST/UI
-  // create flow auto-selects the new tab so it is never hidden, only a
-  // reload restores a hidden-at-mount pane. Post-fix the boot-time
-  // background hydration attach is keepalive_delta + priority background
-  // (replay-only), and the reveal heals geometry with a terminal.resize
-  // whose dims the kernel then confirms via stty.
+  // on the wire. Negotiated lifetime claims keep the hidden terminal alive
+  // without attaching or resizing it. Reveal attaches, replays the retained
+  // scrollback, and applies viewport geometry, which stty confirms.
   // ------------------------------------------------------------------
-  test('reload-restored background tab stays geometry-neutral until reveal heals it with a resize', async ({ browser, serverInfo, e2eMachineId }) => {
+  test('reload-restored background tab claims its terminal until reveal restores scrollback and geometry', async ({ browser, serverInfo, e2eMachineId }) => {
     test.setTimeout(120_000)
     const context = await newClientContext(browser, serverInfo, e2eMachineId)
     const page = await context.newPage()
@@ -520,11 +514,8 @@ test.describe('Multi-Client', () => {
     const terminalBId = await waitForActiveTerminalId(page)
     expect(terminalBId).not.toBe(terminalAId)
 
-    // Leave a marker in T-B's scrollback: after the reload this marker can
-    // only reappear in T-B's buffer once its boot-time background attach's
-    // replay has landed -- a deterministic hydration-complete gate (with
-    // hydration incomplete the reveal below could legitimately fire a reveal
-    // attach instead of the resize-only heal path).
+    // Leave a marker in T-B's scrollback. The hidden tab does not hydrate on
+    // reload; the marker must reappear when reveal attaches and replays it.
     await tabBTerminal.locator('.xterm').first().click()
     await page.keyboard.type('echo __PRE_RELOAD_MARKER__')
     await page.keyboard.press('Enter')
@@ -548,47 +539,42 @@ test.describe('Multi-Client', () => {
     expect(restored.tabCount).toBe(2)
     expect(restored.activeTabId).toBe(tabAId)
 
-    // The reload installed a fresh harness, so getSentWsMessages is a clean
-    // record of everything since boot. The hidden pane's background hydration
-    // attach must be geometry-neutral: keepalive_delta + background, and never
-    // viewport_hydrate while hidden.
+    // The reload installed a fresh harness, so getSentWsMessages records
+    // everything since boot. The negotiated interest snapshot must claim T-B
+    // while classifying it as hidden. No attach or resize may target T-B yet.
     await page.waitForFunction((id) => {
       const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
       return sent.some((msg: any) =>
-        msg?.type === 'terminal.attach'
-        && msg?.terminalId === id
-        && msg?.intent === 'keepalive_delta'
-        && msg?.priority === 'background')
+        msg?.type === 'terminal.interest'
+        && Array.isArray(msg?.claimedTerminalIds)
+        && msg.claimedTerminalIds.includes(id)
+        && !msg.visibleTerminalIds?.includes(id)
+        && msg.focusedTerminalId !== id)
     }, terminalBId, { timeout: 45_000 })
-    await waitForTerminalText(page, '__PRE_RELOAD_MARKER__', terminalBId, 45_000)
+    await page.waitForTimeout(500)
 
-    const hiddenAttaches: any[] = await page.evaluate((id) => {
+    const hiddenGeometryMessages: any[] = await page.evaluate((id) => {
       const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
-      return sent.filter((msg: any) => msg?.type === 'terminal.attach' && msg?.terminalId === id)
+      return sent.filter((msg: any) =>
+        (msg?.type === 'terminal.attach' || msg?.type === 'terminal.resize')
+        && msg?.terminalId === id)
     }, terminalBId)
     expect(
-      hiddenAttaches.some((msg: any) => msg.intent === 'keepalive_delta' && msg.priority === 'background'),
-      'a hidden-at-boot attach must arrive as keepalive_delta with priority background',
-    ).toBe(true)
-    expect(
-      hiddenAttaches.every((msg: any) => msg.intent !== 'viewport_hydrate'),
-      `a hidden pane must never claim viewport geometry; got: ${JSON.stringify(hiddenAttaches)}`,
-    ).toBe(true)
+      hiddenGeometryMessages,
+      `a hidden pane must claim lifetime without attaching or resizing; got: ${JSON.stringify(hiddenGeometryMessages)}`,
+    ).toHaveLength(0)
 
-    // Reveal T-B. The pane is already live via the geometry-neutral
-    // hydration, so NO new attach may fire -- the heal is a terminal.resize
-    // that the suppression-record invalidation lets through even when the
-    // fitted dims match the dims the clamped attach reported.
+    // Reveal T-B. This first attach hydrates the fresh xterm surface, and
+    // the retained marker proves the replay reached that surface.
     await page.evaluate(() => {
       window.__FRESHELL_TEST_HARNESS__?.clearSentWsMessages?.()
     })
     await activateTab(page, tabBId!)
     await page.waitForFunction((id) => {
       const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
-      return sent.some((msg: any) => msg?.type === 'terminal.resize' && msg?.terminalId === id)
+      return sent.some((msg: any) => msg?.type === 'terminal.attach' && msg?.terminalId === id)
     }, terminalBId, { timeout: 15_000 })
-    // Observation window for a (forbidden) surprise attach after the reveal.
-    await page.waitForTimeout(500)
+    await waitForTerminalText(page, '__PRE_RELOAD_MARKER__', terminalBId, 45_000)
     const afterReveal: any[] = await page.evaluate((id) => {
       const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
       return sent.filter((msg: any) =>
@@ -597,27 +583,24 @@ test.describe('Multi-Client', () => {
     }, terminalBId)
     const revealAttaches = afterReveal.filter((msg: any) => msg.type === 'terminal.attach')
     expect(
-      revealAttaches,
-      `no new attach may fire on reveal (the pane is already live); got: ${JSON.stringify(revealAttaches)}`,
-    ).toHaveLength(0)
-    const revealResizes = afterReveal.filter((msg: any) => msg.type === 'terminal.resize')
-    expect(revealResizes.length).toBeGreaterThanOrEqual(1)
-    const healResize = revealResizes[revealResizes.length - 1]
-    expect(healResize.cols).toBeGreaterThan(0)
-    expect(healResize.rows).toBeGreaterThan(0)
+      revealAttaches.some((msg: any) => msg.surfaceReset === true && msg.sinceSeq === 0),
+      `reveal must hydrate the new surface from retained history; got: ${JSON.stringify(revealAttaches)}`,
+    ).toBe(true)
+    const lastGeometry = afterReveal[afterReveal.length - 1]
+    expect(lastGeometry.cols).toBeGreaterThan(0)
+    expect(lastGeometry.rows).toBeGreaterThan(0)
 
     // Kernel cross-check: the PTY's actual winsize must equal the dims the
-    // reveal resize claimed (a hidden-clamp failure would leave the kernel
-    // at stale/never-fitted dims instead). Poll rather than assume the
-    // server has applied the resize within a fixed settle: each attempt
-    // re-asks stty, and readMarkedPtySize takes the LAST __AXIS__ marker,
-    // so a retry always compares the freshest kernel echo.
+    // reveal's latest attach or resize claimed. Poll until the server applies
+    // that frame; each attempt asks stty again and reads the latest marker.
+    let geometryAttempt = 0
     await expect(async () => {
+      const marker = `__AXIS_${geometryAttempt++}__`
       await tabBTerminal.locator('.xterm').first().click()
-      await page.keyboard.type('echo __AXIS__:$(stty size)')
+      await page.keyboard.type(`echo ${marker}:$(stty size)`)
       await page.keyboard.press('Enter')
-      const kernelSize = await waitForMarkedPtySize(page, '__AXIS__', terminalBId)
-      expect(kernelSize).toBe(`${healResize.rows} ${healResize.cols}`)
+      const kernelSize = await waitForMarkedPtySize(page, marker, terminalBId)
+      expect(kernelSize).toBe(`${lastGeometry.rows} ${lastGeometry.cols}`)
     }).toPass({ timeout: 15_000, intervals: [250, 500, 1_000] })
 
     await context.close()

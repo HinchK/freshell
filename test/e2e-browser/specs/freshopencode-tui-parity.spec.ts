@@ -45,6 +45,9 @@ type FreshOpencodePaneState = {
 
 async function installFakeOpencode(binDir: string): Promise<void> {
   await fsp.mkdir(binDir, { recursive: true })
+  // The executable has no extension. Pin its module type even when an
+  // ancestor of this temporary directory declares "type": "module".
+  await fsp.writeFile(path.join(binDir, 'package.json'), '{"type":"commonjs"}\n')
   const target = path.join(binDir, 'opencode')
   await fsp.copyFile(fakeOpencodeSource, target)
   await fsp.chmod(target, 0o755)
@@ -253,7 +256,15 @@ test.describe('Freshopencode TUI inline parity', () => {
       await expect(backgroundBlock.locator('[aria-label="running"]')).toBeVisible()
       await expect(backgroundBlock.getByText(/^\d+(\.\d+)?s$/)).toHaveCount(0)
 
-      // ── Group 5: Open session opens the child session with its delegated-task caption ──
+      // ── Group 5: a child-session event live-refreshes the visible parent's joined rows ──
+      const liveJoinRow = foregroundBlock
+        .getByTestId('fresh-agent-delegation-row')
+        .filter({ hasText: LIVE_JOIN_COMMAND })
+      await expect(liveJoinRow).toHaveCount(0)
+      await fsp.writeFile(childEventGatePath, 'go\n')
+      await expect(liveJoinRow).toHaveCount(1, { timeout: 30_000 })
+
+      // ── Group 6: Open session opens the child session with its delegated-task caption ──
       await foregroundBlock.getByRole('button', { name: `Open session ${FOREGROUND_DESCRIPTION}` }).click()
       await expect.poll(async () => getFreshOpencodePaneState(page), { timeout: 30_000 }).toMatchObject({
         sessionRef: {
@@ -265,14 +276,6 @@ test.describe('Freshopencode TUI inline parity', () => {
       await expect(delegatedCaption).toHaveCount(1)
       await expect(delegatedCaption).toHaveText(DELEGATED_CAPTION)
       await expect(page.getByText(CHILD_PROMPT_TEXT)).toBeVisible({ timeout: 30_000 })
-
-      // ── Group 6: a child-session event live-refreshes the parent's joined rows ──
-      const liveJoinRow = foregroundBlock
-        .getByTestId('fresh-agent-delegation-row')
-        .filter({ hasText: LIVE_JOIN_COMMAND })
-      await expect(liveJoinRow).toHaveCount(0)
-      await fsp.writeFile(childEventGatePath, 'go\n')
-      await expect(liveJoinRow).toHaveCount(1, { timeout: 30_000 })
     } finally {
       await server.stop().catch(() => {})
       await fsp.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})

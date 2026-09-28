@@ -57,10 +57,7 @@ const CHILD2_TITLE = 'Rail e2e subagent child session two'
 /**
  * The paned child-target pane's `initialCwd` leaf. It is NOT the pane
  * title: registry auto-titles own terminal panes (display precedence,
- * docs/development/rename-scope-contract.md), so the pane banner reads
- * `Pane: OpenCode` (registry auto-title: terminal.rs mode_label ->
- * terminals.changed -> recordTerminalTitleForReplay -> initLayout
- * replay; rotted with e78c25c8c). The leaf survives only as the cwd a
+ * docs/development/rename-scope-contract.md). The leaf survives as the cwd a
  * client-side FALLBACK rail row for this pane would be badged with:
  * that row is the pane-content fallback (`pushFallbackItem` /
  * `collectFallbackItemsFromNode` in sidebarSelectors.ts), which takes
@@ -71,7 +68,7 @@ const CHILD2_TITLE = 'Rail e2e subagent child session two'
  * entry for the child-target terminal" assertion a
  * unique, greppable name to negate instead of the generic provider
  * label "OpenCode" (which the tab strip, the pane picker, and the pane
- * banner itself also render).
+ * pane itself also renders).
  *
  * Deliberately NOT created on disk: the directory picker enumerates real
  * directories under the isolated home into <option> elements, which would
@@ -121,6 +118,7 @@ async function seedOpencodeDb(homeDir: string, workDir: string): Promise<void> {
         directory TEXT NOT NULL,
         title TEXT NOT NULL,
         version TEXT NOT NULL,
+        model TEXT NOT NULL,
         time_created INTEGER NOT NULL,
         time_updated INTEGER NOT NULL,
         time_archived INTEGER
@@ -130,19 +128,19 @@ async function seedOpencodeDb(homeDir: string, workDir: string): Promise<void> {
     db.prepare('INSERT OR REPLACE INTO project (id, worktree) VALUES (?, ?)').run('global', '/')
     db.prepare(
       `INSERT OR REPLACE INTO session
-        (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated, time_archived)
-       VALUES (?, 'global', NULL, ?, ?, ?, 'rail-e2e-seed', ?, ?, NULL)`,
-    ).run(ROOT_ID, ROOT_ID, workDir, ROOT_TITLE, now, now)
+        (id, project_id, parent_id, slug, directory, title, version, model, time_created, time_updated, time_archived)
+       VALUES (?, 'global', NULL, ?, ?, ?, 'rail-e2e-seed', ?, ?, ?, NULL)`,
+    ).run(ROOT_ID, ROOT_ID, workDir, ROOT_TITLE, 'fake-model', now, now)
     db.prepare(
       `INSERT OR REPLACE INTO session
-        (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated, time_archived)
-       VALUES (?, 'global', ?, ?, ?, ?, 'rail-e2e-seed', ?, ?, NULL)`,
-    ).run(CHILD_ID, ROOT_ID, CHILD_ID, workDir, CHILD_TITLE, now, now)
+        (id, project_id, parent_id, slug, directory, title, version, model, time_created, time_updated, time_archived)
+       VALUES (?, 'global', ?, ?, ?, ?, 'rail-e2e-seed', ?, ?, ?, NULL)`,
+    ).run(CHILD_ID, ROOT_ID, CHILD_ID, workDir, CHILD_TITLE, 'fake-model', now, now)
     db.prepare(
       `INSERT OR REPLACE INTO session
-        (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated, time_archived)
-       VALUES (?, 'global', ?, ?, ?, ?, 'rail-e2e-seed', ?, ?, NULL)`,
-    ).run(CHILD2_ID, ROOT_ID, CHILD2_ID, workDir, CHILD2_TITLE, now, now)
+        (id, project_id, parent_id, slug, directory, title, version, model, time_created, time_updated, time_archived)
+       VALUES (?, 'global', ?, ?, ?, ?, 'rail-e2e-seed', ?, ?, ?, NULL)`,
+    ).run(CHILD2_ID, ROOT_ID, CHILD2_ID, workDir, CHILD2_TITLE, 'fake-model', now, now)
   } finally {
     db.close()
   }
@@ -324,29 +322,16 @@ test.describe('sidebar opencode rail', () => {
           })
         }, { terminalId: panedTerminalId!, sessionId: CHILD2_ID, initialCwd: childPaneDir })
 
-        // POSITIVE CONTROL for the negatives below: the pane really exists,
-        // carries the child sessionRef, and RENDERS -- its header is a
-        // `banner`, the rail's rows are `button`s, so the button-scoped
-        // absence assertions below are about the RAIL specifically.
-        //
-        // Display-precedence ladder: registry auto-titles OWN terminal
-        // panes -- a cached terminal-level title outranks both the
-        // session-title mirror and the initLayout-derived cwd-leaf
-        // (docs/development/rename-scope-contract.md). Writer path:
-        // terminal create stamps the registry auto-title via mode_label
-        // ("OpenCode", terminal.rs) -> `terminals.changed` -> the client's
-        // terminal-directory fetch caches it for replay
-        // (recordTerminalTitleForReplay, terminalDirectoryThunks.ts) ->
-        // this `panes/initLayout` (a TERMINAL_BINDING_PANE_ACTION)
-        // replays the cached title over the pane. The banner therefore
-        // reads `Pane: OpenCode`, never the cwd-leaf -- that expectation
-        // rotted when the title-replay pipeline landed (e78c25c8c).
+        // POSITIVE CONTROL for the negatives below: the pane exists,
+        // carries the child sessionRef, and renders. Pane shells use role
+        // `group`; the rail's rows are buttons, so the button-scoped absence
+        // assertions below address the rail specifically.
         await expect.poll(async () => {
           const layout = await harness.getPaneLayout('e2e-rail-paned-tab')
           return layout?.content?.sessionRef?.sessionId ?? null
         }, { timeout: 15_000 }).toBe(CHILD2_ID)
         await expect(
-          page.getByRole('banner', { name: 'Pane: OpenCode' }),
+          page.locator('[data-pane-shell][data-tab-id="e2e-rail-paned-tab"][role="group"]'),
         ).toBeVisible({ timeout: 30_000 })
 
         // Re-assert under default visibility: the paned child-target

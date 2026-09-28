@@ -404,7 +404,7 @@ async fn handle_kill_leaves_no_record() {
 /// exposes a readiness witness and a loopback port, and its repeated writes prove that the
 /// sidecar lifecycle is guarding a writer tree rather than only a direct `sleep` child.
 #[tokio::test]
-async fn durable_writer_fixture_exposes_live_witness_and_is_reaped_with_the_sidecar() {
+async fn durable_writer_fixture_exposes_live_witness_and_stops_with_the_sidecar() {
     let _env = ENV_LOCK.lock().await;
     std::env::set_var("CODEX_CMD", fake_codex_cmd());
     let guard = TrackingStoreGuard::install();
@@ -484,8 +484,8 @@ async fn durable_writer_fixture_exposes_live_witness_and_is_reaped_with_the_side
     .await;
 
     assert!(
-        !std::path::Path::new(&format!("/proc/{writer_pid}")).exists(),
-        "the owned writer child must be reaped with the app-server"
+        proc_starttime(writer_pid as i32).is_none(),
+        "the owned writer child must stop with the app-server (a zombie may remain until PID 1 reaps it)"
     );
     assert!(
         guard.records().is_empty(),

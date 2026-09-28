@@ -29,7 +29,12 @@ type PaneNode = {
 }
 
 type Snapshot = {
-  tabs: Array<{ id: string; title?: string }>
+  tabs: Array<{
+    id: string
+    title?: string
+    fallbackSessionRef?: { provider: string; sessionId: string }
+    nameSource?: unknown
+  }>
   activeTabId?: string | null
   layouts: Record<string, PaneNode>
   activePane: Record<string, string>
@@ -74,11 +79,20 @@ async function splitAndSelectShell(page: Page, direction: 'horizontal' | 'vertic
 
 /** The shape the client mirror sends (the client state is the source of
  * truth; the server must echo it). Compares:
- *  - EXACTLY: tabs (id/title/order), layouts (full trees), activePane, activeTabId
+ *  - EXACTLY: tabs (id/title/order/naming source/session ref), layouts (full trees), activePane, activeTabId
  *  - client ⊑ server for paneTitles (server adds derived seeds) and
  *    paneTitleSetByUser (server may add EMPTY per-tab maps from seeding). */
 function expectSnapshotMatchesClient(snapshot: Snapshot, client: any) {
-  const clientTabs = client.tabs.tabs.map((t: any) => ({ id: t.id, title: t.title }))
+  const clientTabs = client.tabs.tabs.map((t: any) => {
+    const provider = t.sessionRef?.provider
+    const sessionId = t.sessionRef?.sessionId
+    return {
+      id: t.id,
+      title: t.title,
+      ...(provider && sessionId ? { fallbackSessionRef: { provider, sessionId } } : {}),
+      ...(t.nameSource ? { nameSource: t.nameSource } : {}),
+    }
+  })
   expect(snapshot.tabs).toEqual(clientTabs)
   expect(snapshot.activeTabId).toEqual(client.tabs.activeTabId)
   expect(snapshot.layouts).toEqual(client.panes.layouts)
@@ -196,21 +210,27 @@ test.describe('AUTO-01 — ui.layout.sync is the authoritative layout', () => {
     // ── the REST read surface must equal the client's real layout ──
     let lastSnapshot: Snapshot | undefined
     let lastClient: any
-    await expect
-      .poll(
-        async () => {
-          lastSnapshot = await fetchSnapshot(serverInfo)
-          lastClient = await harness.getState()
-          try {
-            expectSnapshotMatchesClient(lastSnapshot, lastClient)
-            return true
-          } catch {
-            return false
-          }
-        },
-        { timeout: 15_000, intervals: [LAYOUT_SYNC_DEBOUNCE_MS, 500, 1000] },
-      )
-      .toBe(true)
+    try {
+      await expect
+        .poll(
+          async () => {
+            lastSnapshot = await fetchSnapshot(serverInfo)
+            lastClient = await harness.getState()
+            try {
+              expectSnapshotMatchesClient(lastSnapshot, lastClient)
+              return true
+            } catch {
+              return false
+            }
+          },
+          { timeout: 15_000, intervals: [LAYOUT_SYNC_DEBOUNCE_MS, 500, 1000] },
+        )
+        .toBe(true)
+    } catch (error) {
+      // Report the actual field mismatch instead of only a timed-out boolean.
+      if (lastSnapshot && lastClient) expectSnapshotMatchesClient(lastSnapshot, lastClient)
+      throw error
+    }
     expectSnapshotMatchesClient(lastSnapshot!, lastClient)
 
     // Spot-pin details of the acceptance text: a two-value ratio pair is

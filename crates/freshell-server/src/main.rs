@@ -29,6 +29,8 @@ mod existence_by_id;
 mod extensions;
 mod files;
 mod fresh_agent_extras;
+#[cfg(feature = "managed-runtime-v1")]
+mod fresh_agent_proxy;
 mod host_stats;
 mod identity_sink;
 mod instance_id;
@@ -37,6 +39,12 @@ mod legacy_local_seed;
 mod logging;
 mod machines;
 mod managed_ports;
+#[cfg(feature = "managed-runtime-v1")]
+mod managed_provider_bootstrap;
+#[cfg(feature = "managed-runtime-v1")]
+mod managed_runtime;
+#[cfg(feature = "managed-runtime-v1")]
+mod managed_runtime_api;
 mod migrations;
 mod net_bind;
 mod network;
@@ -754,6 +762,15 @@ async fn probe_stale_start_fences(
     }
 }
 
+fn runtime_ownership_for_ledger(
+    ledger: &freshell_ws::pane_ledger::PaneLedger,
+) -> std::io::Result<Arc<freshell_ownership::RuntimeOwnershipRegistry>> {
+    Ok(Arc::new(match ledger.reserve_boot_epoch()? {
+        Some(epoch) => freshell_ownership::RuntimeOwnershipRegistry::with_epoch(epoch),
+        None => freshell_ownership::RuntimeOwnershipRegistry::new(),
+    }))
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // Legacy parity: `import 'dotenv/config'` (`server/index.ts:2-3`) loads
@@ -968,12 +985,26 @@ async fn main() -> ExitCode {
     fresh_codex_state.set_session_leases(Arc::clone(&fresh_agent_leases));
     fresh_claude_state.set_session_leases(Arc::clone(&fresh_agent_leases));
 
-    // kata b8ke: the ONE server-wide runtime-ownership coordinator shared
-    // by the terminal lane and every fresh-agent provider (Task 3 wires the
-    // fresh-agent lanes; Task 4 adds the WsState field for the terminal
-    // lane). The per-boot epoch is minted at construction (see
-    // `freshell_ownership`'s crate doc).
-    let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+    // The ledger's single-writer lock also owns the durable boot-epoch
+    // counter. Reserve an epoch before any identity lane can write: the
+    // ledger orders (epoch, generation) pairs numerically, so a fresh random
+    // epoch could otherwise sort below a row from the previous server boot.
+    let pane_ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new_locked(
+        home.as_ref()
+            .map(|h| h.join(".freshell").join("pane-ledger")),
+    ));
+    let ownership = match runtime_ownership_for_ledger(&pane_ledger) {
+        Ok(registry) => registry,
+        Err(err) => {
+            tracing::error!(error = %err, "ownership.boot_epoch_reservation_failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(
+        boot_epoch = ownership.boot_epoch(),
+        ledger_enabled = pane_ledger.is_enabled(),
+        "ownership.boot_epoch_ready"
+    );
     fresh_codex_state.set_ownership(Arc::clone(&ownership));
     fresh_claude_state.set_ownership(Arc::clone(&ownership));
 
@@ -1042,6 +1073,49 @@ async fn main() -> ExitCode {
     // lanes claim).
     let registry = freshell_terminal::TerminalRegistry::new()
         .with_ownership(std::sync::Arc::clone(&ownership));
+    #[cfg(feature = "managed-runtime-v1")]
+    let (managed_runtime_available, managed_runtime_client) = {
+        let controller = managed_runtime::ServerManagedRuntimeController::from_env()
+            .await
+            .map_err(|error| {
+                tracing::error!(error = %error, "managed_runtime.init_failed");
+                error
+            })
+            .unwrap_or_else(|error| {
+                eprintln!("managed runtime initialization failed: {error}");
+                std::process::exit(1);
+            });
+        let available = controller.is_some();
+        let client = controller
+            .as_ref()
+            .map(|controller| controller.runtime_client());
+        registry.set_managed_controller(controller.map(|controller| {
+            controller as Arc<dyn freshell_terminal::registry::ManagedTerminalController>
+        }));
+        (available, client)
+    };
+    #[cfg(not(feature = "managed-runtime-v1"))]
+    let managed_runtime_available = false;
+    #[cfg(feature = "managed-runtime-v1")]
+    if let Some(gateway) = fresh_agent_proxy::HostedFreshAgentProxy::from_opt_in(
+        managed_runtime_client.clone(),
+        Arc::clone(&broadcast_tx),
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("managed fresh-agent gateway initialization failed: {error}");
+        std::process::exit(1);
+    }) {
+        fresh_agent_state
+            .set_hosted_rest_gateway(gateway.clone())
+            .unwrap_or_else(|error| {
+                eprintln!("managed fresh-agent gateway initialization failed: {error}");
+                std::process::exit(1);
+            });
+        freshell_ws::hosted_fresh_agent::install_gateway(gateway).unwrap_or_else(|error| {
+            eprintln!("managed fresh-agent gateway initialization failed: {error}");
+            std::process::exit(1);
+        });
+    }
     // HOST-PRESSURE PANE (Task 9, docs/plans/2026-08-25-host-pressure-pane.md):
     // the Rust host-stats collector — freshell-platform readers over
     // freshell-ws's trait bridge. Constructed here (not at the ~1311
@@ -1078,19 +1152,8 @@ async fn main() -> ExitCode {
     // live-session guard can consume it through the `SessionIdentityLookup`
     // seam (cheap-clone handle; `WsState` keeps using this same binding).
     let terminal_identity = freshell_ws::identity::TerminalIdentityRegistry::new();
-    // P1.8: the pane-identity ledger (spec §4.2). Root resolved ONCE here;
-    // the module itself never reads env vars. No home => disabled no-op,
-    // same policy as tabs-snapshots. `new_locked` = the single-writer
-    // guard (V2.md): exclusive flock on <root>/lock, ConfigLock pattern —
-    // a second server on the same home comes up with a DISABLED ledger and
-    // a loud ERROR instead of two writers corrupting one store. Hoisted
-    // above the fresh-agent builder chain (kata hbsa Task 5, ledger A8):
-    // it depends only on `home`, and the REST spawn pipeline's
-    // `PaneIdentityBinder` below must share THIS instance with `ws_state`.
-    let pane_ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new_locked(
-        home.as_ref()
-            .map(|h| h.join(".freshell").join("pane-ledger")),
-    ));
+    // Every REST and WS identity lane shares the locked ledger constructed
+    // above, including its durable boot epoch.
     // Codex sidecar record store (katas ynfn/da92, Task 10 wiring): the
     // flock'd single-writer store of the `codex app-server` sidecars that
     // terminal panes spawn, so a restarted server can reattach to (or
@@ -2323,8 +2386,14 @@ async fn main() -> ExitCode {
     // Detect which coding-CLI agents are on PATH (so the PanePicker surfaces the real
     // claude/codex/opencode agents, was `{}`) and serialize the client registry for
     // `GET /api/extensions`, reusing the `extension_registry` scanned above.
-    let available_clis =
+    let mut available_clis =
         extensions::detect_available_clis_live(&extension_registry.cli_detection_specs());
+    if managed_runtime_available {
+        // OpenCode lives in the pinned managed workload image; a healthy
+        // managed controller means the web host does not need its own copy.
+        // The helper only promotes an already-registered extension key.
+        extensions::promote_managed_runtime_cli(&mut available_clis, "opencode");
+    }
     let extensions_registry = Arc::new(extension_registry.to_client_registry());
 
     // The boot REST surface the RETAINED React SPA fetches on first paint
@@ -2903,7 +2972,29 @@ async fn main() -> ExitCode {
         broadcast_tx: Arc::clone(&broadcast_tx),
     };
 
+    #[cfg(feature = "managed-runtime-v1")]
+    let managed_runtime_router = {
+        let state = managed_runtime_api::ManagedRuntimeApiState::new(
+            Arc::clone(&auth_token),
+            managed_runtime_client.clone(),
+            home.as_ref()
+                .map(|home| home.join(".freshell").join("managed-runtime-views.json")),
+            Arc::clone(&pane_ledger),
+            Arc::clone(&broadcast_tx),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("managed runtime API initialization failed: {error}");
+            std::process::exit(1);
+        });
+        state.spawn_projector();
+        managed_runtime_api::router(state)
+    };
+    #[cfg(not(feature = "managed-runtime-v1"))]
+    let managed_runtime_router = axum::Router::new();
+
     let app = freshell_api::router(api_state)
+        .merge(managed_runtime_router)
         .merge(diag::router(diag_state))
         .merge(freshell_ws::router(ws_state))
         .merge(freshell_freshagent::router(fresh_agent_state.clone()))
@@ -2956,6 +3047,8 @@ async fn main() -> ExitCode {
                 ledger: std::sync::Arc::clone(&pane_ledger),
                 registry: registry.clone(),
                 identity: terminal_identity.clone(),
+                #[cfg(feature = "managed-runtime-v1")]
+                managed_runtime_client: managed_runtime_client.clone(),
             },
         ))
         .merge(network::router(network_state))
@@ -4563,6 +4656,24 @@ mod sessions_sweep_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boot_epoch_is_reserved_before_constructing_runtime_ownership() {
+        let root = tempfile::tempdir().expect("pane-ledger root");
+        let first_epoch = {
+            let ledger = freshell_ws::pane_ledger::PaneLedger::new_locked(Some(root.path().into()));
+            runtime_ownership_for_ledger(&ledger)
+                .expect("first registry")
+                .boot_epoch()
+        };
+        let second_epoch = {
+            let ledger = freshell_ws::pane_ledger::PaneLedger::new_locked(Some(root.path().into()));
+            runtime_ownership_for_ledger(&ledger)
+                .expect("restarted registry")
+                .boot_epoch()
+        };
+        assert_eq!(second_epoch, first_epoch + 1);
+    }
 
     /// Save-and-restore guard for one env var (tests below mutate real
     /// process env; the shared `HOME_ENV_TEST_LOCK` serializes them

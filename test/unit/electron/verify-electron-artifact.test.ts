@@ -279,19 +279,19 @@ describe('verify-electron-artifact', () => {
     expect(probe).not.toHaveBeenCalled()
   })
 
-  it('accepts the macOS icon and Windows NSIS helper in their resource roots', () => {
+  it('accepts native installer resources in their platform resource roots', () => {
     const cases = [
       { platform: 'darwin' as const, file: 'icon.icns' },
       { platform: 'win32' as const, file: 'elevate.exe' },
+      { platform: 'linux' as const, file: 'apparmor-profile' },
     ]
     for (const { platform, file } of cases) {
       const root = artifactRoot()
       writeArtifact(root, platform)
       writeFileSync(path.join(root, file), 'electron-builder resource')
       expect(verifyElectronArtifact(root, platform, {
-        hostPlatform: platform === nativePlatform ? 'linux' : nativePlatform,
-        probe: () => { throw new Error('foreign binary must not execute locally') },
-      })).toMatchObject({ ok: true, platform, executed: false })
+        probe: refusingProbe(),
+      })).toMatchObject({ ok: true, platform, executed: platform === nativePlatform })
     }
   })
 

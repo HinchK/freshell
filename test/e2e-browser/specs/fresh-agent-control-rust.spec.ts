@@ -1287,6 +1287,11 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
       await harness2.waitForConnection()
       const tabId2 = (await harness2.getActiveTabId())!
       expect(await captureDurableId(harness2, tabId2, CANONICAL_UUID_RE, 30_000)).toBe(durableBefore)
+      await waitForLogEntry(
+        lane.eventsLog,
+        (e) => e.kind === 'resume' && e.data?.id === durableBefore,
+        'the replacement sidecar resumed the crashed durable session',
+      )
 
       // The recovered session answers a follow-up turn — gated on the REAL
       // landing (the sidecar saw the send and completed it), never the
@@ -1306,6 +1311,9 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
       await lane.server.restart()
       await waitForWsReady(page)
       expect(await captureDurableId(harness2, tabId2, CANONICAL_UUID_RE, 30_000)).toBe(durableBefore)
+      await expect.poll(() => readJsonl(lane.eventsLog)
+        .filter((e) => e.kind === 'resume' && e.data?.id === durableBefore).length,
+      { timeout: 60_000, message: 'the restarted server resumed the same durable session' }).toBeGreaterThanOrEqual(2)
       await sendComposerText(page, 'post-restart turn')
       await waitForStdinFrame(
         lane.stdinLog,
@@ -2053,21 +2061,25 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
         'exactly one wedged turn renders (user+assistant rows), alive with no provider completion',
       ).toHaveCount(2, { timeout: 30_000 })
 
-      // Recovery: restart the sidecar and resume the durable thread. Truthful
-      // terminal state = idle with transcript intact, or idle with the explicit
-      // memory-loss alert (both are acceptance-valid).
+      // Recovery stops only the wedged process, then resumes the same durable
+      // thread. The recorded turn survives and the replacement accepts work.
+      const turnsBefore = (await fetchSnapshot(lane.info, 'freshcodex', 'codex', threadId))?.turns
+      expect(turnsBefore?.length).toBeGreaterThan(0)
+      const opsBeforeRestart = readCodexOps(lane.opLogPath).length
       await stuckAlert.getByRole('button', { name: /restart sidecar/i }).click()
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       await expect(stuckAlert).toHaveCount(0)
-      const opsAfter = readCodexOps(lane.opLogPath).map((op: any) => op.method)
-      const resumed = opsAfter.includes('thread/resume')
-      const respawnedFresh = opsAfter.filter((m: string) => m === 'thread/start').length >= 2
-      expect(resumed || respawnedFresh).toBe(true)
-      if (respawnedFresh && !resumed) {
-        // Respawn-as-new surfaces through the existing restore-error alert
-        // machinery (getRestoreErrorMessage, FreshAgentView.tsx).
-        await expect(paneRoot.getByRole('alert').filter({ hasText: /cannot be resumed|no longer has memory/i })).toBeVisible()
-      }
+      expect((await paneLeaf(lane.harness, lane.tabId))?.content?.sessionId).toBe(threadId)
+      const postRestartOps = readCodexOps(lane.opLogPath).slice(opsBeforeRestart)
+      expect(postRestartOps.some((op) => op.method === 'thread/resume' && op.params?.threadId === threadId)).toBe(true)
+      expect(postRestartOps.some((op) => op.method === 'thread/start')).toBe(false)
+      const turnsAfter = (await fetchSnapshot(lane.info, 'freshcodex', 'codex', threadId))?.turns
+      expect(turnsAfter?.length).toBeGreaterThanOrEqual(turnsBefore.length)
+      await sendComposerText(page, 'follow-up after sidecar restart')
+      // The REST projection stores a user and assistant row for each turn.
+      await expect.poll(async () =>
+        (await fetchSnapshot(lane.info, 'freshcodex', 'codex', threadId))?.turns?.length,
+      { timeout: 15_000 }).toBe(turnsAfter.length + 2)
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})

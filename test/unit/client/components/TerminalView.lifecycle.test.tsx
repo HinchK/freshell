@@ -9,6 +9,7 @@ import panesReducer, {
   setPaneCloseError,
   applyReconcileAttach,
   setReconcilePendingPanes,
+  clearAllReconcilePendingPanes,
 } from '@/store/panesSlice'
 import settingsReducer, { defaultSettings, updateSettingsLocal } from '@/store/settingsSlice'
 import connectionReducer, { setStatus as setConnectionStatus } from '@/store/connectionSlice'
@@ -5210,6 +5211,7 @@ describe('TerminalView lifecycle updates', () => {
       fireData(term, 'doomed keystrokes')
       act(() => {
         vi.advanceTimersByTime(30_001)
+        vi.advanceTimersByTime(17) // Vitest 5 schedules the queued xterm write on the next frame.
       })
       expectTerminalWriteContaining(term, 'the terminal did not reconnect in time')
     } finally {
@@ -5315,6 +5317,7 @@ describe('TerminalView lifecycle updates', () => {
       fireData(term, 'doomed')
       act(() => {
         vi.advanceTimersByTime(30_001) // timeout -> immediate notice write
+        vi.advanceTimersByTime(17) // Flush the queued notice before anchoring.
       })
       const writesBeforeAnchor = term.write.mock.calls.length
 
@@ -5325,6 +5328,7 @@ describe('TerminalView lifecycle updates', () => {
           requestId: createMsg.requestId,
           terminalId: 'term-new',
         })
+        vi.advanceTimersByTime(17) // Flush the post-anchor notice write.
       })
       // The notice is written AGAIN after the anchor (post-clear), so it
       // survives the hydrate wipe.
@@ -6639,6 +6643,73 @@ describe('TerminalView lifecycle updates', () => {
         streamId: null,
         serverInstanceId: 'server-attach-stream',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
+    })
+
+    it.each([1, 206])('restarts a recovered managed output epoch at sequence one after old cursor %s', async (oldHead) => {
+      const { terminalId, paneId, term } = await renderTerminalHarness({
+        status: 'running', terminalId: `term-managed-epoch-${oldHead}`,
+        serverInstanceId: 'server-managed-epoch', ackInitialAttach: false, clearSends: false,
+      })
+      const attach = sentMessages().find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)!
+      act(() => {
+        messageHandler!({ type: 'terminal.attach.ready', terminalId, streamId: 'old-host-epoch',
+          headSeq: oldHead, replayFromSeq: oldHead, replayToSeq: oldHead, attachRequestId: attach.attachRequestId })
+        messageHandler!({ type: 'terminal.output', terminalId, streamId: 'old-host-epoch',
+          seqStart: oldHead, seqEnd: oldHead, data: 'OLD HOST HISTORY', attachRequestId: attach.attachRequestId })
+        messageHandler!({ type: 'terminal.stream.changed', terminalId, streamId: 'new-host-epoch',
+          reason: 'new_pty_session', attachRequestId: attach.attachRequestId })
+      })
+      // Reuse the existing safe hydration handshake to retire queued writes
+      // and parser callbacks from the old source before accepting lower seqs.
+      const replacementAttach = sentMessages().filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId).at(-1)!
+      expect(replacementAttach.attachRequestId).not.toBe(attach.attachRequestId)
+      expect(replacementAttach.sinceSeq).toBe(0)
+      expect(sentMessages().filter((msg) => msg?.type === 'terminal.create')).toHaveLength(0)
+      act(() => {
+        messageHandler!({ type: 'terminal.attach.ready', terminalId, streamId: 'new-host-epoch',
+          headSeq: 2, replayFromSeq: 1, replayToSeq: 2, attachRequestId: replacementAttach.attachRequestId })
+        messageHandler!({ type: 'terminal.output', terminalId, streamId: 'new-host-epoch',
+          seqStart: 1, seqEnd: 1, data: 'RECOVERED PROVIDER PROMPT', attachRequestId: replacementAttach.attachRequestId })
+        messageHandler!({ type: 'terminal.output', terminalId, streamId: 'old-host-epoch',
+          seqStart: oldHead + 1, seqEnd: oldHead + 1, data: 'STALE OLD HOST', attachRequestId: attach.attachRequestId })
+        messageHandler!({ type: 'terminal.output', terminalId, streamId: 'new-host-epoch',
+          seqStart: 2, seqEnd: 2, data: 'NEW NATIVE RESPONSE', attachRequestId: replacementAttach.attachRequestId })
+      })
+      const writes = terminalWriteStrings(term).join('')
+      expect(writes).toContain('RECOVERED PROVIDER PROMPT')
+      expect(writes).toContain('NEW NATIVE RESPONSE')
+      expect(writes).not.toContain('STALE OLD HOST')
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
+        streamId: 'new-host-epoch', serverInstanceId: 'server-managed-epoch',
+      }, { paneId })?.parserAppliedSeq).toBe(2)
+    })
+
+    it('does not rewind a managed epoch on a duplicate stream-change notification', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running', terminalId: 'term-managed-epoch-idempotent',
+        ackInitialAttach: false, clearSends: false,
+      })
+      const attach = sentMessages().find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)!
+      act(() => {
+        messageHandler!({ type: 'terminal.attach.ready', terminalId, streamId: 'old-managed-epoch',
+          headSeq: 0, replayFromSeq: 1, replayToSeq: 0, attachRequestId: attach.attachRequestId })
+        messageHandler!({ type: 'terminal.stream.changed', terminalId, streamId: 'new-managed-epoch',
+          reason: 'new_pty_session', attachRequestId: attach.attachRequestId })
+      })
+      const replacementAttach = sentMessages().filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId).at(-1)!
+      expect(replacementAttach.attachRequestId).not.toBe(attach.attachRequestId)
+      const frame = { type: 'terminal.output', terminalId, streamId: 'new-managed-epoch',
+        seqStart: 1, seqEnd: 1, data: 'EXACTLY_ONCE_NEW_EPOCH', attachRequestId: replacementAttach.attachRequestId }
+      act(() => {
+        messageHandler!({ type: 'terminal.attach.ready', terminalId, streamId: 'new-managed-epoch',
+          headSeq: 1, replayFromSeq: 1, replayToSeq: 1, attachRequestId: replacementAttach.attachRequestId })
+        messageHandler!(frame)
+        messageHandler!({ type: 'terminal.stream.changed', terminalId, streamId: 'new-managed-epoch',
+          reason: 'new_pty_session', attachRequestId: replacementAttach.attachRequestId })
+        messageHandler!(frame)
+      })
+      expect(terminalWriteStrings(term).join('').split('EXACTLY_ONCE_NEW_EPOCH')).toHaveLength(2)
+      expect(sentMessages().filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)).toHaveLength(2)
     })
 
     it('accepts live output after a terminal.stream.changed control message without trusting the old stream', async () => {
@@ -13494,6 +13565,56 @@ describe('TerminalView lifecycle updates', () => {
         expect(terminalWrites(term)).toBe('SEED TAIL')
         expect(term.clear).not.toHaveBeenCalled()
       })
+
+      it.each(['deferred', 'confirmed'] as const)(
+        'retries a rejected attach when the reconcile window closes with a %s verdict',
+        async (verdict) => {
+          const { store, terminalId, term } = await renderReconcileFlapPane('rejected')
+          await applyCheckpointBaseline(terminalId, term)
+          act(() => {
+            store.dispatch(setReconcilePendingPanes({
+              paneKeys: ['tab-v2-stream:pane-v2-stream'],
+              startedAt: Date.now(),
+            }))
+          })
+          wsMocks.send.mockClear()
+
+          act(() => { reconnectHandler?.() })
+          const rejectedAttach = attachMessagesFor(terminalId).at(-1)
+          expect(rejectedAttach).toMatchObject({ type: 'terminal.attach', terminalId })
+
+          act(() => {
+            messageHandler!({
+              type: 'error',
+              code: 'INVALID_TERMINAL_ID',
+              message: 'Terminal not running',
+              terminalId,
+              requestId: rejectedAttach!.attachRequestId,
+            })
+          })
+          expect(sentMessages().filter((msg) => msg?.type === 'terminal.create')).toHaveLength(0)
+
+          // A managed runtime can defer its verdict or confirm the same
+          // persisted identity. Either result must re-drive the attach that
+          // the server rejected, preserving the terminal ID.
+          act(() => {
+            if (verdict === 'confirmed') {
+              store.dispatch(applyReconcileAttach({
+                tabId: 'tab-v2-stream',
+                paneId: 'pane-v2-stream',
+                terminalId,
+                serverInstanceId: 'srv-9b',
+                sessionRef: { provider: 'claude', sessionId: 's-9b-rejected' },
+              }))
+            } else {
+              store.dispatch(clearAllReconcilePendingPanes())
+            }
+          })
+          const attaches = attachMessagesFor(terminalId)
+          expect(attaches).toHaveLength(2)
+          expect(attaches[1].attachRequestId).not.toBe(rejectedAttach!.attachRequestId)
+        },
+      )
 
       it('a corrective duplicate verdict re-drives as a checkpoint delta, never a full refetch', async () => {
         const { store, terminalId } = await renderReconcileFlapPane('dup')

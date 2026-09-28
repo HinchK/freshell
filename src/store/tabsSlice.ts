@@ -1,5 +1,6 @@
 import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
 import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
+import type { ManagedRuntimeProjectionFields } from '@shared/managed-runtime'
 import { nanoid } from 'nanoid'
 import { closePane, initLayout, restoreLayout, removeLayout, replacePane, setPaneCloseError, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle, markTabClosing, clearTabClosing, markPaneClosing, clearPaneClosing, hasAnyClosePending } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
@@ -326,7 +327,7 @@ type AddTabPayload = {
    * middleware to resolve at the initial content choice.
    */
   nameSource?: TabNameSource
-}
+} & ManagedRuntimeProjectionFields
 
 export const tabsSlice = createSlice({
   name: 'tabs',
@@ -337,6 +338,10 @@ export const tabsSlice = createSlice({
       const payload = action.payload || {}
 
       const id = payload.id || nanoid()
+      // API tab.create delivery and the durable inventory projection can race
+      // or be redelivered after reconnect. An explicit tab ID denotes one view,
+      // not another request to append/activate it or overwrite user state.
+      if (state.tabs.some((existing) => existing.id === id)) return
       const codingCliProvider = payload.codingCliProvider
       const sessionRef = sanitizeSessionRef(payload.sessionRef)
       const tab: Tab = {
@@ -353,6 +358,16 @@ export const tabsSlice = createSlice({
         serverInstanceId: payload.serverInstanceId,
         resumeSessionId: undefined,
         sessionMetadataByKey: payload.sessionMetadataByKey,
+        soulId: payload.soulId,
+        incarnationId: payload.incarnationId,
+        runtimeState: payload.runtimeState,
+        viewIntentId: payload.viewIntentId,
+        viewIntentRevision: payload.viewIntentRevision,
+        soulIntentRevision: payload.soulIntentRevision,
+        incidentId: payload.incidentId,
+        placementGroup: payload.placementGroup,
+        resourceSummary: payload.resourceSummary,
+        recoverySummary: payload.recoverySummary,
         createdAt: Date.now(),
         updatedAt: Date.now(),
         titleSetByUser: payload.titleSetByUser,
@@ -360,6 +375,9 @@ export const tabsSlice = createSlice({
         nameSource: payload.nameSource,
       }
       state.tabs.push(tab)
+      if (payload.viewIntentId) {
+        state.tombstones = (state.tombstones || []).filter((tombstone) => tombstone.id !== id)
+      }
       if (payload.activate !== false || state.tabs.length === 1) {
         state.activeTabId = id
       }

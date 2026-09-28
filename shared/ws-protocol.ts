@@ -14,6 +14,7 @@ import { LiveTerminalHandleSchema, SessionRefSchema, type RestoreError } from '.
 import { CodexDurabilityRefSchema, type CodexDurabilityRef } from './codex-durability.js'
 import type { SessionNameRecord, SessionNameRef, SessionNameUpdate } from './session-names.js'
 import { TabNameSourceSchema } from './session-names.js'
+import type { ManagedRuntimeInventoryChangedMessage, ManagedRuntimeViewChangedMessage } from './managed-runtime.js'
 
 // ──────────────────────────────────────────────────────────────
 // Shared enums and helpers
@@ -447,6 +448,7 @@ export const HelloSchema = z.object({
     // declared, not just sent (same strip hazard as above); absent for the
     // frozen client shape.
     terminalLifetimeClaimV1: z.literal(true).optional(),
+    managedRuntimeV1: z.literal(true).optional(),
   }).optional(),
   client: z.object({
     mobile: z.boolean().optional(),
@@ -954,6 +956,7 @@ export const FreshAgentConfigureSchema = z.object({
 
 export const FreshAgentCompactSchema = z.object({
   type: z.literal('freshAgent.compact'),
+  requestId: z.string().min(1).optional(),
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
@@ -998,6 +1001,32 @@ export const FreshAgentKillSchema = z.object({
   observedEpoch: z.number().int().nonnegative().optional(),
   observedGeneration: z.number().int().nonnegative().optional(),
 })
+
+/** Codex-only process stop used by the stuck card. This extension stays
+ * separate from the frozen client-message inventory; an ordinary kill closes
+ * the durable session, while recovery preserves it for the next attach. */
+export const FreshAgentRecoveryStopSchema = z.object({
+  type: z.literal('freshAgent.recovery.stop'),
+  requestId: z.string().min(1),
+  sessionId: z.string().min(1),
+  sessionType: z.literal('freshcodex'),
+  provider: z.literal('codex'),
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
+})
+export type FreshAgentRecoveryStopMessage = z.infer<typeof FreshAgentRecoveryStopSchema>
+
+export const FreshAgentRecoveryStoppedSchema = z.object({
+  type: z.literal('freshAgent.recovery.stopped'),
+  requestId: z.string().min(1),
+  sessionId: z.string().min(1),
+  sessionType: z.literal('freshcodex'),
+  provider: z.literal('codex'),
+  success: z.boolean(),
+  code: z.string().optional(),
+  message: z.string().optional(),
+})
+export type FreshAgentRecoveryStoppedMessage = z.infer<typeof FreshAgentRecoveryStoppedSchema>
 
 export const FreshAgentForkSchema = z.object({
   type: z.literal('freshAgent.fork'),
@@ -1146,6 +1175,7 @@ export const ReadyCapabilitiesSchema = z
     // that opted in via capabilities.terminalLifetimeClaimV1. Present iff the
     // client may send `terminal.interest.claimedTerminalIds`.
     terminalLifetimeClaimV1: z.literal(true).optional(),
+    managedRuntimeV1: z.literal(true).optional(),
   })
   .optional()
 
@@ -1491,7 +1521,7 @@ export type TerminalStatusMessage = {
    * client renders attempt/maxAttempts from these FIELDS — `reason` prose is
    * purely presentational and must never be parsed (council 7w4h/xkhx). */
   maxAttempts?: number
-  /** Auto-resume 'recovering' frames only: the crashed generation's exit code. */
+  /** Auto-resume recovery and settled crash frames: the crashed generation's exit code. */
   exitCode?: number
   /** Flap-circuit-breaker settle frames ('exited') only: successful
    * auto-resumes inside the rolling window — the typed source for the
@@ -1817,7 +1847,7 @@ export type FreshAgentServerMessage =
   | { type: 'freshAgent.send.accepted'; requestId: string; sessionId: string; sessionType: string; provider: string; submittedTurnId?: string; cwd?: string }
   | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown }
   | { type: 'freshAgent.session.materialized'; previousSessionId: string; sessionId: string; sessionType: string; provider: string; sessionRef?: { provider: string; sessionId: string }; sessionName?: SessionNameRecord; nameRef?: SessionNameRef }
-  | { type: 'freshAgent.forked'; requestId?: string; parentSessionId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }
+  | { type: 'freshAgent.forked'; requestId?: string; parentSessionId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; parentRetiredByRuntime?: boolean; sessionRef?: { provider: string; sessionId: string } }
   | { type: 'freshAgent.killed'; sessionId: string; sessionType: string; provider: string; success: boolean }
 
 /**
@@ -1980,3 +2010,5 @@ export type ServerMessage =
   | ExtensionServerReadyMessage
   | ExtensionServerErrorMessage
   | ExtensionServerStoppedMessage
+  | ManagedRuntimeInventoryChangedMessage
+  | ManagedRuntimeViewChangedMessage

@@ -5014,6 +5014,35 @@ impl FreshClaudeState {
         (approvals, questions)
     }
 
+    /// Read the provider-owned transcript and apply this live runtime's pending
+    /// request, settings, status, and rollback overlays. Session hosts use this
+    /// read-only path for capture; it never consults web-owned pane state.
+    pub async fn get_snapshot(
+        &self,
+        session_type: SessionType,
+        thread_id: &str,
+    ) -> Result<Value, String> {
+        let rollback = self.load_rollback_record(thread_id).await;
+        let mut snapshot = crate::claude_snapshot::get_claude_snapshot(
+            session_type_str(session_type),
+            thread_id,
+            rollback.as_ref(),
+        )
+        .await
+        .map_err(|error| match error {
+            crate::claude_snapshot::ClaudeSnapshotError::NotFound => {
+                "claude session not found".to_string()
+            }
+            crate::claude_snapshot::ClaudeSnapshotError::Io(_) => {
+                "claude snapshot unavailable".to_string()
+            }
+        })?;
+        let (approvals, questions) = self.snapshot_pending_overlay(thread_id).await;
+        crate::claude_snapshot::apply_pending_overlay(&mut snapshot, approvals, questions);
+        self.apply_snapshot_metadata(thread_id, &mut snapshot).await;
+        Ok(snapshot)
+    }
+
     pub(crate) async fn apply_snapshot_metadata(&self, any_id: &str, snapshot: &mut Value) {
         let Some(key) = self.resolve_session_key(any_id).await else {
             return;
@@ -6524,8 +6553,8 @@ impl FreshClaudeState {
             self.broadcast(&lost_session_frame(&msg.session_id, msg.session_type));
             return;
         };
-        // The rebind targets a LIVE session — the same coordinator gate
-        // applies before pointing a pane at it.
+        // A lifecycle transition blocks either a live rebind or a cold
+        // resume. The coordinator is the authority for both paths.
         let rebind_key = self.resolve_ownership_key(&durable);
         let rebind_snap = self.ownership_snapshot(PROVIDER, &rebind_key);
         if coordinator_in_flight(&rebind_snap.state) {
@@ -6541,39 +6570,70 @@ impl FreshClaudeState {
             );
             return;
         }
-        // b8ke ext r12 F2: the rebind's REAL claim — the guard arms under
-        // the coordinator lock and is held ACROSS the rebind, so the
-        // coordinator covers the attach through completion: a handoff or
-        // stop beginning inside the window answers the typed Blocked
-        // outcome and can never commit around the rebind (pre-r12 the
-        // point-in-time snapshot closed no window).
-        // b8ke ext r38 F1: `try_rebind_to_live` is an OBSERVER bind (the
-        // broadcast alias flip + the status ack; it never spawns or
-        // restarts — the fall-through RESUME claims independently through
-        // `begin_lane_claim_at` with the attach's observed fence, the
-        // Task-3 round-2 discipline). So the rebind ADOPTS SPECIFICALLY
-        // when the request carries a pair (a superseded-session bind —
-        // ownership advanced or a foreign owner — refuses typed, the
-        // laundering class closed), and keeps the pre-r38 owner-agnostic
-        // window when the pair is ABSENT (the observer boundary: a pane
-        // bind misdirected by a mid-window handoff self-heals through
-        // the dead-session/reconcile flow; no writer hazard).
-        let expected_fresh_owner = freshell_ownership::OwnerIdentity {
-            kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
-            terminal_id: None,
-            live_session_key: None,
-            pid: None,
-            ownership_id: None,
+        // A fresh server has no live alias or coordinator record to guard.
+        // Only the observer rebind needs an attach guard; a cold resume claims
+        // the vacant key through begin_lane_claim_at below. Check both maps:
+        // a stale cli_index row whose session was evicted is cold too.
+        let mapped = { self.cli_index.lock().await.get(&durable).cloned() };
+        let live_rebind_candidate = match mapped {
+            Some(map_key) => self.sessions.lock().await.contains_key(&map_key),
+            None => false,
         };
-        let rebind_guard = match attach_fence {
-            Some(adopt_fence) => {
-                match crate::ownership_lane::arm_adopt_guard(
+        if live_rebind_candidate {
+            // b8ke ext r12 F2: the rebind's REAL claim — the guard arms under
+            // the coordinator lock and is held ACROSS the rebind, so the
+            // coordinator covers the attach through completion: a handoff or
+            // stop beginning inside the window answers the typed Blocked
+            // outcome and can never commit around the rebind (pre-r12 the
+            // point-in-time snapshot closed no window).
+            // b8ke ext r38 F1: `try_rebind_to_live` is an OBSERVER bind (the
+            // broadcast alias flip + the status ack; it never spawns or
+            // restarts — the fall-through RESUME claims independently through
+            // `begin_lane_claim_at` with the attach's observed fence, the
+            // Task-3 round-2 discipline). So the rebind ADOPTS SPECIFICALLY
+            // when the request carries a pair (a superseded-session bind —
+            // ownership advanced or a foreign owner — refuses typed, the
+            // laundering class closed), and keeps the pre-r38 owner-agnostic
+            // window when the pair is ABSENT (the observer boundary: a pane
+            // bind misdirected by a mid-window handoff self-heals through
+            // the dead-session/reconcile flow; no writer hazard).
+            let expected_fresh_owner = freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: None,
+                pid: None,
+                ownership_id: None,
+            };
+            let rebind_guard = match attach_fence {
+                Some(adopt_fence) => {
+                    match crate::ownership_lane::arm_adopt_guard(
+                        &self.ownership,
+                        PROVIDER,
+                        &rebind_key,
+                        &format!("attach-rebind-{}", uuid::Uuid::new_v4()),
+                        &expected_fresh_owner,
+                        adopt_fence,
+                        "freshclaude/attach-rebind",
+                    ) {
+                        crate::ownership_lane::LaneAttachGuard::Armed(guard) => Some(guard),
+                        crate::ownership_lane::LaneAttachGuard::Unwired => None,
+                        crate::ownership_lane::LaneAttachGuard::Refused => {
+                            self.emit_fresh_agent_error(
+                                &msg.session_id,
+                                session_type_str(msg.session_type),
+                                "SESSION_RESERVED",
+                                "A lifecycle operation owns this session; retry after it settles",
+                            );
+                            return;
+                        }
+                    }
+                }
+                None => match crate::ownership_lane::arm_attach_guard(
                     &self.ownership,
                     PROVIDER,
                     &rebind_key,
                     &format!("attach-rebind-{}", uuid::Uuid::new_v4()),
-                    &expected_fresh_owner,
-                    adopt_fence,
+                    None,
                     "freshclaude/attach-rebind",
                 ) {
                     crate::ownership_lane::LaneAttachGuard::Armed(guard) => Some(guard),
@@ -6587,39 +6647,18 @@ impl FreshClaudeState {
                         );
                         return;
                     }
-                }
+                },
+            };
+            let rebound = self
+                .try_rebind_to_live(&durable, session_type_str(msg.session_type))
+                .await;
+            drop(rebind_guard);
+            if rebound {
+                // Task 10b: a live alias answers with a rebind ACK. If its
+                // session dies inside the guarded window, the failed rebind
+                // falls through to the cold claim below.
+                return;
             }
-            None => match crate::ownership_lane::arm_attach_guard(
-                &self.ownership,
-                PROVIDER,
-                &rebind_key,
-                &format!("attach-rebind-{}", uuid::Uuid::new_v4()),
-                None,
-                "freshclaude/attach-rebind",
-            ) {
-                crate::ownership_lane::LaneAttachGuard::Armed(guard) => Some(guard),
-                crate::ownership_lane::LaneAttachGuard::Unwired => None,
-                crate::ownership_lane::LaneAttachGuard::Refused => {
-                    self.emit_fresh_agent_error(
-                        &msg.session_id,
-                        session_type_str(msg.session_type),
-                        "SESSION_RESERVED",
-                        "A lifecycle operation owns this session; retry after it settles",
-                    );
-                    return;
-                }
-            },
-        };
-        let rebound = self
-            .try_rebind_to_live(&durable, session_type_str(msg.session_type))
-            .await;
-        drop(rebind_guard);
-        if rebound {
-            // Task 10b: durable-in-cli_index on a LIVE session is a REBIND + ACK, not a
-            // silent no-op. A stale index row (the aliased session died; consumer
-            // eviction in flight) falls through to the resume path below instead --
-            // resuming converges the client.
-            return;
         }
         {
             let mut resuming = self.resuming.lock().expect("resuming lock");
@@ -9473,8 +9512,28 @@ async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), Str
     let node = std::env::var("FRESHELL_CLAUDE_NODE").unwrap_or_else(|_| "node".to_string());
     let ownership_id = mint_ownership_id();
 
-    let mut cmd = tokio::process::Command::new(&node);
-    cmd.arg(&entry);
+    let run_as = std::env::var("FRESHELL_PROVIDER_RUN_AS_UID")
+        .ok()
+        .zip(std::env::var("FRESHELL_PROVIDER_RUN_AS_GID").ok());
+    let mut cmd = if let Some((uid, gid)) = run_as {
+        let mut command = tokio::process::Command::new("/usr/bin/setpriv");
+        command.args([
+            "--reuid",
+            &uid,
+            "--regid",
+            &gid,
+            "--clear-groups",
+            "--no-new-privs",
+            "--",
+            &node,
+        ]);
+        command.arg(&entry);
+        command
+    } else {
+        let mut command = tokio::process::Command::new(&node);
+        command.arg(&entry);
+        command
+    };
     // Inherit the parent env (HOME=<isolated>, CLAUDE_HOME=<isolated>/.claude) and layer the
     // ownership tag so the /proc reaper can find our sidecar AND the claude CLI grandchild
     // (the SDK's clean-env passes FRESHELL_CLAUDE_SIDECAR_ID through — it strips only
@@ -9925,6 +9984,31 @@ pub(crate) mod tests {
         (FreshClaudeState::new(Arc::new(tx)), rx)
     }
 
+    #[cfg(target_os = "linux")]
+    async fn spawn_term_immune_tagged_child(
+        ownership_id: &str,
+    ) -> (tokio::process::Child, tempfile::TempDir) {
+        let readiness = tempfile::tempdir().expect("readiness directory");
+        let ready_path = readiness.path().join("term-trap-ready");
+        let child = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg("trap '' TERM; printf ready > \"$FRESHELL_TEST_CHILD_READY\"; while :; do sleep 1; done")
+            .env(CLAUDE_SIDECAR_OWNERSHIP_ENV, ownership_id)
+            .env("FRESHELL_TEST_CHILD_READY", &ready_path)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the lingering tagged grandchild");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready_path.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "child never installed its TERM trap"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        (child, readiness)
+    }
+
     fn attach_msg(session_id: &str) -> FreshAgentAttach {
         FreshAgentAttach {
             observed_epoch: None,
@@ -9995,13 +10079,8 @@ pub(crate) mod tests {
         // The lingering ownership-tagged "CLI grandchild": SIGTERM-immune
         // (only the confirmed-death escalation's SIGKILL can end it).
         // `kill_on_drop` backstops the assertion's own failure path.
-        let mut grandchild = tokio::process::Command::new("bash")
-            .arg("-c")
-            .arg("trap '' TERM; while :; do sleep 1; done")
-            .env(CLAUDE_SIDECAR_OWNERSHIP_ENV, format!("test-{sid}"))
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn the lingering tagged grandchild");
+        let (mut grandchild, _readiness) =
+            spawn_term_immune_tagged_child(&format!("test-{sid}")).await;
         let grandchild_pid = grandchild.id().expect("grandchild pid");
 
         let result = st.kill_for_handoff(&sid, "test-f2").await;
@@ -10041,13 +10120,8 @@ pub(crate) mod tests {
         // The lingering ownership-tagged "CLI grandchild": SIGTERM-immune
         // (the one-round window never reaches the SIGKILL escalation).
         // `kill_on_drop` backstops the assertion's own failure path.
-        let mut grandchild = tokio::process::Command::new("bash")
-            .arg("-c")
-            .arg("trap '' TERM; while :; do sleep 1; done")
-            .env(CLAUDE_SIDECAR_OWNERSHIP_ENV, format!("test-{sid}"))
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn the lingering tagged grandchild");
+        let (mut grandchild, _readiness) =
+            spawn_term_immune_tagged_child(&format!("test-{sid}")).await;
         let grandchild_pid = grandchild.id().expect("grandchild pid");
 
         let result = st.kill_for_handoff(&sid, "test-fr3").await;
@@ -12395,6 +12469,38 @@ rl.on('line', (line) => {
         );
     }
 
+    // Creation may publish the CLI index and durable binding while its
+    // ownership attach guard still holds the key. Match the production
+    // handoff caller's bounded retry of that transient Blocked outcome.
+    async fn begin_test_terminal_handoff(
+        registry: &freshell_ownership::RuntimeOwnershipRegistry,
+        operation_id: &str,
+    ) -> u64 {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            match registry.begin_handoff(
+                "claude",
+                FRESH_CREATE_DURABLE_ID,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                operation_id,
+                None,
+                "test",
+                0,
+            ) {
+                freshell_ownership::BeginOutcome::Granted { generation } => return generation,
+                freshell_ownership::BeginOutcome::Blocked { retry_after_ms, .. } => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the Handoff begin never cleared its transient Blocked window"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(retry_after_ms.min(50)))
+                        .await;
+                }
+                other => panic!("expected the Handoff begin to be granted, got {other:?}"),
+            }
+        }
+    }
+
     /// b8ke delta round-3 F1: a coordinator-REFUSED kill mutates NOTHING
     /// durable — the pane-ledger row stays BOUND, the session stays live,
     /// and the refusal broadcast is TYPED (code + message, never
@@ -12428,39 +12534,9 @@ rl.on('line', (line) => {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        // THE REFUSAL WINDOW: a handoff owns the key's transition. The
-        // begin honors the registry's own transient contract: the
-        // create's adoption can still hold its attach guard
-        // (`in_flight_attaches > 0` on a Vacant record — the b8ke ext
-        // r32 F1 exit-during-guard window) after the identity binding is
-        // recorded, so a single-shot begin can answer
-        // `Blocked { retry_after_ms }` under heavy parallel load. The
-        // production handoff caller RETRIES Blocked; the test applies the
-        // same bounded retry instead of assuming an always-instant
-        // grant (the kata-hsrh flake discipline).
-        let begin_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        let _handoff_generation = loop {
-            match registry.begin_handoff(
-                "claude",
-                FRESH_CREATE_DURABLE_ID,
-                freshell_ownership::RuntimeOwnerKind::Terminal,
-                "handoff-blocking-d3-f1",
-                None,
-                "test",
-                0,
-            ) {
-                freshell_ownership::BeginOutcome::Granted { generation } => break generation,
-                freshell_ownership::BeginOutcome::Blocked { retry_after_ms, .. } => {
-                    assert!(
-                        tokio::time::Instant::now() < begin_deadline,
-                        "the Handoff begin never cleared its transient Blocked window"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(retry_after_ms.min(50)))
-                        .await;
-                }
-                other => panic!("expected the Handoff begin to be granted, got {other:?}"),
-            }
-        };
+        // THE REFUSAL WINDOW: the handoff owns the key's transition.
+        let _handoff_generation =
+            begin_test_terminal_handoff(&registry, "handoff-blocking-d3-f1").await;
 
         st.handle_kill(kill_msg(&placeholder)).await;
 
@@ -12545,17 +12621,7 @@ rl.on('line', (line) => {
         // stamp is consumed and a TERMINAL owner is committed under the
         // durable id.
         crate::ownership_lane::take_retained_stamp(&st.ownership_stamps, FRESH_CREATE_DURABLE_ID);
-        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
-            "claude",
-            FRESH_CREATE_DURABLE_ID,
-            freshell_ownership::RuntimeOwnerKind::Terminal,
-            "handoff-completed-e3r1",
-            None,
-            "test",
-            0,
-        ) else {
-            panic!("expected the Handoff begin to be granted")
-        };
+        let generation = begin_test_terminal_handoff(&registry, "handoff-completed-e3r1").await;
         let terminal_owner = freshell_ownership::OwnerIdentity {
             kind: freshell_ownership::RuntimeOwnerKind::Terminal,
             terminal_id: Some("t-replacement".into()),
@@ -12941,17 +13007,7 @@ rl.on('line', (line) => {
         // THE MID-HANDOFF WINDOW: kill_for_handoff consumed the stamp
         // while the coordinator record stays Handoff.
         crate::ownership_lane::take_retained_stamp(&st.ownership_stamps, FRESH_CREATE_DURABLE_ID);
-        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
-            "claude",
-            FRESH_CREATE_DURABLE_ID,
-            freshell_ownership::RuntimeOwnerKind::Terminal,
-            "handoff-in-flight-e3r2",
-            None,
-            "test",
-            0,
-        ) else {
-            panic!("expected the Handoff begin to be granted")
-        };
+        let generation = begin_test_terminal_handoff(&registry, "handoff-in-flight-e3r2").await;
 
         // THE CONCURRENT KILL: typed refusal, NOTHING durable.
         st.handle_kill(kill_msg(&placeholder)).await;
@@ -13293,17 +13349,7 @@ rl.on('line', (line) => {
 
         // The Handoff window: the map entry still exists (the runtime has
         // not stopped yet) — the pre-d3 fast paths adopted/no-op'd here.
-        let freshell_ownership::BeginOutcome::Granted { generation: _ } = registry.begin_handoff(
-            "claude",
-            FRESH_CREATE_DURABLE_ID,
-            freshell_ownership::RuntimeOwnerKind::Terminal,
-            "handoff-blocking-d3-f2",
-            None,
-            "test",
-            0,
-        ) else {
-            panic!("expected the Handoff begin to be granted")
-        };
+        begin_test_terminal_handoff(&registry, "handoff-blocking-d3-f2").await;
 
         // A delayed CREATE (resume through the live session): the claim
         // sees the Handoff state and answers the typed refusal — never
@@ -16038,13 +16084,7 @@ rl.on('line', (line) => {
                 .expect("the sidecar's ownership id")
                 .to_string()
         };
-        let mut grandchild = tokio::process::Command::new("bash")
-            .arg("-c")
-            .arg("trap '' TERM; while :; do sleep 1; done")
-            .env("FRESHELL_CLAUDE_SIDECAR_ID", &ownership_id)
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn the lingering tagged grandchild");
+        let (mut grandchild, _readiness) = spawn_term_immune_tagged_child(&ownership_id).await;
         let grandchild_pid = grandchild.id().expect("grandchild pid");
 
         while rx.try_recv().is_ok() {}
@@ -18342,6 +18382,7 @@ rl.on('line', (line) => {
 
     fn compact_msg(session_id: &str, instructions: Option<&str>) -> FreshAgentCompact {
         FreshAgentCompact {
+            request_id: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: session_id.to_string(),
             session_type: SessionType::Freshclaude,
@@ -19436,6 +19477,58 @@ rl.on('line', (line) => {
         assert_eq!(create_req["model"], "opus-x");
         assert_eq!(create_req["permissionMode"], "plan");
         assert_eq!(create_req["effort"], "high");
+        drop(env);
+    }
+
+    /// A restarted server has the transcript and settings record, but its
+    /// ownership coordinator has no live entry yet. Attach must claim that
+    /// vacant key and resume the sidecar before it can publish a live owner.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cold_attach_with_fresh_coordinator_resumes_transcript_and_settings() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        const DURABLE: &str = "abababab-aaaa-4aaa-8aaa-abababababab";
+        write_fake_transcript(home.path(), DURABLE);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+
+        let (mut state, mut rx) = state_with_bus();
+        let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::with_epoch(2));
+        state.set_ownership(Arc::clone(&ownership));
+        let settings = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        settings.seed(
+            "claude",
+            DURABLE,
+            crate::identity_sink::FreshAgentSettings {
+                model: Some("opus-x".into()),
+                permission_mode: Some("plan".into()),
+                ..Default::default()
+            },
+        );
+        state.set_identity_sink(settings);
+
+        state
+            .handle_attach(attach_msg_with_resume("client-after-restart", DURABLE))
+            .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        assert_eq!(
+            env.spawn_count(),
+            1,
+            "cold attach must spawn one resumed sidecar"
+        );
+        let log = std::fs::read_to_string(env.spawn_log_path()).unwrap();
+        let create_req: serde_json::Value =
+            serde_json::from_str(log.lines().next().unwrap()).unwrap();
+        assert_eq!(create_req["resumeSessionId"], DURABLE);
+        assert_eq!(create_req["model"], "opus-x");
+        assert_eq!(create_req["permissionMode"], "plan");
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
+        assert_eq!(frame["sessionId"], "client-after-restart");
+        assert!(matches!(
+            ownership.observe("claude", DURABLE).state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ));
         drop(env);
     }
 

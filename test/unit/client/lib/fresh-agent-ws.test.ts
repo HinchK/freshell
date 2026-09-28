@@ -591,6 +591,26 @@ describe('fresh-agent-ws', () => {
     expect(store.getState().freshAgent.sessions[key]).toBeUndefined()
   })
 
+  it('forgets a stopped Codex writer only after a successful recovery stop', () => {
+    const store = createFreshAgentStore()
+    const sessionId = 'codex-thread-recovery'
+    const key = `freshcodex:codex:${sessionId}`
+    const snapshot = {
+      type: 'freshAgent.event', sessionId, sessionType: 'freshcodex', provider: 'codex',
+      event: { type: 'freshAgent.session.snapshot', sessionId, status: 'stuck', latestTurnId: null },
+    }
+    expect(handleFreshAgentMessage(store.dispatch, snapshot)).toBe(true)
+    expect(store.getState().freshAgent.sessions[key]).toBeDefined()
+
+    const stop = { type: 'freshAgent.recovery.stopped', requestId: 'stop-1', sessionId,
+      sessionType: 'freshcodex', provider: 'codex', success: false, code: 'TEARDOWN_NOT_CONFIRMED' }
+    expect(handleFreshAgentMessage(store.dispatch, stop)).toBe(true)
+    expect(store.getState().freshAgent.sessions[key]).toBeDefined()
+
+    expect(handleFreshAgentMessage(store.dispatch, { ...stop, success: true })).toBe(true)
+    expect(store.getState().freshAgent.sessions[key]).toBeUndefined()
+  })
+
   it('folds freshAgent.question.cancelled into removeQuestion and sits in the snapshot-invalidating set', async () => {
     const store = createFreshAgentStore()
     const sessionId = 'claude-thread-question-cancel'

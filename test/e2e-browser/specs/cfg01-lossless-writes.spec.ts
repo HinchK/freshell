@@ -469,9 +469,13 @@ test.describe('CFG-01 lossless config.json writes (rust)', () => {
             server.baseUrl,
             'PATCH',
             `/api/sessions/${encodeURIComponent('claude:cfg01-sess-1')}`,
-            { titleOverride: 'CFG-01 Session Title', archived: true },
+            { summaryOverride: 'CFG-01 Session Summary', archived: true },
           )
           expect(res.status).toBe(200)
+          expect((await readConfig(homeDir)).sessionOverrides?.['claude:cfg01-sess-1']).toMatchObject({
+            summaryOverride: 'CFG-01 Session Summary',
+            archived: true,
+          })
         },
         allowed: [['sessionOverrides', 'claude:cfg01-sess-1']],
       },

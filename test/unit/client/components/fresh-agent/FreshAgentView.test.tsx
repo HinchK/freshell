@@ -4394,6 +4394,7 @@ describe('FreshAgentView', () => {
 
     expect(wsMock.send).toHaveBeenCalledWith({
       type: 'freshAgent.compact',
+      requestId: expect.any(String),
       sessionId: 'freshopencode-req-compact',
       sessionType: 'freshopencode',
       provider: 'opencode',
@@ -5993,6 +5994,60 @@ describe('FreshAgentView', () => {
     })
   })
 
+  it('does not stop the containing soul when the managed runtime already retired the fork parent', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => { onMessage = handler; return () => {} })
+    store.dispatch(initLayout({
+      tabId: 'tab-1', paneId: 'pane-1', content: {
+        kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex',
+        createRequestId: 'managed-fork-request', sessionId: 'thread-parent', status: 'idle',
+      },
+    }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(onMessage).toBeTypeOf('function'))
+    wsMock.send.mockClear()
+    act(() => onMessage?.({
+      type: 'freshAgent.forked', requestId: 'managed-fork-request',
+      parentSessionId: 'thread-parent', sessionId: 'thread-child',
+      sessionType: 'freshcodex', provider: 'codex', runtimeProvider: 'codex',
+      parentRetiredByRuntime: true,
+    }))
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts['tab-1']
+      if (layout?.type !== 'leaf' || layout.content.kind !== 'fresh-agent') throw new Error('expected fresh-agent pane')
+      expect(layout.content.sessionId).toBe('thread-child')
+    })
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
+  })
+
+  it('follows a managed same-soul fork even when another view issued the request', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => { onMessage = handler; return () => {} })
+    store.dispatch(initLayout({
+      tabId: 'tab-1', paneId: 'pane-1', content: {
+        kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex',
+        createRequestId: 'this-view-request', sessionId: 'thread-parent', status: 'idle',
+      },
+    }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(onMessage).toBeTypeOf('function'))
+    wsMock.send.mockClear()
+    act(() => onMessage?.({
+      type: 'freshAgent.forked', requestId: 'other-view-request',
+      parentSessionId: 'thread-parent', sessionId: 'thread-child',
+      sessionType: 'freshcodex', provider: 'codex', runtimeProvider: 'codex',
+      parentRetiredByRuntime: true,
+    }))
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts['tab-1']
+      if (layout?.type !== 'leaf' || layout.content.kind !== 'fresh-agent') throw new Error('expected fresh-agent pane')
+      expect(layout.content.sessionId).toBe('thread-child')
+    })
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
+  })
+
   it('ignores Freshcodex fork responses for a different pane request', async () => {
     const store = createStore()
     let onMessage: ((message: Record<string, unknown>) => void) | undefined
@@ -6103,6 +6158,56 @@ describe('FreshAgentView', () => {
       expect(layout.content.status).toBe('creating')
       expect(layout.content.resumeSessionId).toBe('codex-thread-lost')
     })
+  })
+
+  it('resumes an exited Codex pane without closing its durable conversation', async () => {
+    const store = createStore()
+    store.dispatch(sessionInit({
+      sessionId: 'codex-thread-exited',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      model: 'gpt-6-astra',
+    }))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-codex-exited',
+        sessionId: 'codex-thread-exited',
+        sessionRef: { provider: 'codex', sessionId: 'codex-thread-exited' },
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+    act(() => {
+      store.dispatch(sessionExited({
+        sessionId: 'codex-thread-exited',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+      }))
+    })
+
+    expect(await screen.findByRole('button', { name: 'Start new session' })).toBeVisible()
+    wsMock.send.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: 'Resume session' }))
+
+    await waitFor(() => {
+      const pane = getFreshAgentPaneContent(store)
+      expect(pane.status).toBe('creating')
+      expect(pane.sessionId).toBeUndefined()
+      expect(pane.sessionRef).toEqual({ provider: 'codex', sessionId: 'codex-thread-exited' })
+      expect(pane.resumeSessionId).toBe('codex-thread-exited')
+    })
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.recovery.stop' }))
   })
 
   it('keeps an established freshclaude pane interactive after remount when snapshot loading is unavailable', async () => {
@@ -7179,7 +7284,13 @@ describe('freshcodex wedged-sidecar notice', () => {
     expect(screen.getByRole('button', { name: /start new conversation/i })).toBeInTheDocument()
   })
 
-  it('Restart sidecar kills the wedged session then re-mints a creating pane on the canonical resume id', async () => {
+  it('Restart sidecar confirms the process stop before resuming the same durable thread', async () => {
+    const handlers: Array<(message: Record<string, unknown>) => void> = []
+    wsMock.onMessage.mockReset()
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      handlers.push(handler)
+      return () => {}
+    })
     const { store } = renderFocusPane({ sessionId: 'thread-stuck-1', status: 'running' })
     // Install the spy BEFORE the stuck fold re-renders: the click closure
     // captures `dispatch` at render time (react-redux useDispatch), so a spy
@@ -7188,16 +7299,27 @@ describe('freshcodex wedged-sidecar notice', () => {
     dispatchStuck(store)
     await screen.findByRole('alert')
     fireEvent.click(screen.getByRole('button', { name: /restart sidecar and resume session/i }))
-    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'freshAgent.kill',
+    const sent = wsMock.send.mock.calls.find(([message]) => message.type === 'freshAgent.recovery.stop')?.[0]
+    expect(sent).toMatchObject({
       sessionId: 'thread-stuck-1',
       sessionType: 'freshcodex',
       provider: 'codex',
-    }))
-    const remints = dispatchSpy.mock.calls
+    })
+    const creatingActions = () => dispatchSpy.mock.calls
       .map(([action]) => action)
       .filter((action: any) => action?.type === 'panes/updatePaneContent'
         && action.payload?.content?.status === 'creating')
+    expect(creatingActions()).toHaveLength(0)
+    for (const handler of handlers) handler({
+      type: 'freshAgent.recovery.stopped',
+      requestId: sent.requestId,
+      sessionId: 'thread-stuck-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      success: true,
+    })
+    await waitFor(() => expect(creatingActions()).toHaveLength(1))
+    const remints = creatingActions()
     expect(remints).toHaveLength(1)
     expect(remints[0].payload.content.resumeSessionId).toBe('thread-stuck-1')
     expect(remints[0].payload.content.sessionId).toBeUndefined()
@@ -10149,6 +10271,12 @@ describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement
   })
 
   it('restartStuckSidecar kills the sessionRef session before re-driving creation', async () => {
+    const handlers: Array<(msg: Record<string, unknown>) => void> = []
+    wsMock.onMessage.mockReset()
+    wsMock.onMessage.mockImplementation((listener: (msg: Record<string, unknown>) => void) => {
+      handlers.push(listener)
+      return () => {}
+    })
     const store = createStore()
     const dispatchSpy = vi.spyOn(store, 'dispatch')
 
@@ -10173,20 +10301,85 @@ describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement
     wsMock.send.mockClear()
     fireEvent.click(screen.getByRole('button', { name: /restart sidecar and resume session/i }))
 
-    // THE F2 CONTRACT: the restart's kill targets the durable sessionRef
-    // session — pre-ext a sessionRef-only pane sent NO kill and the
-    // recovery re-drove creation over the live wedged runtime.
-    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'freshAgent.kill',
+    // The recovery stop targets the durable sessionRef and waits for a
+    // correlated confirmation before any new runtime starts.
+    const sent = wsMock.send.mock.calls.find(([message]) => message.type === 'freshAgent.recovery.stop')?.[0]
+    expect(sent).toMatchObject({
       sessionId: 'thread-ref-stuck',
       sessionType: 'freshcodex',
       provider: 'codex',
-    }))
+    })
+    const remintsBeforeAck = dispatchSpy.mock.calls
+      .map(([action]) => action)
+      .filter((action: any) => action?.type === 'panes/updatePaneContent'
+        && action.payload?.content?.status === 'creating')
+    expect(remintsBeforeAck).toHaveLength(0)
+    for (const handler of handlers) {
+      handler({
+        type: 'freshAgent.recovery.stopped',
+        requestId: sent.requestId,
+        sessionId: 'thread-ref-stuck',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        success: true,
+      })
+    }
+    await waitFor(() => {
+      const remints = dispatchSpy.mock.calls
+        .map(([action]) => action)
+        .filter((action: any) => action?.type === 'panes/updatePaneContent'
+          && action.payload?.content?.status === 'creating')
+      expect(remints).toHaveLength(1)
+    })
+  })
+
+  it('does not resume a wedged Codex session after a refused recovery stop', async () => {
+    const handlers: Array<(msg: Record<string, unknown>) => void> = []
+    wsMock.onMessage.mockReset()
+    wsMock.onMessage.mockImplementation((listener: (msg: Record<string, unknown>) => void) => {
+      handlers.push(listener)
+      return () => {}
+    })
+    const store = createStore()
+    const dispatchSpy = vi.spyOn(store, 'dispatch')
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            createRequestId: 'req-ref-stuck-failed',
+            sessionRef: { provider: 'codex', sessionId: 'thread-ref-stuck-failed' },
+            status: 'stuck',
+          }}
+        />
+      </Provider>,
+    )
+    await screen.findByRole('alert')
+    wsMock.send.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: /restart sidecar and resume session/i }))
+    const sent = wsMock.send.mock.calls.find(([message]) => message.type === 'freshAgent.recovery.stop')?.[0]
+    expect(sent?.requestId).toEqual(expect.any(String))
+    for (const handler of handlers) {
+      handler({
+        type: 'freshAgent.recovery.stopped',
+        requestId: sent.requestId,
+        sessionId: 'thread-ref-stuck-failed',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        success: false,
+        code: 'TEARDOWN_NOT_CONFIRMED',
+      })
+    }
+    await waitFor(() => expect(store.getState().freshAgent.sessions['freshcodex:codex:thread-ref-stuck-failed']?.lastErrorCode).toBe('TEARDOWN_NOT_CONFIRMED'))
     const remints = dispatchSpy.mock.calls
       .map(([action]) => action)
       .filter((action: any) => action?.type === 'panes/updatePaneContent'
         && action.payload?.content?.status === 'creating')
-    expect(remints).toHaveLength(1)
+    expect(remints).toHaveLength(0)
   })
 })
 
@@ -10314,15 +10507,16 @@ describe('b8ke ext r21 F2: the compact/undo/fork senders carry the observed fenc
     // The queued frame carries the observed pair — the server's stale-pair
     // rejection can refuse a reconnect-replayed stale compact, never an
     // unfenced recreation.
-    expect(wsMock.send).toHaveBeenCalledWith({
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'freshAgent.compact',
+      requestId: expect.any(String),
       sessionId: 'ses-r21-compact',
       sessionType: 'freshopencode',
       provider: 'opencode',
       cwd: '/repo/r21',
       observedEpoch: 12,
       observedGeneration: 34,
-    })
+    }))
   })
 
   it('/compact with NO owner record sends no pair (the legacy-unfenced shape)', async () => {

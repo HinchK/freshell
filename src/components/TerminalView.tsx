@@ -55,6 +55,7 @@ import {
   recordAutoResumeSettled,
   recordTerminalExit,
   selectActiveNotice,
+  selectAutoResumeSettle,
   selectExitRecord,
   selectLastTerminalIdFrom,
   selectResumeCycles,
@@ -355,6 +356,8 @@ type TerminalInputBlockedReason =
   | 'codex_recovery_pending'
   | 'codex_clean_exit_decision_pending'
   | 'codex_lifecycle_loss_pending'
+  | 'managed_recovery_pending'
+  | 'managed_recovery_blocked'
   | 'unknown_terminal'
 
 function terminalInputBlockedNotice(reason: TerminalInputBlockedReason): string {
@@ -367,6 +370,10 @@ function terminalInputBlockedNotice(reason: TerminalInputBlockedReason): string 
       return 'Input not sent: Codex is checking whether the session is still active. Try again in a moment.'
     case 'codex_lifecycle_loss_pending':
       return 'Input not sent: Codex is resolving a worker disconnect. Try again in a moment.'
+    case 'managed_recovery_pending':
+      return 'Input not sent: this managed session is recovering. Try again when the provider prompt returns.'
+    case 'managed_recovery_blocked':
+      return 'Input not sent: managed recovery is blocked. Repair the provider dependency, then retry this pane.'
     case 'codex_identity_capture_timeout':
       return 'Input not sent: Codex did not provide restore state before startup timed out. Start a new Codex pane or resume inside Codex.'
     case 'codex_identity_unavailable':
@@ -716,6 +723,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // apparatus (selector filter + expiry re-render timer) is deleted. A
   // missed frame is corrected by the reconnect backstop (D-3) below.
   const activeNotice = useAppSelector((s) => selectActiveNotice(s, paneId))
+  const autoResumeSettle = useAppSelector((s) => selectAutoResumeSettle(s, paneId))
   // Flap-circuit-breaker settle count (znhn item 2) — typed field, feeds the
   // "crashed N times — auto-resume paused" alert copy.
   const resumeCycles = useAppSelector((s) => selectResumeCycles(s, paneId)) ?? null
@@ -5340,6 +5348,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             ? msg.streamId
             : null
           const previousStreamId = getTerminalCheckpointStreamId()
+          if (msg.reason === 'new_pty_session' && nextStreamId === previousStreamId) return
           const activeAttach = currentAttachRef.current
           if (activeAttach?.terminalId === tid && activeAttach.requestId === msg.attachRequestId) {
             currentAttachRef.current = {
@@ -5354,6 +5363,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             }
           } else if (previousStreamId) {
             updateContent({ streamId: undefined })
+          }
+          if (msg.reason === 'new_pty_session' && nextStreamId && previousStreamId !== nextStreamId) {
+            // Physical recovery starts a new host sequence domain. Reuse the
+            // full-hydration handshake: it retires queued parser writes by
+            // attach generation and prevents late old-epoch frames from
+            // poisoning the replacement's cursor. This never creates a PTY.
+            clearTerminalCursor(tid)
+            if (contentRef.current) contentRef.current = { ...contentRef.current, streamId: nextStreamId }
+            attachTerminal(tid, 'viewport_hydrate', {
+              sinceSeq: 0, clearViewportFirst: true, skipPreAttachFit: true,
+            })
           }
         }
 
@@ -5823,7 +5843,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             dispatch(
               recordAutoResumeSettled({
                 paneId: paneIdRef.current,
+                terminalId: msg.terminalId,
+                exitCode: msg.exitCode,
                 resumeCycles: msg.resumeCycles,
+                at: Date.now(),
               })
             )
           }
@@ -6446,6 +6469,23 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               reconcilePendingSinceRef.current !== undefined
               && Date.now() - reconcilePendingSinceRef.current < RECONCILE_VERDICT_WAIT_MS
             ) {
+              if (currentAttachInvalidTerminalError) {
+                // The server rejected this attach generation while its
+                // managed terminal registry was still recovering. The
+                // reconcile result may confirm the same persisted identity,
+                // so the pending-window close must retry the attach instead
+                // of treating this rejected generation as still in flight.
+                clearQuarantineRepair()
+                currentAttachRef.current = null
+                pacedReplayRef.current = null
+                deferredAttachStateRef.current = {
+                  mode: 'none',
+                  pendingIntent: null,
+                  pendingSinceSeq: 0,
+                  pendingReason: 'initial_hydrate',
+                }
+                setIsAttaching(false)
+              }
               return
             }
             const restoreMode = current?.mode || (paneContent.kind === 'terminal' ? paneContent.mode : 'shell')
@@ -7082,7 +7122,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   const isAgentPane = Boolean(terminalContent.mode && terminalContent.mode !== 'shell')
   const settledDead =
     (terminalContent.status === 'exited' && (exitRecord ? exitRecord.exitCode !== 0 : true)) ||
-    (terminalContent.status === 'error' && Boolean(exitRecord && exitRecord.exitCode !== 0))
+    (terminalContent.status === 'error' && Boolean(exitRecord && exitRecord.exitCode !== 0)) ||
+    // The replacement can die before this client attaches; in that case
+    // terminal.exit had no subscriber. The server's final status frame still
+    // carries the retained exit code and settles this pane loudly.
+    (typeof autoResumeSettle?.exitCode === 'number'
+      && autoResumeSettle.exitCode !== 0
+      && (!terminalContent.terminalId || terminalContent.terminalId === autoResumeSettle.terminalId))
   // the-usual focused fix 2 (Major): the killed-session recovery affordance.
   // A clean exit (code 0 — the terminal.kill wire contract) whose canonical
   // runtime-owner record folds VACANT is the cross-device-kill shape: the
