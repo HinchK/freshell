@@ -38,7 +38,7 @@ import {
   writeHolder,
 } from './coordinator-store.js'
 import { buildStatusView, renderStatusView } from './coordinator-status.js'
-import { assertNoCoordinatorRecursion, runUpstreamPhase } from './coordinator-upstream.js'
+import { assertNoCoordinatorRecursion, runUpstreamPhase, type SpawnAndWaitOptions } from './coordinator-upstream.js'
 
 const execFileAsync = promisify(execFile)
 const DEFAULT_POLL_MS = 60_000
@@ -163,7 +163,10 @@ async function runCommand(parsed: ParsedRunArgs): Promise<number> {
   }
 
   if (disposition.kind === 'delegated' || disposition.kind === 'passthrough') {
-    const exitCode = await runPhases(disposition.phases)
+    // These dispatches never hold the coordinator gate, so their phases keep
+    // lost-completion liveness detection but no hard timeout: an interactive
+    // watch lane may legitimately run for hours.
+    const exitCode = await runPhases(disposition.phases, { hardTimeout: false })
     if (repo) {
       const refreshedRepo = await refreshRepoContext(repo).catch(() => repo)
       await recordCommandResult(getCoordinatorStoreDir(refreshedRepo.commonDir), buildLatestRunRecord({
@@ -406,9 +409,9 @@ async function runCoordinatedCommand(context: CoordinatedRunContext): Promise<nu
   }
 }
 
-async function runPhases(phases: UpstreamPhase[]): Promise<number> {
+async function runPhases(phases: UpstreamPhase[], options: SpawnAndWaitOptions = {}): Promise<number> {
   for (const phase of phases) {
-    const exitCode = await runUpstreamPhase(phase, process.env)
+    const exitCode = await runUpstreamPhase(phase, process.env, options)
     if (exitCode !== 0) {
       return exitCode
     }

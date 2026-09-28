@@ -1,0 +1,938 @@
+# Coordinator Phase-Child Watchdog Implementation Plan
+
+> **For agentic workers:** Execute this plan task by task with a fresh
+> implementer and a specification-plus-quality review after every task. Track
+> progress with the checkbox steps below.
+
+## User Request
+
+### Requested result
+- The repo-wide test coordinator (`scripts/testing/test-coordinator.ts`) must detect abnormally-exited dispatched phase children and fail the run (releasing the shared coordinator gate) instead of wedging indefinitely. A stale or wedged gate holder must not block every other agent's broad test runs.
+
+### Explicit constraints
+- Fix kata freshell#t4c8 (P2, labels bug/infrastructure) via the the-usual workflow.
+- Threat model: honest mistakes by cooperating agents — the goal is fail-fast + observability, not adversarial defenses (kata scope note).
+- Kata-suggested direction (decide at implementation time): wrap each dispatched phase with a bounded timeout plus child-exit observation (spawn result close/exit code, or a watchdog failing the run when a phase produces no progress); optionally a stale-holder reclaim path (a recorded holder pid provably dead and past a grace period may be reaped by the next acquirer) — phase-level detection alone would have covered the 2026-09-22 incident.
+- Red/green/refactor TDD; broad repo tests go through the shared coordinator gate; changes land via PR to main from the run worktree.
+
+### Accepted tradeoffs and residuals
+- The incident was pre-existing coordinator design, not introduced by the pnpm migration branch.
+- The holder-level reclaim is optional per the kata; phase-level detection is the minimum incident-proof fix.
+
+**Goal:** A dispatched phase child that dies, hangs, or whose completion event is lost fails the coordinated run promptly (exit 125, JSONL evidence, gate released) instead of wedging the repo-wide test gate for hours.
+
+**Architecture:** Harden the single choke point every phase flows through — `spawnAndWait` in `scripts/testing/coordinator-upstream.ts` — with a poll-driven watchdog: every dispatched child gets a liveness/timeout watcher that settles the phase promise when the phase exceeds a bounded timeout (the guaranteed wall-clock bound for every wedge class — an alive-but-hung child, or a child the parent can no longer observe at all) or when the child is provably gone without an observed completion (the prompt path for the 2026-09-22 machine-suspend class, where the child process was fully absent; a lingering unreaped zombie would instead be caught by the timeout bound). Failure plumbing is unchanged: a watchdog settle is just a nonzero phase exit code, which the existing `runPhases` → `runCoordinatedCommand` catch/finally path already records and releases the gate with. The kata's optional holder-reclaim is deliberately out of scope (see Out of Scope).
+
+**Tech Stack:** TypeScript (NodeNext/ESM), Node `child_process.spawn`, Vitest with real short-lived child processes via the existing `FRESHELL_TEST_COORDINATOR_FAKE_UPSTREAM` fixture seam.
+
+## Global Constraints
+
+- pnpm 10.34.5 only; never `npm ci`/`npm install` in this tree. Focused, uncoordinated test path: `pnpm run test:vitest run <paths> --config config/vitest/vitest.config.ts`. Broad runs go through the coordinator (`pnpm run test`); never kill a foreign gate holder.
+- Relative TypeScript imports must end in `.js` (NodeNext/ESM).
+- Structured events go to stderr as JSONL matching the existing `scripts/testing/run-rust-tests.ts` idiom: `{ severity, event, timestamp, ...fields }` with a stable snake_case event name.
+- Preserve existing coordinator behavior exactly where this plan does not change it: numeric exit-code passthrough, `128 + signal` mapping, spawn `error` → promise rejection (exit 1 at the run level), holder release via `clearHolderIfRunIdMatches` in the `finally` of `runCoordinatedCommand`.
+- Exit-code semantics: 124 remains queue-wait timeout; 125 is the new watchdog-settled phase failure. A child that itself exits 125 is disambiguated by the `phase_watchdog_settled` JSONL event's `reason` field.
+- Threat model: honest mistakes by cooperating agents. On a phase timeout the watchdog kills only the process tree it spawned — the phase child and its descendants, discovered with the existing `process-tree.ts` helpers (`readProcessSnapshot` + `descendantPids`) — and must never signal foreign processes. If the process-table snapshot itself fails, cleanup degrades to killing the direct child only and emits a `phase_watchdog_tree_kill_degraded` JSONL event (never silently). The `child_vanished` path performs no killing (the child is already gone); descendants it may have left behind are unreachable post-mortem (a snapshot walk cannot start from a dead root pid) and remain a documented residual — the JSONL event carries the dead child's pid for forensics. The timeout kill takes a single snapshot pass; a descendant spawned in the instant between snapshot and kill is the accepted residual race.
+- Lost-completion event-loop rule: on any watchdog settle, the ChildProcess handle is `unref()`ed before the phase settles, because the lost-completion failure class leaves the native exit callback undelivered — an unreferenced-free handle would keep the event loop alive forever and a process that only assigns `process.exitCode` (the coordinator's main entry) would never actually terminate, recreating the alive-but-idle incident shape even with the gate released.
+- Comments: brief, load-bearing only, matching existing repo style.
+- Work on the run worktree branch `the-usual/coordinator-child-exit-watch`; PR to main only after explicit user approval. No pushes of behavior changes to main.
+
+## Out of Scope (with reasons — do not implement)
+
+- **Stale-holder reclaim (dead-holder reaping), kata's optional direction:** redundant with the gate's own primitive — the gate is a unix-socket/named-pipe listener (`coordinator-endpoint.ts`); when the holder process dies the OS closes its socket and the next waiter's `tryListen` succeeds immediately. Verified in the architecture report and by the 2026-09-22 recovery (the next agent acquired within seconds of the kill).
+- **Holder heartbeat / live-holder liveness publication:** the incident's holder had a live event loop (only the phase promise was unsettled), so a process-liveness heartbeat would NOT have detected it, and the phase watchdog now covers the observed wedge class. Auto-reclaiming a live holder is impossible without killing a foreign process (forbidden). The unobserved "event-loop wedge outside phase code" class keeps today's bounded backstop: waiters give up at `FRESHELL_TEST_COORDINATOR_MAX_WAIT_MS` (24h default) with exit 124.
+- **`run-standard-tests.ts:343` `execFileSync` on vitest-cloud.sh** (kata jjzw family): separate kata, separate change.
+
+---
+
+### Task 1: Phase watchdog core in `spawnAndWait` (timeout branch)
+
+**Files:**
+- Modify: `scripts/testing/coordinator-upstream.ts` (add ~55 lines: constants, helpers, watchdog wiring in `spawnAndWait`)
+- Test: `test/unit/tooling/testing/coordinator-upstream.test.ts` (add cases)
+
+**Interfaces:**
+- Consumes: existing `spawnAndWait(command, args, envVars, viaShell)` shape; existing `FRESHELL_TEST_COORDINATOR_*` env-knob idiom (values parsed from the injected `envVars`, not `process.env`, so tests inject via `fakeEnv`); `readProcessSnapshot` and `descendantPids` from `./process-tree.js`.
+- Produces:
+  - `export type PhaseWatchdogReason = 'phase_timeout' | 'child_vanished'`
+  - `export function evaluatePhaseWatchdogTick(input: { childAlive: boolean | undefined; consecutiveDeadTicks: number; elapsedMs: number; timeoutMs: number }): PhaseWatchdogReason | undefined`
+  - `export interface SpawnAndWaitOptions { livenessProbe?: (pid: number | undefined) => boolean | undefined }`
+  - `export function spawnAndWait(command: string, args: string[], envVars: NodeJS.ProcessEnv, viaShell: boolean, options?: SpawnAndWaitOptions): Promise<number>` (newly exported so Task 1's own tests can drive the vanish wiring with an injected probe)
+  - `export const PHASE_WATCHDOG_EXIT_CODE = 125`
+  - New env knobs parsed from the injected env: `FRESHELL_TEST_COORDINATOR_PHASE_TIMEOUT_MS` (default `7_200_000` = 2h), `FRESHELL_TEST_COORDINATOR_PHASE_WATCH_POLL_MS` (default `10_000`).
+  - JSONL stderr event `phase_watchdog_settled` with fields `reason`, `pid`, `elapsedMs`, `pollMs`, `timeoutMs`.
+
+- [ ] **Step 1: Write the failing behavioral tests**
+
+Add to `test/unit/tooling/testing/coordinator-upstream.test.ts`:
+
+```typescript
+import {
+  PHASE_WATCHDOG_EXIT_CODE,
+  assertNoCoordinatorRecursion,
+  evaluatePhaseWatchdogTick,
+  resolveVitestCommand,
+  runUpstreamPhase,
+  spawnAndWait,
+} from '../../../../scripts/testing/coordinator-upstream.js'
+
+describe('phase watchdog', () => {
+  it('requires two consecutive dead ticks before declaring the child vanished', () => {
+    const base = { childAlive: false as const, elapsedMs: 500, timeoutMs: 10_000 }
+    expect(evaluatePhaseWatchdogTick({ ...base, consecutiveDeadTicks: 1 })).toBeUndefined()
+    expect(evaluatePhaseWatchdogTick({ ...base, consecutiveDeadTicks: 2 })).toBe('child_vanished')
+  })
+
+  it('ignores liveness it cannot determine', () => {
+    expect(evaluatePhaseWatchdogTick({ childAlive: undefined, consecutiveDeadTicks: 5, elapsedMs: 500, timeoutMs: 10_000 })).toBeUndefined()
+  })
+
+  it('declares a phase timeout once elapsed time reaches the bound while the child lives', () => {
+    expect(evaluatePhaseWatchdogTick({ childAlive: true, consecutiveDeadTicks: 0, elapsedMs: 9_999, timeoutMs: 10_000 })).toBeUndefined()
+    expect(evaluatePhaseWatchdogTick({ childAlive: true, consecutiveDeadTicks: 0, elapsedMs: 10_000, timeoutMs: 10_000 })).toBe('phase_timeout')
+  })
+
+  it('fails a hanging phase child with the watchdog exit code once the phase timeout elapses', async () => {
+    const exitCode = await runUpstreamPhase({
+      runner: 'npm',
+      script: 'test:balanced',
+      args: [],
+    }, fakeEnv({
+      'npm:test:balanced': { holdMs: 30_000 },
+    }, {
+      // injected through envVars so the watchdog knobs are test-visible:
+      phaseWatchPollMs: '50',
+      phaseTimeoutMs: '300',
+    }))
+
+    expect(exitCode).toBe(PHASE_WATCHDOG_EXIT_CODE)
+  }, 15_000)
+
+  it('settles through the child_vanished branch when the liveness probe reports the child gone', async () => {
+    const probeCalls: Array<number | undefined> = []
+    const exitCode = await spawnAndWait(
+      process.execPath,
+      [FIXTURE_PATH, JSON.stringify({ selector: 'probe-test' })],
+      fakeEnv({
+        default: { holdMs: 30_000 },
+      }, {
+        phaseWatchPollMs: '25',
+        // A large timeout proves the settle can only come from the vanish branch.
+        phaseTimeoutMs: '30_000',
+      }),
+      false,
+      {
+        livenessProbe: (pid) => {
+          probeCalls.push(pid)
+          return false
+        },
+      },
+    )
+
+    expect(exitCode).toBe(PHASE_WATCHDOG_EXIT_CODE)
+    // The probe was consulted with the real child pid on at least the two
+    // consecutive dead ticks the grace requires.
+    expect(probeCalls.length).toBeGreaterThanOrEqual(2)
+    expect(probeCalls.every((pid) => typeof pid === 'number' && pid > 0)).toBe(true)
+
+    // The probe lied about a child that is really alive: clean it up via the
+    // pid the probe observed so no 30s orphan lingers in the test run.
+    const realPid = probeCalls[0] as number
+    try {
+      process.kill(realPid, 'SIGKILL')
+    } catch {
+      // already exited
+    }
+  }, 15_000)
+
+  it('stays inert when the phase child exits on its own before any bound', async () => {
+    const exitCode = await runUpstreamPhase({
+      runner: 'npm',
+      script: 'typecheck',
+      args: [],
+    }, fakeEnv({
+      'npm:typecheck': { exitCode: 23 },
+    }, {
+      phaseWatchPollMs: '50',
+      phaseTimeoutMs: '300',
+    }))
+
+    expect(exitCode).toBe(23)
+  }, 15_000)
+
+  it('does not mask signal-exit codes when the watchdog is armed', async () => {
+    const exitCode = await runUpstreamPhase({
+      runner: 'npm',
+      script: 'typecheck',
+      args: [],
+    }, fakeEnv({
+      'npm:typecheck': { signal: 'SIGTERM' },
+    }, {
+      phaseWatchPollMs: '50',
+      phaseTimeoutMs: '300',
+    }))
+
+    const expectedExitCode = process.platform === 'win32'
+      ? 1
+      : 128 + osConstants.signals.SIGTERM
+    expect(exitCode).toBe(expectedExitCode)
+  }, 15_000)
+})
+```
+
+Extend the `fakeEnv` helper's `FakeEnvOptions` with the two watchdog knobs:
+
+```typescript
+interface FakeEnvOptions {
+  repoRoot?: string
+  npmExecpath?: string
+  phaseWatchPollMs?: string
+  phaseTimeoutMs?: string
+}
+
+function fakeEnv(behavior: Record<string, unknown> = {}, options: FakeEnvOptions = {}): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    FRESHELL_TEST_COORDINATOR_FAKE_UPSTREAM: FIXTURE_PATH,
+    FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify(behavior),
+    FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
+    FRESHELL_TEST_COORDINATOR_REPO_ROOT: options.repoRoot ?? REPO_ROOT,
+    npm_execpath: options.npmExecpath ?? fakePnpmEntry,
+    ...(options.phaseWatchPollMs ? { FRESHELL_TEST_COORDINATOR_PHASE_WATCH_POLL_MS: options.phaseWatchPollMs } : {}),
+    ...(options.phaseTimeoutMs ? { FRESHELL_TEST_COORDINATOR_PHASE_TIMEOUT_MS: options.phaseTimeoutMs } : {}),
+  }
+}
+```
+
+- [ ] **Step 2: Run the tests and verify the intended failure**
+
+Run: `pnpm run test:vitest run test/unit/tooling/testing/coordinator-upstream.test.ts --config config/vitest/vitest.config.ts`
+
+Expected: FAIL — the new `describe('phase watchdog')` block fails to import `evaluatePhaseWatchdogTick`, `PHASE_WATCHDOG_EXIT_CODE`, and `spawnAndWait` (module has no such exports); the behavior cases cannot pass because no watchdog exists.
+
+- [ ] **Step 3: Add the minimal production implementation**
+
+In `scripts/testing/coordinator-upstream.ts`:
+
+Add the import alongside the existing ones:
+
+```typescript
+import { descendantPids, readProcessSnapshot } from './process-tree.js'
+```
+
+Add constants and helpers (below the existing env keys at the top):
+
+```typescript
+const PHASE_TIMEOUT_ENV_KEY = 'FRESHELL_TEST_COORDINATOR_PHASE_TIMEOUT_MS'
+const PHASE_WATCH_POLL_ENV_KEY = 'FRESHELL_TEST_COORDINATOR_PHASE_WATCH_POLL_MS'
+const DEFAULT_PHASE_TIMEOUT_MS = 2 * 60 * 60 * 1000
+const DEFAULT_PHASE_WATCH_POLL_MS = 10_000
+
+export const PHASE_WATCHDOG_EXIT_CODE = 125
+
+export type PhaseWatchdogReason = 'phase_timeout' | 'child_vanished'
+
+export interface SpawnAndWaitOptions {
+  livenessProbe?: (pid: number | undefined) => boolean | undefined
+}
+
+function parsePositiveIntEnv(envVars: NodeJS.ProcessEnv, key: string, fallback: number): number {
+  const parsed = Number.parseInt(envVars[key] ?? '', 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
+
+export function evaluatePhaseWatchdogTick(input: {
+  childAlive: boolean | undefined
+  consecutiveDeadTicks: number
+  elapsedMs: number
+  timeoutMs: number
+}): PhaseWatchdogReason | undefined {
+  if (input.childAlive === false && input.consecutiveDeadTicks >= 2) {
+    return 'child_vanished'
+  }
+  if (input.elapsedMs >= input.timeoutMs) {
+    return 'phase_timeout'
+  }
+  return undefined
+}
+
+function isChildAlive(pid: number | undefined): boolean | undefined {
+  if (pid === undefined) {
+    return undefined
+  }
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+// Kill the phase child AND its descendants: the phase child of a broad run is
+// usually a package-manager wrapper around the real workload, so killing
+// only the direct child would release the gate while the workload keeps
+// running. The snapshot walk is the repo's existing process-tree primitive.
+function killProcessTree(pid: number | undefined): void {
+  if (pid === undefined) {
+    return
+  }
+  try {
+    const snapshot = readProcessSnapshot()
+    const victims = [pid, ...descendantPids(pid, snapshot)]
+    for (const victim of victims) {
+      try {
+        process.kill(victim, 'SIGKILL')
+      } catch {
+        // already dead
+      }
+    }
+    return
+  } catch (error) {
+    // Degraded cleanup: without a process-table snapshot only the direct
+    // child is reachable. Never silent — the event names what happened so a
+    // surviving-workload overlap can be classified instead of re-guessed.
+    console.error(JSON.stringify({
+      severity: 'warn',
+      event: 'phase_watchdog_tree_kill_degraded',
+      timestamp: new Date().toISOString(),
+      pid,
+      error: (error as Error).message,
+    }))
+    try {
+      process.kill(pid, 'SIGKILL')
+    } catch {
+      // already dead
+    }
+  }
+}
+
+function emitPhaseWatchdogEvent(reason: PhaseWatchdogReason, fields: {
+  pid: number | undefined
+  elapsedMs: number
+  pollMs: number
+  timeoutMs: number
+}): void {
+  console.error(JSON.stringify({
+    severity: reason === 'phase_timeout' ? 'warn' : 'error',
+    event: 'phase_watchdog_settled',
+    timestamp: new Date().toISOString(),
+    reason,
+    ...fields,
+  }))
+}
+```
+
+Replace `spawnAndWait` with the watchdog-armed, exported version (preserving the existing `error`→reject and `exit`→code semantics exactly):
+
+```typescript
+export function spawnAndWait(
+  command: string,
+  args: string[],
+  envVars: NodeJS.ProcessEnv,
+  viaShell: boolean,
+  options: SpawnAndWaitOptions = {},
+): Promise<number> {
+  const pollMs = parsePositiveIntEnv(envVars, PHASE_WATCH_POLL_ENV_KEY, DEFAULT_PHASE_WATCH_POLL_MS)
+  const timeoutMs = parsePositiveIntEnv(envVars, PHASE_TIMEOUT_ENV_KEY, DEFAULT_PHASE_TIMEOUT_MS)
+  const isAlive = options.livenessProbe ?? isChildAlive
+
+  return new Promise((resolve, reject) => {
+    const startedAtMs = Date.now()
+    const child = spawn(command, args, {
+      stdio: 'inherit',
+      env: envVars,
+      ...(viaShell ? { shell: true } : {}),
+    })
+
+    let settled = false
+    let consecutiveDeadTicks = 0
+
+    const watchdog = setInterval(() => {
+      const childAlive = isAlive(child.pid)
+      consecutiveDeadTicks = childAlive === false ? consecutiveDeadTicks + 1 : 0
+      const reason = evaluatePhaseWatchdogTick({
+        childAlive,
+        consecutiveDeadTicks,
+        elapsedMs: Date.now() - startedAtMs,
+        timeoutMs,
+      })
+
+      if (reason === undefined) {
+        return
+      }
+
+      // The child hung (or its completion signal was lost with the process
+      // gone): fail the phase instead of awaiting forever. On timeout the
+      // whole spawned tree dies so no workload outlives the failed run.
+      emitPhaseWatchdogEvent(reason, {
+        pid: child.pid,
+        elapsedMs: Date.now() - startedAtMs,
+        pollMs,
+        timeoutMs,
+      })
+      if (reason === 'phase_timeout') {
+        killProcessTree(child.pid)
+      }
+      // In the lost-completion class the native exit callback never arrives,
+      // so the ChildProcess handle keeps an event-loop reference forever and
+      // a process that only assigns process.exitCode (like the coordinator's
+      // main entry) never terminates. Drop the reference so the loop drains.
+      child.unref()
+      finish({ kind: 'code', code: PHASE_WATCHDOG_EXIT_CODE })
+    }, pollMs)
+
+    function finish(outcome: { kind: 'code'; code: number } | { kind: 'error'; error: Error }): void {
+      if (settled) return
+      settled = true
+      clearInterval(watchdog)
+      if (outcome.kind === 'error') {
+        reject(outcome.error)
+        return
+      }
+      resolve(outcome.code)
+    }
+
+    child.once('error', (error) => finish({ kind: 'error', error }))
+    child.once('exit', (code, signal) => {
+      if (typeof code === 'number') {
+        finish({ kind: 'code', code })
+        return
+      }
+      if (signal) {
+        finish({ kind: 'code', code: 128 + (osConstants.signals[signal as keyof typeof osConstants.signals] ?? 1) })
+        return
+      }
+      finish({ kind: 'code', code: 1 })
+    })
+  })
+}
+```
+
+Note the dead-tick accounting runs on every tick (before the decision, so the current tick counts) and resets to 0 whenever the child is observably alive; `consecutiveDeadTicks >= 2` therefore means two consecutive provably-dead polls separated by a full poll interval — the grace that keeps a normally-observed exit (whose `exit` event is merely queued) from being misread as a lost completion.
+
+- [ ] **Step 4: Run the focused test**
+
+Run: `pnpm run test:vitest run test/unit/tooling/testing/coordinator-upstream.test.ts --config config/vitest/vitest.config.ts`
+
+Expected: PASS (all new + existing cases in the file).
+
+- [ ] **Step 5: Refactor while green**
+
+Check for duplication between the watchdog's liveness probe and `coordinator-store.ts`'s `isProcessAlive`: both use `process.kill(pid, 0)` with EPERM-as-alive. They stay separate — the store's is private and file-local by design; hoisting a shared util across store/upstream modules is churn without benefit at this size. State this conclusion in the task review; no refactor needed.
+
+- [ ] **Step 6: Run impacted-test verification**
+
+Impacted set: every consumer of `spawnAndWait`/`runUpstreamPhase` and all coordinator tooling tests (`test/unit/tooling/testing/`), plus the scripts lane that covers prepush-manager and related tooling (`test/unit/scripts/`), plus typecheck.
+
+Run: `pnpm run test:vitest run test/unit/tooling/testing test/unit/scripts --config config/vitest/vitest.config.ts && pnpm run typecheck`
+
+Expected: PASS (the workspace-baseline receipt at base_ref was 14 files / 122 tests green; this lane must stay green with the additions).
+
+- [ ] **Step 7: Commit the task**
+
+```bash
+git add scripts/testing/coordinator-upstream.ts test/unit/tooling/testing/coordinator-upstream.test.ts
+git commit -m "feat(coordinator): fail hanging phase children via a bounded phase watchdog
+
+A dispatched phase whose child exceeds FRESHELL_TEST_COORDINATOR_PHASE_TIMEOUT_MS
+(default 2h) has its whole spawned process tree SIGKILLed and settles the phase with exit 125 plus a
+phase_watchdog_settled JSONL event, instead of awaiting forever while holding
+the repo-wide gate (kata freshell#t4c8, 2026-09-22 incident class)."
+```
+
+---
+
+### Task 2: Dead-child detection and tree-reap proof (the lost-completion branch)
+
+**Files:**
+- Modify: `test/fixtures/testing/fake-coordinated-workload.mjs` (add `pid` to the capture record; add the `spawnDescendant` behavior)
+- Modify: `scripts/testing/coordinator-upstream.ts` (only if the tick accounting from Task 1 needs a fix — the branch itself is already wired by `evaluatePhaseWatchdogTick`'s `child_vanished` arm)
+- Test: `test/unit/tooling/testing/coordinator-upstream.test.ts` (add cases)
+
+**Interfaces:**
+- Consumes: Task 1's `evaluatePhaseWatchdogTick`, `PHASE_WATCHDOG_EXIT_CODE`, exported `spawnAndWait` (with `SpawnAndWaitOptions`), watchdog wiring and `killProcessTree`, `fakeEnv` knob options.
+- Produces: the fixture capture record now includes `pid: number` (the fixture process's own pid), a second capture line `{ selector, role: 'descendant', pid }` when the new `spawnDescendant: true` behavior is set, and the fixture behavior `spawnDescendant` itself — Task 3's e2e consumes none of these but the unit seam keeps the reap proof hermetic.
+
+- [ ] **Step 1: Write the failing behavioral tests**
+
+Add these cases to `test/unit/tooling/testing/coordinator-upstream.test.ts` (the fixture seam they depend on — `pid` in the capture record, and the `spawnDescendant` behavior — is deliberately NOT added yet; that is this task's green step):
+
+```typescript
+  it('settles promptly at the signal-mapped code when the child is killed outside the watchdog', async () => {
+    const exitPromise = runUpstreamPhase({
+      runner: 'npm',
+      script: 'test:balanced',
+      args: [],
+    }, fakeEnv({
+      'npm:test:balanced': { holdMs: 30_000 },
+    }, {
+      phaseWatchPollMs: '50',
+      phaseTimeoutMs: '10_000',
+    }))
+
+    const pid = await waitForCapturePid('npm:test:balanced')
+    expect(pid).toBeGreaterThan(0)
+
+    process.kill(pid, 'SIGKILL')
+
+    const expectedExitCode = process.platform === 'win32'
+      ? 1
+      : 128 + osConstants.signals.SIGKILL
+    await expect(exitPromise).resolves.toBe(expectedExitCode)
+  }, 20_000)
+
+  it('reaps the phase child AND its descendants when the watchdog kills on timeout', async () => {
+    const exitPromise = runUpstreamPhase({
+      runner: 'npm',
+      script: 'test:balanced',
+      args: [],
+    }, fakeEnv({
+      'npm:test:balanced': { holdMs: 30_000, spawnDescendant: true },
+    }, {
+      phaseWatchPollMs: '25',
+      phaseTimeoutMs: '250',
+    }))
+
+    await expect(exitPromise).resolves.toBe(PHASE_WATCHDOG_EXIT_CODE)
+
+    const directPid = await waitForCapturePid('npm:test:balanced')
+    const descendantPid = await waitForCapturePid('npm:test:balanced', { role: 'descendant' })
+    expect(directPid).toBeGreaterThan(0)
+    expect(descendantPid).toBeGreaterThan(0)
+
+    // Both the direct child and its spawned descendant must be gone: the
+    // watchdog killed the whole tree, not just the wrapper.
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    expect(() => process.kill(directPid, 0)).toThrow()
+    expect(() => process.kill(descendantPid, 0)).toThrow()
+  }, 20_000)
+```
+
+with this shared poll helper (defined once in the file's helpers section, before the `describe` blocks):
+
+```typescript
+async function waitForCapturePid(selector: string, filter?: { role?: string }): Promise<number> {
+  const deadline = Date.now() + 10_000
+  let lastLines = ''
+  while (Date.now() < deadline) {
+    const raw = await fsp.readFile(captureFile, 'utf8').catch(() => '')
+    lastLines = raw
+    const parsed = raw.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    const match = parsed.find((entry) =>
+      entry.selector === selector && (!filter?.role || entry.role === filter.role))
+    if (typeof match?.pid === 'number' && match.pid > 0) {
+      return match.pid
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  throw new Error(`capture pid for ${selector}${filter?.role ? ` (role=${filter.role})` : ''} never appeared; last capture: ${lastLines}`)
+}
+```
+
+- [ ] **Step 2: Run the tests and verify the intended failure**
+
+Run: `pnpm run test:vitest run test/unit/tooling/testing/coordinator-upstream.test.ts --config config/vitest/vitest.config.ts`
+
+Expected: FAIL — both new cases fail inside `waitForCapturePid` because the fixture's capture record has no `pid` (and no descendant line exists at all): the helper times out with `match?.pid` undefined / no match. This is the missing fixture seam, not a syntax or setup accident.
+
+- [ ] **Step 3: Add the minimal production implementation**
+
+Extend `test/fixtures/testing/fake-coordinated-workload.mjs`. First the import:
+
+```javascript
+import { spawn } from 'node:child_process'
+```
+
+Then, inside the capture block, add `pid` to the existing record:
+
+```javascript
+  await fs.appendFile(
+    captureFile,
+    `${JSON.stringify({
+      selector: payload.selector,
+      command: payload.command,
+      args: payload.args,
+      pid: process.pid,
+      active: process.env.FRESHELL_TEST_COORDINATOR_ACTIVE,
+    })}\n`,
+  )
+```
+
+And after the capture block (before the `stdout`/`stderr` handling), the new `spawnDescendant` behavior:
+
+```javascript
+if (behavior.spawnDescendant) {
+  const descendant = spawn(process.execPath, ['-e', 'setInterval(() => {}, 60000)'], {
+    stdio: 'ignore',
+  })
+  if (captureFile) {
+    await fs.appendFile(
+      captureFile,
+      `${JSON.stringify({
+        selector: payload.selector,
+        role: 'descendant',
+        pid: descendant.pid ?? null,
+      })}\n`,
+    )
+  }
+}
+```
+
+No `coordinator-upstream.ts` change is expected in this task — Task 1 already wired the `child_vanished` arm and the tree-kill. If the killed-outside case ever flakes because the watchdog's dead-tick grace raced a real `exit` delivery, fix the accounting in the watchdog tick — never weaken the two-tick grace; the real `exit` event must always win when it is deliverable (empirically settled: 100/100 external-SIGKILL iterations at 5 ms and 25 ms poll cadences, the real exit always won).
+
+- [ ] **Step 4: Run the focused test**
+
+Run: `pnpm run test:vitest run test/unit/tooling/testing/coordinator-upstream.test.ts --config config/vitest/vitest.config.ts`
+
+Expected: PASS — the signal-mapped kill settles at `128 + SIGKILL` (the real exit event beats the grace), and both the timeout-killed phase child and its spawned descendant are provably reaped.
+
+- [ ] **Step 5: Refactor while green**
+
+The capture polling already shares one `waitForCapturePid` helper (defined in Step 1). Review the two new cases for any remaining duplication or dead setup (e.g. `fakeNpmEntry` usage inherited from the file template); simplify if something concrete emerges, otherwise state that no refactor is needed. Re-run Step 4's command; expected PASS.
+
+- [ ] **Step 6: Run impacted-test verification**
+
+Any test that reads the fixture capture record may observe the new `pid` field: run the whole coordinator tooling lane.
+
+Run: `pnpm run test:vitest run test/unit/tooling/testing test/unit/scripts --config config/vitest/vitest.config.ts && pnpm run typecheck`
+
+Expected: PASS. (Existing `toMatchObject` assertions select named fields, so the added `pid` field is additive; verify no strict-equality assertion on the full capture record exists — if one does, update it to include `pid`.)
+
+- [ ] **Step 7: Commit the task**
+
+```bash
+git add test/fixtures/testing/fake-coordinated-workload.mjs test/unit/tooling/testing/coordinator-upstream.test.ts
+git commit -m "test(coordinator): prove dead-child detection and full tree reaping with pid capture"
+```
+
+---
+
+### Task 3: End-to-end incident replay through the real coordinator + docs
+
+**Files:**
+- Create: `test/integration/tooling/coordinator-watchdog-replay.test.ts`
+- Create: `test/fixtures/testing/watchdog-process-exit-driver.ts` (process-level lost-completion driver)
+- Modify: `config/vitest/vitest.runtime.config.ts` (add the new file to its explicit include list — the default vitest config excludes `test/integration/tooling/**`)
+- Modify: `AGENTS.md` (Test Coordination section: two lines for the new knobs)
+
+**Interfaces:**
+- Consumes: Task 1–2 watchdog (env knobs), the fixture seam, `tsx` CLI (`require.resolve('tsx/cli')` — precedent `test/unit/config/sanitize-test-env.test.ts:10`), `buildCoordinatorEndpoint` + `tryListen` from `scripts/testing/coordinator-endpoint.js`, `getCoordinatorStoreDir` + `readHolder` from `scripts/testing/coordinator-store.js`.
+- Produces: the incident-replay proof (coordinator child fails fast, releases gate, records the failure) and the agent-facing documentation of the knobs.
+
+**Isolation contract (load-bearing, validated):** the spawned coordinator resolves its git repo context from `INIT_CWD` or `PWD` before ever consulting `process.cwd()` (`scripts/testing/repo-context.ts` `resolveInvocationCwd`, consumed by `resolveRepoInvocationCwd` in `test-coordinator.ts`). The child env therefore MUST set both `INIT_CWD` and `PWD` to the temp repo, or the e2e would bind to the real repo's shared coordinator gate and store. The run-record binding assertion below proves the isolation held.
+
+- [ ] **Step 1: Write the failing e2e test**
+
+`test/integration/tooling/coordinator-watchdog-replay.test.ts`:
+
+```typescript
+// @vitest-environment node
+import { createRequire } from 'node:module'
+import fsp from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { spawn } from 'node:child_process'
+
+import { afterAll, describe, expect, it } from 'vitest'
+
+import { buildCoordinatorEndpoint, tryListen } from '../../../scripts/testing/coordinator-endpoint.js'
+import { getCoordinatorStoreDir, readHolder } from '../../../scripts/testing/coordinator-store.js'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+const require = createRequire(import.meta.url)
+const tsxCli = require.resolve('tsx/cli')
+const COORDINATOR_PATH = path.resolve(__dirname, '../../../scripts/testing/test-coordinator.ts')
+const FIXTURE_PATH = path.resolve(__dirname, '../../fixtures/testing/fake-coordinated-workload.mjs')
+const REPO_ROOT = path.resolve(__dirname, '../../..')
+
+const tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-watchdog-replay-'))
+const tempRepos: string[] = []
+
+afterAll(async () => {
+  await fsp.rm(tempRoot, { recursive: true, force: true })
+})
+
+function run(command: string, args: string[], cwd: string, env?: NodeJS.ProcessEnv): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd, ...(env ? { env } : {}) })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (chunk) => { stdout += String(chunk) })
+    child.stderr.on('data', (chunk) => { stderr += String(chunk) })
+    child.once('error', reject)
+    child.once('close', (code) => resolve({ code: code ?? 1, stdout, stderr }))
+  })
+}
+
+async function makeTempGitRepo(): Promise<{ repo: string; commonDir: string }> {
+  const repo = path.join(tempRoot, `repo-${tempRepos.length}`)
+  tempRepos.push(repo)
+  await fsp.mkdir(repo, { recursive: true })
+  await run('git', ['-C', repo, 'init'], repo)
+  // A bootstrap commit keeps repo-context resolution (branch/commit/dirty
+  // probing) on its happy path in an otherwise empty repo.
+  await fsp.writeFile(path.join(repo, 'README.md'), 'watchdog replay\n')
+  await run('git', ['-C', repo, '-c', 'user.name=watchdog-replay', '-c', 'user.email=watchdog-replay@example.invalid', 'add', 'README.md'], repo)
+  await run('git', ['-C', repo, '-c', 'user.name=watchdog-replay', '-c', 'user.email=watchdog-replay@example.invalid', 'commit', '-m', 'bootstrap'], repo)
+  const commonDirRaw = (await run('git', ['-C', repo, 'rev-parse', '--git-common-dir'], repo)).stdout.trim()
+  const commonDir = path.resolve(repo, commonDirRaw)
+  return { repo, commonDir }
+}
+
+interface CoordinatorOutcome {
+  code: number
+  stdout: string
+  stderr: string
+  storeDir: string
+}
+
+async function runCoordinatorIn(repo: string, commonDir: string, behavior: Record<string, unknown>): Promise<CoordinatorOutcome> {
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    // Repo-context isolation: the coordinator resolves its git context from
+    // INIT_CWD/PWD before process.cwd(), so both must point at the temp repo
+    // or the e2e would bind to the real repo's shared gate and store.
+    INIT_CWD: repo,
+    PWD: repo,
+    FRESHELL_TEST_COORDINATOR_FAKE_UPSTREAM: FIXTURE_PATH,
+    FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify(behavior),
+    FRESHELL_TEST_COORDINATOR_REPO_ROOT: REPO_ROOT,
+    FRESHELL_TEST_COORDINATOR_PHASE_WATCH_POLL_MS: '50',
+    FRESHELL_TEST_COORDINATOR_PHASE_TIMEOUT_MS: '400',
+    FRESHELL_TEST_SUMMARY: 'watchdog replay',
+  }
+  delete env.FRESHELL_TEST_COORDINATOR_ACTIVE
+
+  const result = await run(process.execPath, [tsxCli, COORDINATOR_PATH, 'run', 'test'], repo, env)
+  return { ...result, storeDir: getCoordinatorStoreDir(commonDir) }
+}
+
+const WEDGE_BEHAVIOR: Record<string, unknown> = {
+  'npm:test:balanced': { holdMs: 5_000 },
+}
+
+describe('coordinator phase watchdog end to end', () => {
+  it('fails the run, releases the gate, and records the failure when a phase child wedges', { timeout: 60_000 }, async () => {
+    const { repo, commonDir } = await makeTempGitRepo()
+
+    const outcome = await runCoordinatorIn(repo, commonDir, WEDGE_BEHAVIOR)
+
+    expect(outcome.code).toBe(125)
+    expect(outcome.stderr).toContain('"event":"phase_watchdog_settled"')
+    expect(outcome.stderr).toContain('"reason":"phase_timeout"')
+
+    await expect(readHolder(outcome.storeDir)).resolves.toBeUndefined()
+    const endpoint = buildCoordinatorEndpoint(commonDir)
+    const listener = await tryListen(endpoint)
+    expect(listener.kind).toBe('listening')
+    if (listener.kind === 'listening') {
+      await listener.close()
+    }
+  })
+
+  it('keeps green runs green with the watchdog armed', { timeout: 60_000 }, async () => {
+    const { repo, commonDir } = await makeTempGitRepo()
+
+    const outcome = await runCoordinatorIn(repo, commonDir, {
+      'npm:test:balanced': { exitCode: 0 },
+    })
+
+    expect(outcome.code).toBe(0)
+    expect(outcome.stderr).not.toContain('phase_watchdog_settled')
+    await expect(readHolder(outcome.storeDir)).resolves.toBeUndefined()
+  })
+
+  it('records the watchdog failure as a run result other agents can see', { timeout: 60_000 }, async () => {
+    const { repo, commonDir } = await makeTempGitRepo()
+
+    const outcome = await runCoordinatorIn(repo, commonDir, WEDGE_BEHAVIOR)
+
+    expect(outcome.code).toBe(125)
+    const raw = await fsp.readFile(path.join(outcome.storeDir, 'command-runs.json'), 'utf8')
+    const parsed = JSON.parse(raw) as {
+      byKey: Record<string, { exitCode: number; repo: { repoRoot: string; worktreePath: string } }>
+    }
+    const recorded = Object.values(parsed.byKey).find((entry) => entry.exitCode === 125)
+    // Binding proof: the failure was recorded against the temp repo, not the
+    // real shared store — the isolation contract held end to end.
+    expect(recorded?.repo.repoRoot).toBe(repo)
+    expect(recorded?.repo.worktreePath).toBe(repo)
+  })
+
+  it('terminates a whole process whose child completion was lost — no leaked event-loop handle', { timeout: 30_000 }, async () => {
+    // The lost-completion class is not externally fabricable through the real
+    // coordinator CLI (the liveness probe is not injectable across a
+    // process boundary), so this case proves the mechanism at process
+    // level. A driver process settles its phase through the child_vanished
+    // branch against a child that is really alive and stays alive for a
+    // minute; the driver must then terminate promptly by event-loop drain
+    // alone. Without child.unref() the leaked native handle keeps the
+    // driver wedged until the child's 60s hold expires, and the explicit
+    // 10s prompt-exit bound below fails exactly that regression.
+    const driverPath = path.resolve(__dirname, '../../fixtures/testing/watchdog-process-exit-driver.ts')
+    const sentinelPath = path.join(tempRoot, `driver-sentinel-${Date.now()}.json`)
+
+    // stdio 'ignore' is load-bearing: the fixture child inherits the
+    // driver's stdio, so piped streams would couple the driver's observable
+    // exit to the child's death and mask a wedged driver.
+    const driver = spawn(process.execPath, [tsxCli, driverPath, FIXTURE_PATH, sentinelPath], {
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        FRESHELL_TEST_COORDINATOR_PHASE_WATCH_POLL_MS: '25',
+      },
+      stdio: 'ignore',
+    })
+
+    const driverExit = new Promise<number>((resolve, reject) => {
+      driver.once('error', reject)
+      driver.once('exit', (code) => resolve(code ?? 1))
+    })
+    let boundTimer: NodeJS.Timeout | undefined
+    const bounded = await Promise.race([
+      driverExit,
+      new Promise<'timeout'>((resolve) => {
+        boundTimer = setTimeout(() => resolve('timeout'), 10_000)
+      }),
+    ])
+    clearTimeout(boundTimer)
+
+    if (bounded === 'timeout') {
+      try {
+        process.kill(driver.pid!, 'SIGKILL')
+      } catch {
+        // already dead
+      }
+      throw new Error('driver did not terminate promptly after the lost-completion settle — leaked event-loop handle')
+    }
+    expect(bounded).toBe(0)
+
+    const sentinel = JSON.parse(await fsp.readFile(sentinelPath, 'utf8')) as {
+      status: string
+      childPid?: number
+    }
+    expect(sentinel.status).toBe('DRIVER_DONE')
+
+    // The driver settled while its child was still alive; clean up the
+    // orphan the driver's probe reported.
+    if (typeof sentinel.childPid === 'number') {
+      try {
+        process.kill(sentinel.childPid, 'SIGKILL')
+      } catch {
+        // already dead
+      }
+    }
+  })
+})
+```
+
+The red-run shape is deliberate: with `holdMs: 5_000` and no watchdog yet in place, the coordinator at base waits out the child's clean 5s exit and finishes green, so the first case fails fast on `expect(outcome.code).toBe(125)` (expected 0, received green run) without wedging the test runner or leaking a 60-second child. After Tasks 1–2, the watchdog fires at ~400ms — long before the child's own exit — so the same behavior stays a genuine wedge for the watchdog to catch.
+
+Create the driver fixture at `test/fixtures/testing/watchdog-process-exit-driver.ts`:
+
+```typescript
+import process from 'node:process'
+import fsp from 'node:fs/promises'
+
+import { PHASE_WATCHDOG_EXIT_CODE, spawnAndWait } from '../../../scripts/testing/coordinator-upstream.js'
+
+const fixturePath = process.argv[2]
+const sentinelPath = process.argv[3]
+
+let observedChildPid: number | undefined
+
+const exitCode = await spawnAndWait(
+  process.execPath,
+  [fixturePath, JSON.stringify({ selector: 'driver-child' })],
+  {
+    ...process.env,
+    FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({ default: { holdMs: 60_000 } }),
+  },
+  false,
+  // Simulate the lost-completion class: the OS-level liveness answer is
+  // "gone" while the child is really alive for a full minute, so the native
+  // exit callback cannot arrive to close the handle during the case.
+  { livenessProbe: (pid) => { observedChildPid = pid; return false } },
+)
+
+if (exitCode !== PHASE_WATCHDOG_EXIT_CODE) {
+  await fsp.writeFile(sentinelPath, JSON.stringify({ status: 'DRIVER_UNEXPECTED_EXIT', exitCode })).catch(() => {})
+  process.exit(1)
+}
+
+// Sentinel file, not stdout: the fixture child inherits this process's
+// stdio, so a pipe-based DONE signal would couple the driver's observable
+// completion to the child's much-later death.
+await fsp.writeFile(sentinelPath, JSON.stringify({ status: 'DRIVER_DONE', childPid: observedChildPid }))
+
+// No explicit process.exit: with the settled child's handle unreferenced,
+// the event loop drains and this process terminates on its own while the
+// child is still alive. A leaked ChildProcess handle would keep this
+// process wedged until the child's 60s hold expires — the e2e case's 10s
+// prompt-exit bound fails exactly that regression.
+```
+
+Before finalizing the file, the implementer must verify against the real source and adjust (these are load-bearing details, not trivia):
+- `tryListen`'s exact export name and result union (architecture report cites `coordinator-endpoint.ts:80-110`).
+- `readHolder`'s exact signature and return type (it exists in `coordinator-store.ts` near `writeHolder`).
+- The run-results file is `command-runs.json` (constant `COMMAND_RUNS_FILE`, `coordinator-store.ts:23`) with a `byKey` record map embedding the full run record — the binding assertion reads `repo.repoRoot`/`repo.worktreePath` from that record.
+
+Also update `config/vitest/vitest.runtime.config.ts` — its include list is an explicit file array (`test/integration/tooling/source-runtime-rust.test.ts` today) and the default vitest config excludes `test/integration/tooling/**`; add the new file so it actually runs in the runtime lane:
+
+```typescript
+    include: [
+      'test/integration/tooling/source-runtime-rust.test.ts',
+      'test/integration/tooling/coordinator-watchdog-replay.test.ts',
+    ],
+```
+
+- [ ] **Step 2: Run the test and verify the harness is honest (non-vacuous check)**
+
+Tasks 1–2 are already implemented when this task runs, so the e2e cases are expected to pass on their first run — they prove the Tasks 1–2 mechanisms end to end, and the lost-completion driver case proves the `unref()` event-loop rule at process level. Guard against a vacuous harness with a deliberate inversion: temporarily change the first case's `expect(outcome.code).toBe(125)` to `toBe(0)`, run the file, and confirm that case FAILS; restore the assertion and proceed.
+
+Run: `pnpm run test:vitest run test/integration/tooling/coordinator-watchdog-replay.test.ts --config config/vitest/vitest.runtime.config.ts`
+
+Expected: the inverted assertion FAILS while the case runs (proving the wedge case observes real behavior); after restoring, all cases PASS, including `DRIVER_DONE` from the process-level lost-completion driver.
+
+- [ ] **Step 3: Add the minimal production implementation**
+
+There is no new production code in this task if Tasks 1–2 are complete: the coordinator's existing failure plumbing must carry the watchdog settle to the recorded run result and the cleared holder. If any of the three cases fail, fix the cause in the coordinator (`test-coordinator.ts` `runCoordinatedCommand` catch/finally), not in the test — the run record must show exit 125 and `holder.json` must be cleared by the existing `finally`.
+
+- [ ] **Step 4: Run the focused test**
+
+Run: `pnpm run test:vitest run test/integration/tooling/coordinator-watchdog-replay.test.ts --config config/vitest/vitest.runtime.config.ts`
+
+Expected: PASS (all four cases, including `DRIVER_DONE` from the process-level lost-completion driver).
+
+- [ ] **Step 5: Refactor while green**
+
+Deduplicate the store-dir resolution inside the test file (one helper, used by all cases). Re-run Step 4; expected PASS.
+
+- [ ] **Step 6: Run impacted-test verification + docs**
+
+Add the agent-facing knob documentation to `AGENTS.md` in the Test Coordination section (after the `test:status` bullet):
+
+```markdown
+- Phase-child watchdog: a dispatched phase child that wedges or whose completion signal is lost fails the run with exit 125 (JSONL `phase_watchdog_settled` on stderr) and releases the gate instead of holding it indefinitely. Knobs: `FRESHELL_TEST_COORDINATOR_PHASE_TIMEOUT_MS` (default 7200000 = 2h, hard per-phase cap; on timeout the watchdog SIGKILLs the child's whole process tree via the process-table snapshot) and `FRESHELL_TEST_COORDINATOR_PHASE_WATCH_POLL_MS` (default 10000, liveness poll cadence; two consecutive dead polls settle a lost completion).
+```
+
+Then run the full impacted set: the coordinator unit lane (default config), the new integration file (runtime config), and typecheck.
+
+Run: `pnpm run test:vitest run test/unit/tooling/testing test/unit/scripts --config config/vitest/vitest.config.ts && pnpm run test:vitest run test/integration/tooling/coordinator-watchdog-replay.test.ts --config config/vitest/vitest.runtime.config.ts && pnpm run typecheck`
+
+Expected: PASS.
+
+- [ ] **Step 7: Commit the task**
+
+```bash
+git add test/integration/tooling/coordinator-watchdog-replay.test.ts test/fixtures/testing/watchdog-process-exit-driver.ts config/vitest/vitest.runtime.config.ts AGENTS.md
+git commit -m "test(coordinator): e2e incident replay proves the watchdog fails fast and frees the gate"
+```
+
+---
+
+## Final whole-branch verification (after Task 3)
+
+Run the repo's broad coordinated suite from the worktree per the repo's documented full-suite procedure (`pnpm run test` — it queues on the shared coordinator gate like any broad run), expecting green with no pre-existing failures (baseline ledger: none). This is the whole-branch gate required before the delta review; its receipt goes in the run record.

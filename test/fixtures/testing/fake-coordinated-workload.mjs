@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { spawn } from 'node:child_process'
 
 const payload = JSON.parse(process.argv[2] ?? '{}')
 const behaviorMap = JSON.parse(process.env.FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR ?? '{}')
@@ -14,9 +15,29 @@ if (captureFile) {
       selector: payload.selector,
       command: payload.command,
       args: payload.args,
+      pid: process.pid,
       active: process.env.FRESHELL_TEST_COORDINATOR_ACTIVE,
     })}\n`,
   )
+}
+
+if (behavior.spawnDescendant) {
+  // Bounded lease: the descendant self-terminates so an orphan can never
+  // outlive a failed test run; 30s is far beyond the watchdog's kill window,
+  // so the tree-reap coverage still exercises a live descendant.
+  const descendant = spawn(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 30000)'], {
+    stdio: 'ignore',
+  })
+  if (captureFile) {
+    await fs.appendFile(
+      captureFile,
+      `${JSON.stringify({
+        selector: payload.selector,
+        role: 'descendant',
+        pid: descendant.pid ?? null,
+      })}\n`,
+    )
+  }
 }
 
 if (behavior.stdout) {
