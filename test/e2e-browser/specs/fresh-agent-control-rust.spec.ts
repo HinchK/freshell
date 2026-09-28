@@ -1287,6 +1287,11 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
       await harness2.waitForConnection()
       const tabId2 = (await harness2.getActiveTabId())!
       expect(await captureDurableId(harness2, tabId2, CANONICAL_UUID_RE, 30_000)).toBe(durableBefore)
+      await waitForLogEntry(
+        lane.eventsLog,
+        (e) => e.kind === 'resume' && e.data?.id === durableBefore,
+        'the replacement sidecar resumed the crashed durable session',
+      )
 
       // The recovered session answers a follow-up turn — gated on the REAL
       // landing (the sidecar saw the send and completed it), never the
@@ -1306,6 +1311,9 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
       await lane.server.restart()
       await waitForWsReady(page)
       expect(await captureDurableId(harness2, tabId2, CANONICAL_UUID_RE, 30_000)).toBe(durableBefore)
+      await expect.poll(() => readJsonl(lane.eventsLog)
+        .filter((e) => e.kind === 'resume' && e.data?.id === durableBefore).length,
+      { timeout: 60_000, message: 'the restarted server resumed the same durable session' }).toBeGreaterThanOrEqual(2)
       await sendComposerText(page, 'post-restart turn')
       await waitForStdinFrame(
         lane.stdinLog,
