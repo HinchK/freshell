@@ -53,8 +53,18 @@ extraResources:
     to: claude-sidecar
     filter:
       - "**/*"
+  # electron-builder omits nested node_modules from directory mappings.
+  # Map each deployed dependency tree as its own resource root.
+  - from: electron-runtime/claude-sidecar/node_modules
+    to: claude-sidecar/node_modules
+    filter:
+      - "**/*"
   - from: electron-runtime/mcp
     to: mcp
+    filter:
+      - "**/*"
+  - from: electron-runtime/mcp/node_modules
+    to: mcp/node_modules
     filter:
       - "**/*"
   - from: electron-runtime/node-client-runtime
